@@ -30,7 +30,7 @@ if not defined RFOM_JOBS set "RFOM_JOBS=4"
   if errorlevel 1 (echo Configure FAILED - see logs\configure.log & type logs\configure.log & goto fail)
 )
 echo [1/2] Building front end (EBOOT)...
-"%PS%" -NoProfile -Command "cmake --build build -j %RFOM_JOBS% 2>&1 | Tee-Object -FilePath logs\build.log; $c = $LASTEXITCODE; if (Select-String -Path logs\build.log -Pattern '^FAILED: |^ninja: build stopped' -Quiet) { $c = 1 }; exit $c"
+"%PS%" -NoProfile -ExecutionPolicy Bypass -File "%~dp0tools\build_tee.ps1" -BuildDir build -Jobs "%RFOM_JOBS%" -Log logs\build.log
 if errorlevel 1 (echo. & echo BUILD FAILED - see logs\build.log & goto fail)
 
 (
@@ -39,7 +39,7 @@ if errorlevel 1 (echo. & echo BUILD FAILED - see logs\build.log & goto fail)
   if errorlevel 1 (echo Configure FAILED - see logs\configure_game.log & type logs\configure_game.log & goto fail)
 )
 echo [2/2] Building game (game.self)...
-"%PS%" -NoProfile -Command "cmake --build build_game -j %RFOM_JOBS% 2>&1 | Tee-Object -FilePath logs\build_game.log; $c = $LASTEXITCODE; if (Select-String -Path logs\build_game.log -Pattern '^FAILED: |^ninja: build stopped' -Quiet) { $c = 1 }; exit $c"
+"%PS%" -NoProfile -ExecutionPolicy Bypass -File "%~dp0tools\build_tee.ps1" -BuildDir build_game -Jobs "%RFOM_JOBS%" -Log logs\build_game.log
 if errorlevel 1 (echo. & echo BUILD FAILED - see logs\build_game.log & goto fail)
 
 echo Building the launcher...
