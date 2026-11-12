@@ -1371,7 +1371,7 @@ static void fsr_mv_replay(u32 d0, u32 d1, D3D12_CPU_DESCRIPTOR_HANDLE dsv, int r
     const D3D12_GPU_VIRTUAL_ADDRESS hva = s_fsr_hist->lpVtbl->GetGPUVirtualAddress(s_fsr_hist);
     const float tw = (float)rt->w, th = (float)rt->h;
     ID3D12PipelineState* last = NULL;
-    u32 n = 0, ncut = 0;
+    u32 n = 0, ncut = 0, nrx = 0, nmul = 0;
     for (u32 d = d0; d < d1 && d < MAX_DRAWS; d++) {
         const D3D12DrawRecord* dr = &T_DRAWS[d];
         if (!dr->is_vp || dr->is_clear || dr->fsr != 1 || !dr->fp_addr) continue;
@@ -1381,6 +1381,18 @@ static void fsr_mv_replay(u32 d0, u32 d1, D3D12_CPU_DESCRIPTOR_HANDLE dsv, int r
          * (ground smeared under FSR). Blend key: bit0 on, src bits 1-5, dst 6-10. */
         const int rx = (dr->blend_key & 1u) && !(((dr->blend_key >> 1) & 31u) == 2u && ((dr->blend_key >> 6) & 31u) == 1u);
         if (rx && fsr_rx_val() <= 0.0f) continue;   /* v189: blended -> reactive mask only */
+        /* Modulating blends (src DEST_COLOR/DEST_ALPHA/ZERO, dst ZERO/ONE/SRC_COLOR/SRC_ALPHA,
+         * op ADD) only scale the colour already there: the shadow-map receive pass re-draws
+         * the world with DEST_COLOR,ZERO (~95 draws, 75% of the screen in Grimsby). Marked
+         * reactive, they told the upscaler to favour the jittered current frame almost
+         * everywhere (boiling/shimmer). What they multiply in moves with the surface below,
+         * whose motion is already written: skipped. RSX_FSR_RX_MUL=1 = old behaviour. */
+        if (rx) {
+            static int rm = -1; if (rm < 0) { const char* e = getenv("RSX_FSR_RX_MUL"); rm = e ? atoi(e) : 0; }
+            const u32 bs = (dr->blend_key >> 1) & 31u, bd = (dr->blend_key >> 6) & 31u, bo = (dr->blend_key >> 21) & 7u;
+            if (!rm && bo == 1u && (bs == 1u || bs == 7u || bs == 9u) && (bd == 1u || bd == 2u || bd == 3u || bd == 5u)) { nmul++; continue; }
+            nrx++;
+        }
         /* v184i: colour writes off = occlusion-query boxes / depth-only passes
          * (185 per frame in the Grimsby factory). Not part of the picture; each
          * box stamped its own (mismatched) motion over what was behind it --
@@ -1439,7 +1451,7 @@ static void fsr_mv_replay(u32 d0, u32 d1, D3D12_CPU_DESCRIPTOR_HANDLE dsv, int r
         n++;
     }
     fsr_gt_end(gtq);
-    { static int lg = 0; if (lg < 6 && n) { lg++; fprintf(stderr, "[FSR] motion pass: %u draws (%u cutout skipped)%c", n, ncut, 10); } }
+    { static int lg = 0; if (lg < 6 && n) { lg++; fprintf(stderr, "[FSR] motion pass: %u draws (%u cutout skipped, %u blended -> reactive, %u modulating skipped)%c", n, ncut, nrx, nmul, 10); } }
     cl->lpVtbl->SetGraphicsRootSignature(cl, s_d3d.vp_root_sig);
     if (s_gf_buf)
         cl->lpVtbl->SetGraphicsRootShaderResourceView(cl, 3, s_gf_buf->lpVtbl->GetGPUVirtualAddress(s_gf_buf) + (u64)T_PARITY * GF_CAP);

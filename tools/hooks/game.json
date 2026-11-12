@@ -768,6 +768,39 @@
 ]
 }
 ],
+"func_005F29D4": [
+{
+"at": 99,
+"ctx": "}",
+"rm": [],
+"add": [
+"extern \"C\" void rfom_demux_wait_begin(void);   /* F3: movie Demuxer input wait (project/stubs.cpp) */",
+"extern \"C\" int rfom_demux_wait_spin(void);"
+]
+}
+],
+"func_005F2AF4": [
+{
+"at": 74,
+"ctx": "        vm_write64_stk(R_1 + 0x78, R_7);",
+"rm": [],
+"add": [
+"        rfom_demux_wait_begin();"
+]
+},
+{
+"at": 118,
+"ctx": "        { int64_t a = (int64_t)R_7; int64_t b = (int64_t)0; uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((R_xer >> 31) & 1u); ctx->cr = R_cr = (R_cr & ~(0xFu << 0)) | (cr_val << 0); }",
+"rm": [
+"        if (((R_cr >> 1) & 1)) goto loc_005F2B8C;"
+],
+"add": [
+"        /* F3: the input wait never looks at the Demuxer's stop request; give the step back",
+"         * (returns 0 = nothing read) after a bounded wait so the worker loop can see it */",
+"        if (((R_cr >> 1) & 1)) { if (rfom_demux_wait_spin()) goto loc_005F2DE4; goto loc_005F2B8C; }"
+]
+}
+],
 "func_00621A44": [
 {
 "at": 200,

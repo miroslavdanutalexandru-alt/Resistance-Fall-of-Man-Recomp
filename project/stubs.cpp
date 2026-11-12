@@ -2052,6 +2052,29 @@ extern "C" uint64_t rfom_movie_evwait_us(void)
     return (uint64_t)us;
 }
 
+/* F3: the movie Demuxer's input wait (func_005F2AF4) sleeps 1 ms per poll until the
+ * file stream hands it a packet or reports EOF, without looking at the Demuxer's own
+ * stop flag. When a movie is skipped, the streaming threads are joined first; a
+ * Demuxer caught starving at that moment waits forever and the main thread's join on
+ * it never returns. After RFOM_MOVIE_DEMUX_WAIT_MS (default 100, 0 = original
+ * unbounded wait) the step returns "nothing read" instead, so the worker loop
+ * re-checks its stop flag and simply calls the step again otherwise. */
+static thread_local ULONGLONG s_dmx_t0;
+extern "C" void rfom_demux_wait_begin(void) { s_dmx_t0 = GetTickCount64(); }
+extern "C" int rfom_demux_wait_spin(void)
+{
+    static long long ms = -1;
+    if (ms < 0) { const char* e = getenv("RFOM_MOVIE_DEMUX_WAIT_MS"); ms = e ? atoll(e) : 100; if (ms < 0) ms = 0; }
+    if (!ms) return 0;
+    const ULONGLONG now = GetTickCount64();
+    if (now - s_dmx_t0 < (ULONGLONG)ms) return 0;
+    static volatile long logged = 0;
+    if (InterlockedIncrement(&logged) <= 8)
+        fprintf(stderr, "[demux-wait] no input for %llu ms, returning to the worker loop%c", (unsigned long long)(now - s_dmx_t0), 10);
+    s_dmx_t0 = now;
+    return 1;
+}
+
 extern "C" void ps3_load_prx_modules(void)
 {
     ps3_hle_register_ctx(0xFC52A7A9u, "sys_game_process_exitspawn", hle_game_process_exitspawn);

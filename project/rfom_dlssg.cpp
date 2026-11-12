@@ -112,6 +112,37 @@ template <class T> bool GetFn(sl::Feature f, const char* name, T*& out)
     return true;
 }
 
+// NGX snippets (nvngx_dlssg.dll) carry only NVIDIA's ordinary Authenticode signature, not the secondary
+// Streamline signature sl::security::verifyEmbeddedSignature requires of the sl.* plugins (which rejected
+// every shipped nvngx_dlssg.dll). Check them the standard way: valid for the OS, signed by NVIDIA Corporation.
+bool SignedByNvidiaAuthenticode(const wchar_t* path)
+{
+    WINTRUST_FILE_INFO fi{};
+    fi.cbStruct = sizeof fi;
+    fi.pcwszFilePath = path;
+    WINTRUST_DATA wd{};
+    wd.cbStruct = sizeof wd;
+    wd.dwUIChoice = WTD_UI_NONE;
+    wd.fdwRevocationChecks = WTD_REVOKE_NONE;
+    wd.dwUnionChoice = WTD_CHOICE_FILE;
+    wd.pFile = &fi;
+    wd.dwStateAction = WTD_STATEACTION_VERIFY;
+    GUID act = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+    bool ok = WinVerifyTrust(nullptr, &act, &wd) == ERROR_SUCCESS;
+    if (ok) {
+        wchar_t org[128] = L"";
+        CRYPT_PROVIDER_DATA* pd = WTHelperProvDataFromStateData(wd.hWVTStateData);
+        CRYPT_PROVIDER_SGNR* sg = pd ? WTHelperGetProvSignerFromChain(pd, 0, FALSE, 0) : nullptr;
+        CRYPT_PROVIDER_CERT* pc = sg ? WTHelperGetProvCertFromChain(sg, 0) : nullptr;
+        if (pc && pc->pCert)
+            CertGetNameStringW(pc->pCert, CERT_NAME_ATTR_TYPE, 0, (void*)szOID_ORGANIZATION_NAME, org, 128);
+        ok = wcscmp(org, L"NVIDIA Corporation") == 0;
+    }
+    wd.dwStateAction = WTD_STATEACTION_CLOSE;
+    WinVerifyTrust(nullptr, &act, &wd);
+    return ok;
+}
+
 void SetIdentity(sl::float4x4& m)
 {
     for (uint32_t r = 0; r < 4; r++) m.setRow(r, sl::float4(r == 0, r == 1, r == 2, r == 3));
@@ -135,7 +166,9 @@ __declspec(dllexport) int rfom_dlssg_init(ID3D12Device* dev, const wchar_t* dir,
     for (const wchar_t* f : kSigned) {
         const std::wstring p = g_dir + L"\\" + f;
         if (GetFileAttributesW(p.c_str()) == INVALID_FILE_ATTRIBUTES) { Log("%ls not found", f); return 0; }
-        if (!sl::security::verifyEmbeddedSignature(p.c_str())) { Log("%ls is not signed by NVIDIA -- refusing to load it", f); return 0; }
+        const bool ngx = wcsncmp(f, L"nvngx_", 6) == 0;
+        if (!(ngx ? SignedByNvidiaAuthenticode(p.c_str()) : sl::security::verifyEmbeddedSignature(p.c_str()))) {
+            Log("%ls is not signed by NVIDIA -- refusing to load it", f); return 0; }
     }
     g_mod = LoadLibraryW(interposer.c_str());
     if (!g_mod) { Log("cannot load sl.interposer.dll (error %lu)", GetLastError()); return 0; }

@@ -955,6 +955,22 @@ static int s_park_pass = 0;           /* this drain stopped on a self-JUMP park 
 /* How long a self-JUMP park may stand with `put` somewhere else before the
  * drain gives up on it being patched and follows `put` instead. */
 #define GCM_PARK_GRACE_MS 50ull
+/* The park being timed. Cleared as soon as `get` leaves it (the title patched
+ * the word): a later park at the same offset with the same `put` -- a title
+ * reusing the same side-buffer slot frame after frame -- is a new park, not
+ * one that has stood since the first. Before, only a resync cleared it, so
+ * after one grace period every fresh park there was resynced on sight,
+ * dropping the commands (and the frame's label write) from the ring start to
+ * put (the inFAMOUS 2 recomp's freeze, docs/NOTES.md "The freeze").
+ * GCM_PARK_CLEAR=1 enables it (off by default until tested on this title). */
+static u32 s_park_off, s_park_put;
+static unsigned long long s_park_since;
+static int gcm_park_clear_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("GCM_PARK_CLEAR"); on = e && e[0] == '1'; }
+    return on;
+}
 /* How close `current` must get to `end` before the runtime will recycle a ring
  * on the title's behalf. One gcmReserve is 8 bytes; a page of slack keeps a
  * title that is merely near the end from being touched. */
@@ -2142,6 +2158,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
             break;
         }
         u32 w = vm_read32(ea);
+        if (s_park_off && s_fifo_getoff == s_park_off && w != (0x20000000u | s_park_off) && gcm_park_clear_on())
+            s_park_off = 0;   /* the park was patched: `get` leaves it */
         /* Only remember offsets BELOW put -- those are positions in the
          * ring the title is writing. A park in another region is where the
          * walker gave up, not how far it got through the ring. */
@@ -2266,13 +2284,11 @@ static void gcm_rsx_process_fifo_unlocked(void)
                    * takes between the two stores. */
                   if (put != s_fifo_getoff) {
                       extern unsigned long long ps3_ms_now(void);
-                      static u32 park_off, park_put;
-                      static unsigned long long park_since;
                       const unsigned long long now = ps3_ms_now();
-                      if (park_off != s_fifo_getoff || park_put != put) {
-                          park_off = s_fifo_getoff; park_put = put; park_since = now;
-                      } else if (now - park_since >= GCM_PARK_GRACE_MS) {
-                          park_off = 0;
+                      if (s_park_off != s_fifo_getoff || s_park_put != put) {
+                          s_park_off = s_fifo_getoff; s_park_put = put; s_park_since = now;
+                      } else if (now - s_park_since >= GCM_PARK_GRACE_MS) {
+                          s_park_off = 0;
                           gcm_fifo_dump_around(s_fifo_getoff);
                           gcm_fifo_resync_why("jump-park", &s_fifo_getoff, put);
                       }
