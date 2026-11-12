@@ -22,6 +22,8 @@ if errorlevel 1 (echo Could not set up the Visual Studio build tools. & goto fai
 set "PATH=C:\Program Files\LLVM\bin;C:\Program Files\CMake\bin;%LOCALAPPDATA%\Microsoft\WinGet\Links;%PATH%"
 set "FFOPT=-DPS3RECOMP_FFMPEG_RUNTIME=ON -DPS3RECOMP_FFMPEG_INCLUDE_DIR=%~dp0ffmpeg\include"
 set "PS=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
+rem files dated in the future (zip/installer time zones) make Ninja regenerate forever
+"%PS%" -NoProfile -ExecutionPolicy Bypass -File "%~dp0tools\fix_timestamps.ps1"
 if not defined RFOM_JOBS set "RFOM_JOBS=4"
 
 (
