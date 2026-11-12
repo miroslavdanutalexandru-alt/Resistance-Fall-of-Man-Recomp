@@ -1829,6 +1829,29 @@ static void dark_titlebar(HWND hw)
     DwmSetWindowAttribute(hw, 35, &cap, sizeof cap);              // DWMWA_CAPTION_COLOR (Windows 11)
 }
 
+// "Launcher.exe --play" (RecompLauncher, recomplauncher.json): no window. Rewrites settings.bat from settings.ini (the
+// RecompLauncher may have changed it), runs the shader scan, starts run.bat hidden and waits until the game has closed.
+// Exit codes: 0 = played, 3 = not built yet (run Setup), 4 = run.bat could not start.
+static int play_headless()
+{
+    load_settings();
+    save_settings();
+    if (GetFileAttributesA(path_of("build\\ResistanceFoM.exe").c_str()) == INVALID_FILE_ATTRIBUTES) return 3;
+    if (!shaderscan_exe().empty()) scan_thread(NULL);
+    lx_auto_backup();
+    SHELLEXECUTEINFOA se = { sizeof se };
+    se.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC;
+    se.lpVerb = "open";
+    const std::string bat = path_of("run.bat");
+    se.lpFile = bat.c_str();
+    se.lpDirectory = g_dir;
+    se.nShow = SW_HIDE;
+    if (!ShellExecuteExA(&se) || !se.hProcess) return 4;
+    WaitForSingleObject(se.hProcess, INFINITE);   // run.bat waits for the game, then backs up the shader cache
+    CloseHandle(se.hProcess);
+    return 0;
+}
+
 int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmd, int show)
 {
     // per-monitor DPI awareness, so text is sharp at 125% / 150% scaling
@@ -1844,6 +1867,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmd, int show)
     lx_register();                          // launcher_extra_r1.inc: the extras' settings (after "updates")
     // test hook: "Launcher.exe --resave" reads settings.ini and writes settings.ini and settings.bat again (no window)
     if (cmd && strstr(cmd, "--resave")) { load_settings(); return save_settings() ? 0 : 1; }
+    if (cmd && strstr(cmd, "--play")) return play_headless();
     load_settings();
     detect_hardware();
     if (g_first_run) apply_recommended();   // first start: this PC's recommended settings
