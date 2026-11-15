@@ -32,6 +32,7 @@
     #include <netinet/tcp.h>
     #include <netdb.h>
     #include <arpa/inet.h>
+    #include <strings.h>   /* strcasecmp: PS3_NET_HOSTS name matching */
     #include <unistd.h>
     #include <fcntl.h>
     #include <errno.h>
@@ -83,9 +84,16 @@ typedef struct {
     int           stream;   /* SOCK_STREAM or SOCK_STREAM_P2P */
     uint16_t      vport;    /* the P2P vport it was bound to */
     int           listening;
+    /* A DNS answer this port made up for a query it did not really send
+     * (see the built-in resolver below). */
+    uint8_t       dns[512];
+    uint32_t      dns_len;
+    struct sockaddr_in dns_from;
 } net_socket_slot;
 
 static net_socket_slot s_sockets[SYS_NET_MAX_SOCKETS];
+/* Guest LR of the last socket call, for the packet trace (see h_send below). */
+static uint32_t s_io_lr;
 static int s_net_initialized = 0;
 
 /* Guest scratch, allocated on first use through the allocator the runtime
@@ -598,8 +606,8 @@ static void trace(const char* op, int32_t s, int n, const struct sockaddr_in* a)
     hh = (unsigned)tm.tm_hour; mm = (unsigned)tm.tm_min; ss = (unsigned)tm.tm_sec;
     ms = (unsigned)(tv.tv_usec / 1000);
 #endif
-    printf("[sys_net %02u:%02u:%02u.%03u] %s(%d) %s:%u -> %d (host error %d)\n", hh, mm, ss, ms,
-           op, s, ip, a ? ntohs(a->sin_port) : 0, n, err);
+    printf("[sys_net %02u:%02u:%02u.%03u] %s(%d) %s:%u -> %d (host error %d) lr=0x%08X\n", hh, mm, ss, ms,
+           op, s, ip, a ? ntohs(a->sin_port) : 0, n, err, s_io_lr);
 }
 
 int32_t sys_net_bnet_send(int32_t s, const void* buf, uint32_t len, int32_t flags)
@@ -609,6 +617,96 @@ int32_t sys_net_bnet_send(int32_t s, const void* buf, uint32_t len, int32_t flag
     int n = send(s_sockets[s].host_fd, GUEST_PTR(EA(buf), const char*), (int)len, PS3_NET_HOST_SEND_FLAGS);
     if (net_trace()) trace("send", s, n, NULL);
     return n == HOST_SOCKET_ERROR ? host_fail() : n;
+}
+
+/* ---------------------------------------------------------------------------
+ * Built-in DNS for PS3_NET_HOSTS.
+ *
+ * The front end does NOT use gethostbyname for the Sony hostnames. Its own
+ * resolver sends a UDP query straight to 8.8.8.8:53 (logged as
+ * `sendto(1) 8.8.8.8:53 -> 48`), which PS3_NET_HOSTS cannot touch, and those
+ * names no longer exist -- so the answer is NXDOMAIN and Medius never
+ * connects. Answer the query ourselves instead, with the same mapping
+ * net_hosts.txt already provides, so pointing a title at a community server
+ * needs no system resolver change. Names we do not know are passed through to
+ * the real server untouched.
+ * -----------------------------------------------------------------------*/
+
+/* Defined below with PS3_NET_HOSTS; the resolver above needs it earlier. */
+static int hosts_override(const char* host, struct in_addr* out);
+
+static int dns_pending(int32_t s)
+{
+    return s >= 0 && s < SYS_NET_MAX_SOCKETS && s_sockets[s].in_use && s_sockets[s].dns_len > 0;
+}
+
+/* Read the QNAME at buf+12 into dot notation. Returns the offset just past the
+ * question section, or 0 when the packet is not a single-question A/IN query. */
+static uint32_t dns_parse_question(const uint8_t* buf, uint32_t len, char* name, size_t namecap)
+{
+    if (len < 12 + 5) return 0;
+    if ((buf[4] << 8 | buf[5]) != 1) return 0;          /* QDCOUNT */
+    uint32_t p = 12; size_t n = 0;
+    if (namecap) name[0] = 0;
+    while (p < len && buf[p]) {
+        uint32_t l = buf[p];
+        if (l & 0xC0) return 0;                          /* compression in a question */
+        if (p + 1 + l >= len) return 0;
+        if (n + l + 2 >= namecap) return 0;
+        if (n) name[n++] = '.';
+        memcpy(name + n, buf + p + 1, l);
+        n += l; name[n] = 0;
+        p += 1 + l;
+    }
+    if (p + 5 > len) return 0;
+    p += 1;                                              /* root label */
+    uint16_t qtype = (uint16_t)(buf[p] << 8 | buf[p + 1]);
+    uint16_t qclass = (uint16_t)(buf[p + 2] << 8 | buf[p + 3]);
+    if (qtype != 1 || qclass != 1) return 0;             /* A / IN only */
+    return p + 4;
+}
+
+/* Intercept a query to port 53. 1 = answered here (nothing was sent). */
+static int dns_maybe_answer(int32_t s, const void* guest_buf, uint32_t len,
+                            const struct sockaddr_in* to)
+{
+    if (!to || ntohs(to->sin_port) != 53 || len < 12 || len > 400) return 0;
+    if (s < 0 || s >= SYS_NET_MAX_SOCKETS) return 0;
+
+    const uint8_t* q = (const uint8_t*)GUEST_PTR(EA(guest_buf), const uint8_t*);
+    char name[256];
+    uint32_t qend = dns_parse_question(q, len, name, sizeof(name));
+    if (!qend) return 0;
+
+    struct in_addr answer;
+    if (!hosts_override(name, &answer)) {
+        printf("[sys_net] DNS query '%s' -> real server (not in PS3_NET_HOSTS)\n", name);
+        return 0;
+    }
+
+    net_socket_slot* sl = &s_sockets[s];
+    memset(sl->dns, 0, sizeof sl->dns);
+    memcpy(sl->dns, q, qend);                            /* id, then the question */
+    sl->dns[2] = 0x81;                                   /* QR=1, RD=1 */
+    sl->dns[3] = 0x80;                                   /* RA=1, rcode=0 */
+    sl->dns[4] = 0; sl->dns[5] = 1;                      /* QDCOUNT */
+    sl->dns[6] = 0; sl->dns[7] = 1;                      /* ANCOUNT */
+    sl->dns[8] = 0; sl->dns[9] = 0;                      /* NSCOUNT */
+    sl->dns[10] = 0; sl->dns[11] = 0;                    /* ARCOUNT */
+    uint8_t* a = sl->dns + qend;
+    a[0] = 0xC0; a[1] = 0x0C;                            /* pointer to the question name */
+    a[2] = 0; a[3] = 1;                                  /* TYPE A */
+    a[4] = 0; a[5] = 1;                                  /* CLASS IN */
+    a[6] = a[7] = a[8] = 0; a[9] = 60;                   /* TTL 60 s */
+    a[10] = 0; a[11] = 4;                                /* RDLENGTH */
+    memcpy(a + 12, &answer.s_addr, 4);
+    sl->dns_len = qend + 16;
+    sl->dns_from = *to;
+
+    char ip[16];
+    printf("[sys_net] DNS '%s' -> %s (answered locally, %u bytes)\n",
+           name, ip_str(&answer, ip), sl->dns_len);
+    return 1;
 }
 
 int32_t sys_net_bnet_sendto(int32_t s, const void* buf, uint32_t len, int32_t flags,
@@ -622,6 +720,7 @@ int32_t sys_net_bnet_sendto(int32_t s, const void* buf, uint32_t len, int32_t fl
     if (s_sockets[s].p2p && np_psnr_p2p_route(GUEST_PTR(EA(buf), const char*), len,
                                              (const uint8_t*)&a.sin_addr, ntohs(a.sin_port)))
         return (int32_t)len;   /* went through psnr's relay */
+    if (dns_maybe_answer(s, buf, len, &a)) return (int32_t)len;
     if (would_block(s, flags, POLLOUT)) return fail(SYS_NET_EWOULDBLOCK);
     int n = sendto(s_sockets[s].host_fd, GUEST_PTR(EA(buf), const char*), (int)len, PS3_NET_HOST_SEND_FLAGS,
                    (struct sockaddr*)&a, sizeof(a));
@@ -645,6 +744,19 @@ int32_t sys_net_bnet_recvfrom(int32_t s, void* buf, uint32_t len, int32_t flags,
     socklen_t alen;
     int n;
     if (!valid_socket(s)) return fail(SYS_NET_EBADF);
+
+    /* A DNS answer we made up for a query the title sent to 8.8.8.8:53. */
+    if (s_sockets[s].dns_len) {
+        net_socket_slot* sl = &s_sockets[s];
+        uint32_t n = sl->dns_len;
+        if (n > len) n = len;
+        memcpy(GUEST_PTR(EA(buf), uint8_t*), sl->dns, n);
+        a = sl->dns_from;
+        sl->dns_len = 0;
+        if (net_trace()) trace("recvfrom(dns)", s, (int)n, &a);
+        write_sockaddr(EA(from), EA(fromlen), &a);
+        return (int32_t)n;
+    }
 
     /* psnr's own packets (probe replies, peers' punches) are consumed here;
      * the title only ever sees its own traffic. */
@@ -837,6 +949,8 @@ static int run_poll(const int32_t* gfd, const short* gev, short* grev, int n, in
     int relayed = 0;
     for (int i = 0; i < n; i++)
         if ((gev[i] & SYS_NET_POLLIN) && valid_socket(gfd[i]) && relayed_pending(gfd[i])) relayed++;
+    for (int i = 0; i < n; i++)
+        if ((gev[i] & SYS_NET_POLLIN) && valid_socket(gfd[i]) && dns_pending(gfd[i])) relayed++;
     if (nval || relayed) timeout_ms = 0;
     if (nh == 0) { sleep_ms(timeout_ms); return nval; }
 
@@ -852,6 +966,7 @@ static int run_poll(const int32_t* gfd, const short* gev, short* grev, int n, in
         if (h & POLLHUP)  rv |= SYS_NET_POLLHUP;
         if (h & POLLNVAL) rv |= SYS_NET_POLLNVAL;
         if ((gev[map[k]] & SYS_NET_POLLIN) && relayed_pending(gfd[map[k]])) rv |= SYS_NET_POLLIN;
+        if ((gev[map[k]] & SYS_NET_POLLIN) && dns_pending(gfd[map[k]])) rv |= SYS_NET_POLLIN;
         grev[map[k]] = rv;
         if (rv) ready++;
     }
@@ -934,6 +1049,59 @@ int32_t sys_net_bnet_select(int32_t nfds, void* readfds, void* writefds,
  * Addresses and DNS
  * -----------------------------------------------------------------------*/
 
+/* Case-insensitive hostname compare for PS3_NET_HOSTS. */
+#ifdef _WIN32
+#  define host_name_eq(a, b) (_stricmp((a), (b)) == 0)
+#else
+#  define host_name_eq(a, b) (strcasecmp((a), (b)) == 0)
+#endif
+
+/* PS3_NET_HOSTS=<file>: hostname -> IPv4 overrides, so a community server can
+ * answer the title's hardcoded hostnames without an Administrator edit of the
+ * system hosts file. One "name ip" or "name=ip" per line; '#' starts a comment
+ * and blank lines are skipped. The file is read on every lookup: DNS lookups
+ * are rare, and an edit made while the game runs then applies to the next
+ * connect. Returns 1 and fills *out when the name was found. */
+static int hosts_override(const char* host, struct in_addr* out)
+{
+    const char* path = getenv("PS3_NET_HOSTS");
+    if (!path || !*path) return 0;
+    FILE* f = fopen(path, "r");
+    if (!f) return 0;
+
+    char line[512];
+    int found = 0;
+    while (!found && fgets(line, sizeof line, f)) {
+        char* p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '#' || *p == '\r' || *p == '\n' || !*p) continue;
+        /* "host=ip" and "host ip" both split at whitespace once '=' is gone. */
+        char* q;
+        for (q = p; *q; q++) if (*q == '=') *q = ' ';
+        char name[256] = "", addr[64] = "";
+        if (sscanf(p, "%255s %63s", name, addr) != 2) continue;
+        if (!host_name_eq(name, host)) continue;
+        if (inet_pton(AF_INET, addr, out) == 1) {
+            found = 1;
+        } else {
+            /* A domain name (a community server's DNS name): resolve it with the
+             * host's DNS, IPv4 only. */
+            struct addrinfo hints, *res = NULL;
+            memset(&hints, 0, sizeof hints);
+            hints.ai_family = AF_INET;
+            if (getaddrinfo(addr, NULL, &hints, &res) == 0 && res) {
+                *out = ((struct sockaddr_in*)res->ai_addr)->sin_addr;
+                freeaddrinfo(res);
+                found = 1;
+            } else {
+                printf("[sys_net] PS3_NET_HOSTS: '%s' for '%s' did not resolve\n", addr, name);
+            }
+        }
+    }
+    fclose(f);
+    return found;
+}
+
 int32_t sys_net_bnet_inet_pton(int32_t family, const char* src, void* dst)
 {
     /* PS3's current host-socket backend supports AF_INET. Do not pass guest
@@ -988,16 +1156,22 @@ uint32_t sys_net_bnet_gethostbyname(const char* name)
     const char* host = GUEST_PTR(EA(name), const char*);
     uint32_t h = scratch(&s_hostent_ea, HOSTENT_SCRATCH);
     struct addrinfo hints, *res = NULL;
+    struct in_addr address;
     if (!host || !h) return 0;
 
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_INET;
-    if (getaddrinfo(host, NULL, &hints, &res) != 0 || !res) {
-        printf("[sys_net] gethostbyname('%s') failed\n", host);
-        if (scratch(&s_h_errno_ea, 4)) vm_write32(s_h_errno_ea, SYS_NET_HOST_NOT_FOUND);
-        return 0;
+    if (hosts_override(host, &address)) {
+        char ip[16];
+        printf("[sys_net] gethostbyname('%s') -> %s (PS3_NET_HOSTS)\n", host, ip_str(&address, ip));
+    } else {
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_family = AF_INET;
+        if (getaddrinfo(host, NULL, &hints, &res) != 0 || !res) {
+            printf("[sys_net] gethostbyname('%s') failed\n", host);
+            if (scratch(&s_h_errno_ea, 4)) vm_write32(s_h_errno_ea, SYS_NET_HOST_NOT_FOUND);
+            return 0;
+        }
+        address = ((const struct sockaddr_in*)res->ai_addr)->sin_addr;
     }
-    const struct sockaddr_in* sa = (const struct sockaddr_in*)res->ai_addr;
 
     memset(vm_ptr8(h), 0, HOSTENT_SCRATCH);
     vm_write32(h + 0,  h + 64);           /* h_name */
@@ -1006,12 +1180,14 @@ uint32_t sys_net_bnet_gethostbyname(const char* name)
     vm_write32(h + 12, 4);                /* h_length */
     vm_write32(h + 16, h + 40);           /* h_addr_list -> { &addr, NULL } */
     vm_write32(h + 40, h + 48);
-    memcpy(vm_ptr8(h + 48), &sa->sin_addr, 4);
+    memcpy(vm_ptr8(h + 48), &address, 4);
     strncpy((char*)vm_ptr8(h + 64), host, HOSTENT_SCRATCH - 65);
 
-    char ip[16];
-    printf("[sys_net] gethostbyname('%s') -> %s\n", host, ip_str(&sa->sin_addr, ip));
-    freeaddrinfo(res);
+    if (res) {
+        char ip[16];
+        printf("[sys_net] gethostbyname('%s') -> %s\n", host, ip_str(&address, ip));
+        freeaddrinfo(res);
+    }
     return h;
 }
 
@@ -1038,10 +1214,80 @@ static void h_listen(ppu_context* ctx)      { RET_S(sys_net_bnet_listen(S32(3), 
 static void h_accept(ppu_context* ctx)      { RET_S(sys_net_bnet_accept(S32(3), PTR(4), PTR(5))); }
 static void h_connect(ppu_context* ctx)     { RET_S(sys_net_bnet_connect(S32(3), PTR(4), R32(5))); }
 static void h_shutdown(ppu_context* ctx)    { RET_S(sys_net_bnet_shutdown(S32(3), S32(4))); }
-static void h_send(ppu_context* ctx)        { RET_S(sys_net_bnet_send(S32(3), PTR(4), R32(5), S32(6))); }
-static void h_sendto(ppu_context* ctx)      { RET_S(sys_net_bnet_sendto(S32(3), PTR(4), R32(5), S32(6), PTR(7), R32(8))); }
-static void h_recv(ppu_context* ctx)        { RET_S(sys_net_bnet_recv(S32(3), PTR(4), R32(5), S32(6))); }
-static void h_recvfrom(ppu_context* ctx)    { RET_S(sys_net_bnet_recvfrom(S32(3), PTR(4), R32(5), S32(6), PTR(7), PTR(8))); }
+/* Which guest function called send/recv. The title's own network code lives
+ * in hundreds of unnamed recompiled functions, so "who sent these 4 bytes" is
+ * otherwise unanswerable; with the LR, the call site is a func_XXXXXXXX name
+ * in recompiled/ and the caller can be read as C++. */
+/* ---------------------------------------------------------------------------
+ * PS3_NET_BT=<n>: host backtrace whenever the title sends or receives.
+ *
+ * The guest stack scanner behind PS3_DEBUG's `threads` cannot follow a call
+ * made through a virtual dispatch, and the Medius message layer is full of
+ * them -- the record reader func_00602A68 has no static callers at all. The
+ * HOST stack has no such problem: every recompiled function is a real C++
+ * frame, so the frames here ARE the recompiled functions, and the addresses
+ * can be resolved against build\\ResistanceFoM.pdb.
+ *
+ * Prints module-relative addresses (rva) because the exe is relocated.
+ * -----------------------------------------------------------------------*/
+#ifdef _WIN32
+#include <windows.h>
+static void host_bt_emit(const char* what)
+{
+    void* frames[48];
+    unsigned short c = RtlCaptureStackBackTrace(0, 48, frames, NULL);
+    char* base = (char*)GetModuleHandleA(NULL);
+    fprintf(stderr, "[netbt] %s:", what);
+    for (unsigned short i = 0; i < c; i++) fprintf(stderr, " %llX", (unsigned long long)((char*)frames[i] - base));
+    fprintf(stderr, "\n");
+    fflush(stderr);
+}
+
+/* PS3_NET_BT_ALL=1: backtrace EVERY send/recv, no budget.
+ *
+ * The budget below never worked: the game reads PS3_NET_BT=400 (the string is in
+ * the exe, the bat sets it unconditionally) and still stops after exactly 40
+ * lines, so whatever the cause, a count-based gate cannot be trusted to reach
+ * the call we care about -- the 0x0B send is around the 60th socket call. This
+ * switch has no counter, so it cannot run out. Lines land next to the transport
+ * log in the same stderr stream, so a given send is found by reading backwards
+ * from its [sys_net] line. */
+static int bt_all(void)
+{
+    static int s_all = -1;
+    if (s_all == -1) { const char* e = getenv("PS3_NET_BT_ALL"); s_all = (e && *e && *e != '0') ? 1 : 0;
+        if (s_all) fprintf(stderr, "[netbt] PS3_NET_BT_ALL=1: unbudgeted backtraces\n"); }
+    return s_all;
+}
+
+static void host_bt(const char* what, int n)
+{
+    (void)what; (void)n;
+    /* budget path: report what it actually decided, once, so a repeat of the
+     * "set 400, got 40" mystery names itself instead of costing a guess. */
+    static int s_n = -1;
+    if (s_n == -1) {
+        const char* e = getenv("PS3_NET_BT");
+        s_n = e ? atoi(e) : 0;
+        if (s_n > 0) fprintf(stderr, "[netbt] budget=%d (PS3_NET_BT=\"%s\")\n", s_n, e);
+        fflush(stderr);
+    }
+    if (bt_all()) { host_bt_emit(what); return; }
+    if (s_n <= 0) return;
+    static int s_left = -3;
+    if (s_left == -3) s_left = s_n;
+    if (s_left <= 0) return;
+    s_left--;
+    host_bt_emit(what);
+}
+#else
+static void host_bt(const char* what, int n) { (void)what; (void)n; }
+#endif
+
+static void h_send(ppu_context* ctx)        { s_io_lr = (uint32_t)ctx->lr; host_bt("send", S32(3)); RET_S(sys_net_bnet_send(S32(3), PTR(4), R32(5), S32(6))); }
+static void h_sendto(ppu_context* ctx)      { s_io_lr = (uint32_t)ctx->lr; RET_S(sys_net_bnet_sendto(S32(3), PTR(4), R32(5), S32(6), PTR(7), R32(8))); }
+static void h_recv(ppu_context* ctx)        { s_io_lr = (uint32_t)ctx->lr; host_bt("recv", S32(3)); RET_S(sys_net_bnet_recv(S32(3), PTR(4), R32(5), S32(6))); }
+static void h_recvfrom(ppu_context* ctx)    { s_io_lr = (uint32_t)ctx->lr; RET_S(sys_net_bnet_recvfrom(S32(3), PTR(4), R32(5), S32(6), PTR(7), PTR(8))); }
 static void h_setsockopt(ppu_context* ctx)  { RET_S(sys_net_bnet_setsockopt(S32(3), S32(4), S32(5), PTR(6), R32(7))); }
 static void h_getsockopt(ppu_context* ctx)  { RET_S(sys_net_bnet_getsockopt(S32(3), S32(4), S32(5), PTR(6), PTR(7))); }
 static void h_getsockname(ppu_context* ctx) { RET_S(sys_net_bnet_getsockname(S32(3), PTR(4), PTR(5))); }

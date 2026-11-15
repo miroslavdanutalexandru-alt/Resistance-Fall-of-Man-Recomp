@@ -19,7 +19,8 @@ The runtime's command line takes two flags, anywhere after the program name:
 The name follows PSN's online ID rules: 3-16 letters, digits, `-` or `_`,
 starting with a letter. Other characters are dropped, and a name that still
 doesn't fit is ignored with a message. With no name set, an online game uses
-the OS login name. Offline with no name, nothing changes ("PS3Player").
+a random name such as "ExcitingHippo" (`np_psnr_random_id`), never the OS
+login name. Offline with no name, nothing changes ("PS3Player").
 
 | Variable | What it does |
 |---|---|
@@ -30,6 +31,11 @@ the OS login name. Offline with no name, nothing changes ("PS3Player").
 | `PS3_NET_P2P_PORT=n` | The host port this instance's P2P sockets bind, whatever port the title asks for. Default 3658. psnr hands this port to peers. Two instances on one machine need two ports. |
 | `PS3_NP_SIGNALING_DELAY_MS=n` | How long after a member joins that signaling reports them "established". Default 1000. |
 | `PS3_NET_TRACE=1` | Log every packet sent, and every packet received (not the empty polls). |
+| `PS3_NET_HOSTS=<file>` | Hostname -> IPv4 overrides for `gethostbyname`, one `name ip` (or `name=ip`) per line, `#` comments. For a title whose own backend calls hardcoded hostnames: point those names at a community server without an Administrator edit of the system hosts file. Applies to `PS3_NET_ONLINE` lookups only. |
+
+## Titles with their own network backend
+
+Not every online title uses `sceNpMatching2`. Resistance: Fall of Man, for example, matches through Sony's Medius Client Library and connects to hardcoded regional hostnames. For those, `PS3_NET_ONLINE=1` is what matters: it makes `sys_net` real, so the title's own stack runs against the host network. psnr is not involved, and `PSNR_SERVER` can stay unset. Point the title's hostnames at a server with `PS3_NET_HOSTS`; the log then shows every lookup (`[sys_net] gethostbyname(...)`) and, with `PS3_NET_TRACE=1`, every packet.
 
 ## Two players on one machine
 
