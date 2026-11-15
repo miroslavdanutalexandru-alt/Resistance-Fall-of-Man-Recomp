@@ -5,7 +5,7 @@ if not exist logs mkdir logs
 rem settings and controls are also kept in Saved Games\Resistance Fall of Man\config, so they survive a reinstall or update:
 rem missing files are restored from there before the game starts and saved back after it closes. portable.txt turns this off.
 set "CFG_USER=%USERPROFILE%\Saved Games\Resistance Fall of Man\config"
-set "CFG_FILES=settings.ini settings.bat controls.txt mouselook.cfg"
+set "CFG_FILES=settings.ini settings.bat controls.txt mouselook.cfg online.txt net_hosts.txt"
 if not exist portable.txt if exist "%CFG_USER%" robocopy "%CFG_USER%" . %CFG_FILES% /XO /XN /XC /R:0 /W:0 /NJH /NJS /NFL /NDL /NP >nul
 rem RFOM_BUILD_DIR: run another build of the programs (a Launcher.exe in that folder sets it)
 if not defined RFOM_BUILD_DIR set "RFOM_BUILD_DIR=build"
@@ -26,6 +26,8 @@ set "CHILD_PS3_FTRACE_CAP=1500000"
 set "PS3_DEBUG=%~dp0logs\dbg.txt"
 rem your copy of the game (Setup.bat put it here)
 set "PS3_VFS_ROOT=%~dp0gamefiles"
+rem Multiplayer page: hostname overrides for community servers (read by libs/network/sysNet.c)
+if exist net_hosts.txt set "PS3_NET_HOSTS=%~dp0net_hosts.txt"
 rem Launcher.exe writes settings.bat (display mode, frame limit, vsync, filtering, keys)
 if exist settings.bat call settings.bat
 rem portable.txt: saves stay in this folder (gamedata) too

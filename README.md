@@ -156,12 +156,13 @@ The options are sorted into pages (the same pages as the Resistance 2 / 3 launch
 | 2 | Upscaling & Frame Gen | Anti-aliasing and upscaling (DLSS / FSR / XeSS, DLSS model, sharpening, object motion vectors), Frame generation and latency (Frame Generation, Reflex) |
 | 3 | Performance | Shader cache (compile before playing, compile threads, **Rebuild shader cache**) |
 | 4 | Controls | Key bindings, Mouse, Controller, Gyro, Controller buttons |
-| 5 | Audio | Sound (speaker layout, audio buffer), In the background |
-| 6 | Interface & Notifications | Notifications (achievement pop-ups), Movies (hold to skip, skip hint), Overlays (F3 overlay and its corner), Photo mode and Discord |
-| 7 | Advanced | Start-up and quitting, Gameplay (gore, adaptive difficulty), Mods and textures, Saves (location, backups, **Open save folder**), Updates |
-| 8 | Achievements | Unofficial fan-made achievements read from your save (see *Achievements* under *Trophies*) |
-| 9 | Saves & tools | Save backups, the benchmark |
-| 10 | About | Version, credits and licences, the key list, folder buttons, the project page, **Report a problem**, **Reset all to defaults** |
+| 5 | Multiplayer | Online play (community servers, network logging), **Edit online.txt**, **Edit net_hosts.txt** |
+| 6 | Audio | Sound (speaker layout, audio buffer), In the background |
+| 7 | Interface & Notifications | Notifications (achievement pop-ups), Movies (hold to skip, skip hint), Overlays (F3 overlay and its corner), Photo mode and Discord |
+| 8 | Advanced | Start-up and quitting, Gameplay (gore, adaptive difficulty), Mods and textures, Saves (location, backups, **Open save folder**), Updates |
+| 9 | Achievements | Unofficial fan-made achievements read from your save (see *Achievements* under *Trophies*) |
+| 10 | Saves & tools | Save backups, the benchmark |
+| 11 | About | Version, credits and licences, the key list, folder buttons, the project page, **Report a problem**, **Reset all to defaults** |
 
 Options that are empty by default write nothing to `settings.bat` until changed (the game's default is used).
 
@@ -219,6 +220,15 @@ Button: **Rebuild shader cache** (asks first).
 
 **Controls:** key bindings, the mouse (sensitivity, invert, mouse aiming, the free-cursor key, vertical and zoomed sensitivity, zoom mode, shaking off grabs with the mouse (`RFOM_GRAB_MOUSE=0` = off), the extra crosshair), the controller (use / interact button, deadzone, response curve, controller support, button prompts `RFOM_PAD_GLYPHS=\|xbox\|ps`, Nintendo layout, light bar, pause on disconnect, southpaw, player 1 controller `PAD_P1_CONTROLLER=1..4`), gyro, and the controller button remap. See *Controls* above.
 
+**Multiplayer**
+
+Online play uses the community server, `r1.rfom.online` (Resistance-Fall-of-Man-Recomp-Server).
+
+| Setting | Choices (default) | Environment variable | Notes |
+|---|---|---|---|
+| Log network traffic | **Off**, On | `PS3_NET_TRACE=1` | Every packet sent and received goes to `logs\run.log`. Large and slow; for diagnosing a failed connection. |
+| Edit online.txt | button | `PSNR_SERVER`, `PS3_NP_ONLINE_ID` | `id=` the player name (default: a random one, such as ExcitingHippo). |
+| Edit net_hosts.txt | button | `PS3_NET_HOSTS` | Which server the game connects to: one `hostname address` per line (IP or domain). Default: `r1.rfom.online`. |
 **Audio**
 
 | Setting | Choices (default) | Environment variable | Notes |

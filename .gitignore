@@ -54,6 +54,13 @@ __pycache__/
 # local copies of earlier builds
 /backup_build_*/
 
+# per-user online settings written by the launcher's Multiplayer page
+/net_hosts.txt
+/online.txt
+
+# local multiplayer research notes
+/docs/MULTIPLAYER-PLAN.md
+
 # Setup.exe is attached to the GitHub release, not committed
 /Setup.exe
 /scratch/RSXFIFOCommands*.pdf
