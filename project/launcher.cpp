@@ -624,11 +624,11 @@ struct Widget {
     std::string title, help;     // for the help strip
     bool disabled = false;
 };
-enum Page { P_DISPLAY, P_GRAPHICS, P_UPSCALE, P_PERF, P_CONTROLS, P_AUDIO, P_UI, P_ADVANCED, P_TROPHIES, P_TOOLS, P_ABOUT,
-            P_COUNT };   // "Launcher.exe --page N" numbers (README)
+enum Page { P_DISPLAY, P_GRAPHICS, P_UPSCALE, P_PERF, P_CONTROLS, P_ONLINE, P_AUDIO, P_UI, P_ADVANCED, P_TROPHIES,
+            P_TOOLS, P_ABOUT, P_COUNT };   // "Launcher.exe --page N" numbers (README)
 static const char* g_page_name[P_COUNT] = { "Display", "Graphics", "Upscaling & Frame Gen", "Performance", "Controls",
-                                            "Audio", "Interface & Notifications", "Advanced", "Achievements",
-                                            "Saves & tools", "About" };
+                                            "Multiplayer", "Audio", "Interface & Notifications", "Advanced",
+                                            "Achievements", "Saves & tools", "About" };
 static float g_nav_end;   // bottom of the sidebar items (the art starts below them)
 static int g_page = P_DISPLAY;
 static std::vector<Widget> g_w;
@@ -851,6 +851,7 @@ static void layout()
         y += SF(40);
         if (g_page == P_DISPLAY || g_page == P_GRAPHICS || g_page == P_UPSCALE) layout_recommend_panel(x, y, w);
         layout_cat_groups(x, y, w, g_page);
+        if (g_page == P_ONLINE) lx_online_controls(x, y, w);
         if (g_page == P_PERF) {
             y += SF(26);
             Widget& rb = add(W_BUTTON, RectF(x, y, SF(230), SF(38)), BT_REBUILD_SHADERS);

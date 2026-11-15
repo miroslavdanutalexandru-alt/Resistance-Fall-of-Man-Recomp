@@ -34,6 +34,26 @@
 ]
 }
 ],
+"func_001B70C0": [
+{
+"at": 1,
+"ctx": "void func_001B70C0(ppu_context* ctx) {",
+"rm": [],
+"add": [
+"        rfom_mp_glog(1, ctx);   /* v184: game network debug log -> logs/mp_game.log */"
+]
+}
+],
+"func_001B7284": [
+{
+"at": 1,
+"ctx": "void func_001B7284(ppu_context* ctx) {",
+"rm": [],
+"add": [
+"        rfom_mp_glog(0, ctx);   /* v184: game network debug log -> logs/mp_game.log */"
+]
+}
+],
 "func_00513A7C": [
 {
 "at": 6,
@@ -148,6 +168,102 @@
 ]
 }
 ],
+"func_00627748": [
+{
+"at": 54,
+"ctx": "         * is why it defaults to off. */",
+"rm": [],
+"add": [
+"        rfom_mp_scert_note(1, (uint32_t)ctx->gpr[31], (uint32_t)ctx->gpr[30], (uint32_t)ctx->gpr[29], 0);"
+]
+}
+],
+"func_00629D5C": [
+{
+"at": 1,
+"ctx": "void func_00629D5C(ppu_context* ctx) {",
+"rm": [],
+"add": [
+"        /* v174 diag: the session-message builder is about to run -- this is",
+"         * the moment the client decides which type goes out (0x0B lives here).",
+"         * gpr[3] is the session base at entry. */",
+"        rfom_mp_scert_win(1, (uint32_t)ctx->gpr[3]);"
+]
+}
+],
+"func_0062B9D0": [
+{
+"at": 180,
+"ctx": "loc_0062BC2C:",
+"rm": [],
+"add": [
+"        /* v171 diag: what the pump returns and what is left in its message queue",
+"         * ([session+0x7C] is the head; 0 means the record was consumed). */",
+"        rfom_mp_scert_win(3, ctx->gpr[27] ? (uint32_t)ctx->gpr[27] : 0);",
+"        rfom_mp_scert_note(6, (uint32_t)ctx->gpr[0],",
+"                           ctx->gpr[27] ? (uint32_t)vm_read32(ctx->gpr[27] + 0x7C) : 0xFFFFFFFFu,",
+"                           ctx->gpr[27] ? (uint32_t)vm_read32(ctx->gpr[27] + 0x8) : 0xFFFFFFFFu, 0);"
+]
+},
+{
+"at": 362,
+"ctx": "loc_0062BEDC:",
+"rm": [],
+"add": [
+"        /* v178 diag: lr = return address of the arm that dispatched this record,",
+"         * so the path that actually handles our types gets named by symbolizing it. */",
+"        rfom_mp_disp_note((uint32_t)ctx->gpr[23], (uint32_t)ctx->lr, (uint32_t)ctx->gpr[29]);",
+"        /* Resistance port (v170) diag: which message type reached this dispatcher,",
+"         * and the session state it is being handled in. Only with the gate on. */",
+"        rfom_mp_scert_win(2, (uint32_t)ctx->gpr[27]);",
+"        rfom_mp_scert_note(4, (uint32_t)ctx->gpr[23], (uint32_t)vm_read32(ctx->gpr[27] + 0x8),",
+"                           (uint32_t)ctx->gpr[31], (uint32_t)ctx->gpr[29]);"
+]
+},
+{
+"at": 585,
+"ctx": "loc_0062C22C:",
+"rm": [],
+"add": [
+"        /* v171 diag: a record reached the \"no handler\" arm, so nothing consumed it.",
+"         * type, session state, and the queue entry that is still pending. */",
+"        rfom_mp_scert_note(7, (uint32_t)ctx->gpr[23],",
+"                           ctx->gpr[27] ? (uint32_t)vm_read32(ctx->gpr[27] + 0x8) : 0xFFFFFFFFu,",
+"                           (uint32_t)ctx->gpr[29], 0);"
+]
+}
+],
+"func_00651FEC": [
+{
+"at": 1,
+"ctx": "void func_00651FEC(ppu_context* ctx) {",
+"rm": [],
+"add": [
+"        /* v171 diag: is the pump being driven as a read (1) or as a timer (0)? */",
+"        rfom_mp_scert_note(5, (uint32_t)ctx->gpr[3], 0, 0, 0);"
+]
+},
+{
+"at": 46,
+"ctx": "        ctx->gpr[9] = vm_read32(ctx->gpr[31] + 0x430);",
+"rm": [],
+"add": [
+"        /* Resistance port (v170) diag: connection Ea + the state word this pass",
+"         * sees, before the decrement below. Only with PS3_MP_SCERT_ACCEPT. */",
+"        rfom_mp_scert_note(2, (uint32_t)ctx->gpr[31], (uint32_t)ctx->gpr[9],",
+"                           (uint32_t)vm_read32(ctx->gpr[31] + 0x444),",
+"                           (uint32_t)vm_read32(ctx->gpr[31] + 0x44C));"
+]
+},
+{
+"at": 76,
+"ctx": "loc_006520EC:",
+"rm": [],
+"add": [
+"        rfom_mp_scert_note(3, (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[29], 0, 0);   /* v170 diag: pump step status */"
+]
+}
+],
 "func_0070FD60": [
 {
 "at": 1,
@@ -168,13 +284,11 @@
 ]
 },
 "preamble": [
-"extern \"C\" void rfom_text_patch(uint32_t file_obj);",
-"extern \"C\" void rfom_snd_note(int kind, uint32_t v, uint32_t lr, uint32_t extra);",
-"extern \"C\" uint32_t rfom_speakers(uint32_t configured);",
-"#include <setjmp.h>",
-"extern \"C\" jmp_buf* rfom_jb_arm(ppu_context* ctx);",
-"extern \"C\" void rfom_jb_landed(ppu_context* ctx);",
-"extern \"C\" void rfom_jb_jump(ppu_context* ctx, uint32_t buf_ea);"
+"extern \"C\" int rfom_mp_scert_accept(void);",
+"extern \"C\" void rfom_mp_scert_note(int kind, uint32_t a, uint32_t b, uint32_t c, uint32_t d);",
+"extern \"C\" void rfom_mp_scert_win(int tag, uint32_t sess);",
+"extern \"C\" void rfom_mp_disp_note(uint32_t type, uint32_t slot, uint32_t code);",
+"extern \"C\" void rfom_mp_glog(int err, ppu_context* ctx);"
 ],
 "header": [
 {

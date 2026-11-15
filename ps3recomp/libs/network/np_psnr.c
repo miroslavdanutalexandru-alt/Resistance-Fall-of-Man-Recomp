@@ -57,6 +57,31 @@ static int clean_online_id(const char* in, char out[17])
 static char s_id[17];
 static int  s_id_state;     /* 0 unresolved, 1 a name applies, 2 none (offline) */
 
+/* Adjective + animal, at most 8 + 8 letters, so every pair is a valid ID. */
+static const char* const k_adj[] = {
+    "Amazing", "Brave", "Clever", "Daring", "Eager", "Fearless", "Fierce", "Gentle",
+    "Happy", "Jolly", "Lucky", "Mighty", "Nimble", "Quick", "Quiet", "Rapid",
+    "Sneaky", "Swift", "Witty", "Bold", "Calm", "Cosmic", "Crafty", "Dizzy",
+    "Electric", "Exciting", "Fancy", "Fuzzy", "Grumpy", "Hasty", "Lively", "Mellow",
+    "Plucky", "Proud", "Rowdy", "Sleepy", "Speedy", "Steady", "Sunny", "Zesty" };
+static const char* const k_animal[] = {
+    "Hippo", "Lizard", "Badger", "Beaver", "Bison", "Cobra", "Condor", "Coyote",
+    "Falcon", "Ferret", "Gecko", "Heron", "Hyena", "Iguana", "Jackal", "Koala",
+    "Lemur", "Lynx", "Marmot", "Moose", "Narwhal", "Ocelot", "Otter", "Panda",
+    "Panther", "Parrot", "Pelican", "Penguin", "Puffin", "Raccoon", "Raven", "Rhino",
+    "Salmon", "Shark", "Sloth", "Tapir", "Tiger", "Toucan", "Walrus", "Wombat" };
+
+void np_psnr_random_id(char out[17])
+{
+    uint64_t x = (uint64_t)time(NULL) ^ ((uint64_t)clock() << 20) ^ (uint64_t)(uintptr_t)out;
+#ifdef _WIN32
+    x ^= ((uint64_t)GetCurrentProcessId() << 32) ^ GetTickCount64();
+#endif
+    for (int i = 0; i < 4; i++) { x ^= x << 13; x ^= x >> 7; x ^= x << 17; }   /* xorshift64 */
+    snprintf(out, 17, "%s%s", k_adj[x % (sizeof k_adj / sizeof *k_adj)],
+             k_animal[(x >> 32) % (sizeof k_animal / sizeof *k_animal)]);
+}
+
 void np_psnr_setup(const char* username, const char* server)
 {
     /* Before anything reads them: the runtime's getenv cache keeps the first
@@ -66,7 +91,8 @@ void np_psnr_setup(const char* username, const char* server)
         set_env("PSNR_SERVER", server);
     }
     /* The first valid one of: --username, PS3_NP_ONLINE_ID, and -- online
-     * only -- the OS login name. */
+     * only -- a random name (np_psnr_random_id). Never the OS login name: it
+     * would show the player's account name to everyone online. */
     const char* named[2] = { username, getenv("PS3_NP_ONLINE_ID") };
     int found = 0;
     for (int i = 0; i < 2 && !found; i++) {
@@ -78,12 +104,7 @@ void np_psnr_setup(const char* username, const char* server)
     }
     if (!found) {
         if (!np_psnr_enabled()) { s_id_state = 2; return; }   /* offline: "PS3Player" */
-#ifdef _WIN32
-        const char* os = getenv("USERNAME");
-#else
-        const char* os = getenv("USER");
-#endif
-        if (!clean_online_id(os, s_id)) strcpy(s_id, "PS3Player");
+        np_psnr_random_id(s_id);
     }
     s_id_state = 1;
     printf("[psnr] player \"%s\"%s\n", s_id, np_psnr_enabled() ? "" : " (offline)");

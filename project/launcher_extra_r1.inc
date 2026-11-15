@@ -224,7 +224,92 @@ static void lx_register()
                "maps the same way). Swapping two buttons needs both rows. Also in game: F10 > More PC Options > "
                "Controller layout.", env, std::move(ch));
     }
+    // "ONLINE PLAY" (Multiplayer page). Online itself is always on (main.cpp online_setup).
+    lx_add(P_ONLINE, "net_trace", "Log network traffic",
+           "Writes every packet sent and received to the game log (logs\\run.log). Useful when a connection fails; "
+           "it makes the log large, so leave it off for normal play.", "PS3_NET_TRACE",
+           { {"Off", ""}, {"On", "1"} });
 }
+
+// ---- online (Multiplayer page) ---------------------------------------------------------------------
+// online.txt holds the psnr server and the player name; net_hosts.txt maps the game's hardcoded Sony
+// hostnames to a community server. Both are plain text so they can be edited here or by hand.
+static std::string lx_online_path()   { return path_of("online.txt"); }
+static std::string lx_hosts_path()    { return path_of("net_hosts.txt"); }
+
+// first "key = value" whose key matches, "" if absent
+static std::string lx_online_value(const char* key)
+{
+    FILE* f = fopen(lx_online_path().c_str(), "r");
+    if (!f) return {};
+    char line[512]; std::string out;
+    while (out.empty() && fgets(line, sizeof line, f)) {
+        char* p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '#' || *p == '\r' || *p == '\n' || !*p) continue;
+        char* eq = strchr(p, '=');
+        if (!eq) continue;
+        std::string k(p, eq);
+        while (!k.empty() && (k.back() == ' ' || k.back() == '\t')) k.pop_back();
+        if (_stricmp(k.c_str(), key)) continue;
+        std::string v(eq + 1);
+        const size_t nl = v.find_first_of("\r\n");
+        if (nl != std::string::npos) v.resize(nl);
+        while (!v.empty() && (v.front() == ' ' || v.front() == '\t')) v.erase(v.begin());
+        while (!v.empty() && (v.back() == ' ' || v.back() == '\t')) v.pop_back();
+        out = v;
+    }
+    fclose(f);
+    return out;
+}
+
+static void lx_write_if_missing(const std::string& path, const char* text)
+{
+    if (GetFileAttributesA(path.c_str()) != INVALID_FILE_ATTRIBUTES) return;
+    FILE* f = fopen(path.c_str(), "wb");
+    if (!f) return;
+    fputs(text, f);
+    fclose(f);
+}
+
+static const char* kOnlineTxt =
+    "# Resistance: Fall of Man -- online settings (Multiplayer page).\r\n"
+    "# One key=value per line; '#' starts a comment.\r\n"
+    "#\r\n"
+    "# server: a psnr server (host or host:port). Only games that matchmake through\r\n"
+    "#   sceNpMatching2 use it; Resistance has its own Medius stack, so leave this\r\n"
+    "#   empty and use net_hosts.txt to reach a community server instead.\r\n"
+    "# id: the player name other players see (3-16 letters, digits, '-' or '_',\r\n"
+    "#   starting with a letter). Empty: a random name is picked on the next start.\r\n"
+    "\r\n"
+    "server=\r\n"
+    "id=\r\n";
+
+static const char* kHostsTxt =
+    "# Resistance: Fall of Man -- hostname overrides (Multiplayer page).\r\n"
+    "# One \"hostname ip\" per line ('hostname=ip' also works); '#' starts a comment.\r\n"
+    "# run.bat points PS3_NET_HOSTS at this file, so entries apply to the game's\r\n"
+    "# own DNS lookups -- no Administrator edit of the Windows hosts file.\r\n"
+    "#\r\n"
+    "# These are the Sony hostnames the front end connects to. They no longer\r\n"
+    "# answer, so each one is mapped to the community server, r1.rfom.online.\r\n"
+    "# The address can be an IP or a domain name; for your own server on this PC\r\n"
+    "# use 127.0.0.1.\r\n"
+    "\r\n"
+    "resistance.ps3.online.scea.com            r1.rfom.online\r\n"
+    "resistance.online.scee.com                r1.rfom.online\r\n"
+    "resistance-muis.scej-online.jp            r1.rfom.online\r\n"
+    "resistance-prod-muis.pdonline.scek.co.kr  r1.rfom.online\r\n"
+    "rfom.rt.au.playstation.com                r1.rfom.online\r\n"
+    "blob128.scea.com                          r1.rfom.online\r\n";
+
+static void lx_edit_text(const std::string& path, const char* skeleton)
+{
+    lx_write_if_missing(path, skeleton);
+    ShellExecuteA(g_hw, "open", "notepad.exe", path.c_str(), NULL, SW_SHOWNORMAL);
+}
+
+static const char* lx_val(const char* key);   // defined below lx_write_bat
 
 static void lx_write_bat(FILE* f)
 {
@@ -232,6 +317,10 @@ static void lx_write_bat(FILE* f)
         const char* v = g_set[o.si].choices[g_set[o.si].sel].value;
         if (*v) fprintf(f, "set \"%s=%s\"\n", o.env, v);
     }
+    // online.txt is the Multiplayer page's server / player name.
+    const std::string srv = lx_online_value("server"), id = lx_online_value("id");
+    if (!srv.empty()) fprintf(f, "set \"PSNR_SERVER=%s\"\n", srv.c_str());
+    if (!id.empty())  fprintf(f, "set \"PS3_NP_ONLINE_ID=%s\"\n", id.c_str());
 }
 static const char* lx_val(const char* key)
 {
@@ -412,7 +501,29 @@ static std::string lx_last_bench()
            low + " fps 1% low,  " + usd + " \xC2\xB5s per draw";
 }
 
-enum { BT_X_BACKUP = 100, BT_X_OPEN_SAVES, BT_X_OPEN_BACKUPS, BT_X_BENCH, BT_X_BENCH_LOGS, BT_X_RESTORE, BT_X_DELETE };
+enum { BT_X_BACKUP = 100, BT_X_OPEN_SAVES, BT_X_OPEN_BACKUPS, BT_X_BENCH, BT_X_BENCH_LOGS, BT_X_RESTORE, BT_X_DELETE,
+       BT_X_ONLINE_TXT, BT_X_HOSTS_TXT };
+
+static void lx_online_controls(float x, float& y, float w)
+{
+    // Both files exist from the first visit, so the two Edit buttons and run.bat's PS3_NET_HOSTS have something to work with.
+    lx_write_if_missing(lx_online_path(), kOnlineTxt);
+    lx_write_if_missing(lx_hosts_path(), kHostsTxt);
+
+    y += SF(26);
+    Widget& b1 = add(W_BUTTON, RectF(x, y, SF(190), SF(38)), BT_X_ONLINE_TXT);
+    b1.title = "Edit online.txt";
+    b1.help = "Your player name (id=).";
+    Widget& b2 = add(W_BUTTON, RectF(x + SF(202), y, SF(210), SF(38)), BT_X_HOSTS_TXT);
+    b2.title = "Edit net_hosts.txt";
+    b2.help = "Which server the game connects to (default r1.rfom.online).";
+    y += SF(56);
+
+    const std::string srv = lx_online_value("server"), id = lx_online_value("id");
+    std::string note = "Player name: " + (id.empty() ? std::string("picked at random on the next start") : id) + ".";
+    deco(D_NOTE, RectF(x, y, w, SF(66)), note);
+    y += SF(72);
+}
 
 static void lx_layout_tools(float x, float& y, float w)
 {
@@ -505,6 +616,10 @@ static bool lx_click(int id, int sub)
     } else if (id == BT_X_BENCH_LOGS) {
         CreateDirectoryA(path_of("logs").c_str(), NULL); CreateDirectoryA(path_of("logs\\bench").c_str(), NULL);
         ShellExecuteA(g_hw, "open", path_of("logs\\bench").c_str(), NULL, NULL, SW_SHOWNORMAL);
+    } else if (id == BT_X_ONLINE_TXT) {
+        lx_edit_text(lx_online_path(), kOnlineTxt);
+    } else if (id == BT_X_HOSTS_TXT) {
+        lx_edit_text(lx_hosts_path(), kHostsTxt);
     } else return false;
     return true;
 }
