@@ -501,9 +501,19 @@ static void test_nn_ambiguous()
 	CHECK(!rfom_nn_ambiguous_c(bd, bd2, 50.0f, 0.0f));
 	CHECK(!rfom_nn_ambiguous_c(bd, bd2, 60.0f, 0.5f));   // C over-estimated past bd: clamped, kept
 	// default: an ambiguous match is dropped (-> per-draw camera split), never kept as the guessed neighbour
-	CHECK(rfom_nn_ambig_action(1, 0) == -1);
-	CHECK(rfom_nn_ambig_action(1, 1) == 5);
-	CHECK(rfom_nn_ambig_action(0, 0) == 3 && rfom_nn_ambig_action(0, 1) == 3);
+	CHECK(rfom_nn_ambig_action(1, 0, 0) == -1);
+	CHECK(rfom_nn_ambig_action(1, 1, 0) == 5);
+	CHECK(rfom_nn_ambig_action(0, 0, 0) == 3 && rfom_nn_ambig_action(0, 1, 0) == 3);
+	// a view-attached piece (carbine) keeps its match: camera-only motion is wrong for it on either path
+	CHECK(rfom_nn_ambig_action(1, 0, 1) == 3 && rfom_nn_ambig_action(1, 1, 1) == 3);
+	// view-attached = object origin within thr of the eye (clip x, y, w)
+	CHECK(rfom_viewmodel_near(0.05, -0.2, 0.4, 1.0));
+	CHECK(rfom_viewmodel_near(0.0, 0.0, -0.3, 1.0));      // rooted just behind the eye
+	CHECK(!rfom_viewmodel_near(0.1, 0.1, 12.0, 1.0));     // York arch 12 m away: still dropped
+	CHECK(!rfom_viewmodel_near(5.0, 0.0, 0.5, 1.0));      // close in depth but far to the side
+	CHECK(!rfom_viewmodel_near(0.0, 0.0, 0.4, 0.0));      // RSX_DLSS_VIEWMODEL_W=0: off
+	volatile double z0 = 0.0;
+	CHECK(!rfom_viewmodel_near(0.0, 0.0, z0 / z0, 1.0));  // NaN
 }
 #endif
 

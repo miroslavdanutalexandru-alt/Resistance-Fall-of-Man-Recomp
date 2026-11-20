@@ -119,11 +119,20 @@ static inline int rfom_nn_ambiguous_c(float bd, float bd2, float c, float ratio)
 /* What an ambiguous nearest match becomes. Default (keep = 0): dropped, so the draw takes its own exact camera-only
  * motion (fsr_cam_prev, match type 4), else the camera fill (0). keep = 1 (RSX_DLSS_AMBIG_KEEP, the r1_fg12 path):
  * the match is kept as type 5 (camera fill if the frame has a camera, else that guessed match). Returns the match
- * type to record, or -1 = drop the match. */
-static inline int rfom_nn_ambig_action(int ambiguous, int keep)
+ * type to record, or -1 = drop the match. vmnear = the draw is view-attached (rfom_viewmodel_near): the camera-only
+ * motion of either path is wrong for it (the first-person carbine follows the view), so the nearest match is kept. */
+static inline int rfom_nn_ambig_action(int ambiguous, int keep, int vmnear)
 {
-    if (!ambiguous) return 3;
+    if (!ambiguous || vmnear) return 3;
     return keep ? 5 : -1;
+}
+/* The object's origin, run through the draw's vertex program (clip x, y, w), lies within thr world units of the
+ * eye: a first-person viewmodel (weapon pieces) rather than world geometry. A pivot just behind the eye counts too
+ * (a weapon mesh rooted at the shoulder). thr <= 0: off (RSX_DLSS_VIEWMODEL_W=0). */
+static inline int rfom_viewmodel_near(double x, double y, double w, double thr)
+{
+    if (!(thr > 0.0) || !(w == w) || !(x == x) || !(y == y)) return 0;
+    return (w < 0 ? -w : w) < thr && (x < 0 ? -x : x) < 2.0 * thr && (y < 0 ? -y : y) < 2.0 * thr;
 }
 
 #endif

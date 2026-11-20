@@ -238,6 +238,7 @@ static u8 s_fsr_multi[FSR_VARY_VS];   /* repeat draws of a program within a fram
 static volatile u32 s_fsr_st_rec, s_fsr_st_match, s_fsr_st_over, s_fsr_st_wait, s_fsr_st_exact;   /* v184 stats */
 static volatile u32 s_fsr_st_cam;                 /* draws given camera-only motion (no previous-frame match) */
 static volatile u32 s_fsr_st_amb;                 /* nearest matches refused as ambiguous (RSX_DLSS_MATCH_RATIO) */
+static volatile u32 s_fsr_st_vm;                  /* ...of which kept as view-attached (RSX_DLSS_VIEWMODEL_W) */
 static u32 s_fsr_st_zr;                           /* motion-pass draws with a CLIP_MIN/MAX depth range (render thread) */
 /* RSX_DLSS_MATCH_RATIO (default 0.5, 0 = off): a nearest-by-constants match is kept only when it is at most this
  * fraction of the distance of the nearest distinct other candidate; otherwise the draw is "unmatched" and gets
@@ -462,6 +463,44 @@ static void cam_note(const D3D12DrawRecord* dr, int vs_idx, const char* csrc, co
     cf->n = k + 1u;
 }
 
+/* RSX_DLSS_VIEWMODEL_W (default 1.0 world units, 0 = off): an ambiguous nearest match whose object origin lies this
+ * close to the eye is the first-person weapon. Its pieces (drum halves, sights: same mesh, instance rows that turn
+ * with the view) went ambiguous in fast turns and were given the static world's camera motion -- the carbine
+ * ghosted in generated frames while the background swept the other way. Such a draw keeps its nearest match. */
+static float fsr_vm_w(void)
+{
+    static float v = -1.0f;
+    if (v < 0.0f) { const char* e = getenv("RSX_DLSS_VIEWMODEL_W"); v = e && *e ? (float)atof(e) : 1.0f; if (!(v >= 0.0f) || v > 100.0f) v = 1.0f;
+                    fprintf(stderr, "[DLSS] view-attached ambiguous draws keep their match within %.2f units of the eye%s (RSX_DLSS_VIEWMODEL_W)%c", v, v > 0.0f ? "" : " (off)", 10); }
+    return v;
+}
+/* FIFO thread: is this draw's object origin within fsr_vm_w() of the eye? At most 256 evaluations a frame. */
+static int fsr_vm_near(int vs_idx, const char* csrc, u32 fr)
+{
+    const float thr = fsr_vm_w();
+    if (!(thr > 0.0f) || vs_idx < 0 || vs_idx >= s_d3d.vp_vs_n) return 0;
+    const VPVSEntry* ve = &s_d3d.vp_vs[vs_idx];
+    if (!ve->ucode || !ve->ucode_n) return 0;
+    static u32 bf, bn;
+    if (bf != fr) { bf = fr; bn = 0; }
+    if (bn >= 256u) return 0;
+    CamProg* pg = &s_cam_prog[(ve->hash * 2654435761u) >> 23];
+    if (pg->hash != ve->hash) { pg->hash = ve->hash; pg->st = 0; pg->pa = -1; }
+    if (pg->st == 2) return 0;   /* skinned / not evaluable: no single object origin */
+    bn++;
+    static float c[512 * 4];   /* FIFO thread only */
+    memcpy(c, csrc, sizeof c);
+    if (pg->st == 0) {
+        const int pa = vpcpu_find_pos(ve->ucode, ve->ucode_n, c, ve->inmask);
+        if (pa < 0) { pg->st = 2; return 0; }
+        pg->pa = (signed char)pa; pg->st = 1;
+    }
+    float v[16][4], o[4];
+    vpcpu_attr_default(v);   /* position (0,0,0,1): the object's origin */
+    if (!vpcpu_run(ve->ucode, ve->ucode_n, c, (const float (*)[4])v, o)) return 0;
+    return rfom_viewmodel_near(o[0], o[1], o[3], thr);
+}
+
 static void fsr_record_impl(D3D12DrawRecord* dr, int vs_idx, char* dst, const char* csrc, const float* epi);
 static void fsr_record(D3D12DrawRecord* dr, int vs_idx, char* dst, const char* csrc, const float* epi)
 {
@@ -656,7 +695,10 @@ static void fsr_record_impl(D3D12DrawRecord* dr, int vs_idx, char* dst, const ch
                                     fprintf(stderr, "[DLSS] ambiguous matches: %s%c", keep ? "kept, camera fill (RSX_DLSS_AMBIG_KEEP=1)"
                                                                                           : "per-draw camera motion (RSX_DLSS_AMBIG_KEEP=1: keep)", 10); }
                     s_fsr_st_amb++;
-                    if (rfom_nn_ambig_action(1, keep) == 5) dr->fsr_mt = 5; else best = 0xFFFFFFFFu;
+                    const int vmn = fsr_vm_near(vs_idx, csrc, fr);
+                    if (vmn) s_fsr_st_vm++;
+                    const int act = rfom_nn_ambig_action(1, keep, vmn);
+                    if (act == 5) dr->fsr_mt = 5; else if (act < 0) best = 0xFFFFFFFFu;
                 }
             }
             if (best != 0xFFFFFFFFu) { prev_off = ((u64)pr * s_fsr_slots + best) * FSR_HIST_STRIDE; s_fsr_st_match++;
@@ -2575,9 +2617,9 @@ static void fsr_dispatch(void)
           QueryPerformanceCounter(&q1); QueryPerformanceFrequency(&qf);
           const double tpms = (q0.QuadPart && t1 > t0 && q1.QuadPart > q0.QuadPart) ? (double)(t1 - t0) / ((double)(q1.QuadPart - q0.QuadPart) * 1000.0 / (double)qf.QuadPart) : 0.0;   /* TSC ticks per ms (0 on the first report) */
           q0 = q1; t0 = t1;
-          fprintf(stderr, "[FSR] stats/600: history resets %u (frame gaps %u), scene draws %u, matched to last frame %.1f%%, over slot limit %u, lead waits %u, exact %.1f%%, camera fallback %.1f%%,           ambiguous %.1f%%, depth-range draws %u, record %.3f ms/frame%c",
+          fprintf(stderr, "[FSR] stats/600: history resets %u (frame gaps %u), scene draws %u, matched to last frame %.1f%%, over slot limit %u, lead waits %u, exact %.1f%%, camera fallback %.1f%%,           ambiguous %.1f%% (view-attached kept %u), depth-range draws %u, record %.3f ms/frame%c",
                   nr, gap, rec, rec ? 100.0 * mt / rec : 0.0, ov, s_fsr_st_wait, rec ? 100.0 * s_fsr_st_exact / rec : 0.0,
-                            rec ? 100.0 * s_fsr_st_cam / rec : 0.0, rec ? 100.0 * s_fsr_st_amb / rec : 0.0, s_fsr_st_zr, tpms > 0.0 ? (double)s_fsr_st_tsc / tpms / 600.0 : 0.0, 10);
+                            rec ? 100.0 * s_fsr_st_cam / rec : 0.0, rec ? 100.0 * s_fsr_st_amb / rec : 0.0, s_fsr_st_vm, s_fsr_st_zr, tpms > 0.0 ? (double)s_fsr_st_tsc / tpms / 600.0 : 0.0, 10);
           if (s_gt_frames) { fprintf(stderr, "[FSR] GPU/frame (%u frames): motion pass %.3f ms, upscaler %.3f ms%c", s_gt_frames, s_gt_ms[0] / s_gt_frames, s_gt_ms[1] / s_gt_frames, 10);
                              s_gt_ms[0] = s_gt_ms[1] = 0.0; s_gt_frames = 0; }
           /* one line for the next play session: where the camera motion came from */
@@ -2595,7 +2637,7 @@ static void fsr_dispatch(void)
                     md ? 100.0 * s_cf_mt[4] / md : 0.0, md ? 100.0 * s_cf_mt[0] / md : 0.0, rw, rh, w, h, uf, ssao_status(), 10);
             memset(s_cf_st, 0, sizeof s_cf_st); memset(s_cf_mt, 0, sizeof s_cf_mt); memset(s_cf_dep, 0, sizeof s_cf_dep); memset(s_cf_run, 0, sizeof s_cf_run);
             s_cf_cut = s_cf_cand = s_cf_elig = s_cf_tried = s_cf_bad = s_cf_plur = s_cf_med = s_cf_held = s_cf_loose = 0; }
-          s_fsr_st_rec = s_fsr_st_match = s_fsr_st_over = s_fsr_st_wait = s_fsr_st_exact = s_fsr_st_cam = s_fsr_st_amb = s_fsr_st_zr = 0; s_fsr_st_tsc = 0; nr = gap = 0;
+          s_fsr_st_rec = s_fsr_st_match = s_fsr_st_over = s_fsr_st_wait = s_fsr_st_exact = s_fsr_st_cam = s_fsr_st_amb = s_fsr_st_vm = s_fsr_st_zr = 0; s_fsr_st_tsc = 0; nr = gap = 0;
       } }
     s_fsr_last_frame = s_fsr_frame_r;
     s_fsr_disp_frame = s_fsr_frame_r; s_fsr_disp_ms = GetTickCount64();
