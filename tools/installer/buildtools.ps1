@@ -251,15 +251,16 @@ function Expand-BtZip([string]$Zip, [string]$Dest) {
     [IO.Compression.ZipFile]::ExtractToDirectory($Zip, $Dest)
 }
 # .tar.gz / .tar.xz: Windows' tar.exe (bsdtar), else Python's tarfile
-function Expand-BtTar([string]$Tar, [string]$Dest, [string]$Python = '') {
+# (PowerShell names are case-insensitive: a local $tar for tar.exe would overwrite the archive path $Tar)
+function Expand-BtTar([string]$Tar, [string]$Dest, [string]$Python = '', [string]$TarExe = (Join-Path $env:SystemRoot 'System32\tar.exe')) {
     New-Item -ItemType Directory -Force -Path $Dest | Out-Null
-    $tar = Join-Path $env:SystemRoot 'System32\tar.exe'
-    if (Test-Path -LiteralPath $tar) {
-        if ((Invoke-BtNative $tar @('-xf', $Tar, '-C', $Dest)) -eq 0) { return }
+    if ($TarExe -and (Test-Path -LiteralPath $TarExe)) {
+        if ((Invoke-BtNative $TarExe @('-xf', $Tar, '-C', $Dest)) -eq 0) { return }
         Write-BtMsg 'tar.exe could not unpack it; trying Python'
     }
     if (-not $Python) { throw "cannot unpack $Tar (no tar.exe and no Python)" }
-    $code = 'import sys,tarfile; t=tarfile.open(sys.argv[1]); kw={"filter":"data"} if hasattr(tarfile,"data_filter") else {}; t.extractall(sys.argv[2],**kw)'
+    # single quotes only: Windows PowerShell 5.1 drops embedded double quotes from native arguments
+    $code = "import sys,tarfile; t=tarfile.open(sys.argv[1]); kw={'filter':'data'} if hasattr(tarfile,'data_filter') else {}; t.extractall(sys.argv[2],**kw)"
     if ((Invoke-BtNative $Python @('-c', $code, $Tar, $Dest)) -ne 0) { throw "could not unpack $Tar" }
 }
 # moves the single top folder of an unpacked archive (or the folder itself) to $Dest

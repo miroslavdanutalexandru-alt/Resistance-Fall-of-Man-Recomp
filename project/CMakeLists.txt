@@ -2,6 +2,11 @@ cmake_minimum_required(VERSION 3.20)
 if(NOT DEFINED PORT_NAME)
     set(PORT_NAME ResistanceFoM)
 endif()
+# CMake's compiler checks build in Debug by default, which links the debug CRT (msvcrtd.lib). The portable MSVC
+# libraries (Setup -PortableTools, xwin) have only the release CRT, so configure failed there.
+if(NOT DEFINED CMAKE_TRY_COMPILE_CONFIGURATION)
+    set(CMAKE_TRY_COMPILE_CONFIGURATION Release)
+endif()
 project(${PORT_NAME}
     VERSION 0.1.0
     LANGUAGES C CXX

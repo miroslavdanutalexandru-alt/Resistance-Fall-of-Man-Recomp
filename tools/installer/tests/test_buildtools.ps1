@@ -97,6 +97,19 @@ Check (Test-BtHash $hf 'SHA256' 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9
 Check (Test-BtHash $hf 'SHA512B64' '3a81oZNherrMQXNJriBBMRLm+k6JqX6iCp7u5ktV05ohkpkqJ0/BqDa6PCOj/uu9RU1EI2Q86A4qmslPpUyknw==') 'SHA-512 base64 (NuGet)'
 Check (-not (Test-BtHash $hf 'SHA256' ('0' * 64))) 'hash mismatch detected'
 
+Write-Host '-- unpacking a real .tar.gz'
+$tsrc = Join-Path $Root 'tar src'; Touch (Join-Path $tsrc 'xwin-1\xwin.exe') 'w'
+$tgz = Join-Path $Root 'x w.tar.gz'
+& (Join-Path $env:SystemRoot 'System32\tar.exe') -czf $tgz -C $tsrc 'xwin-1'
+$tx = Join-Path $Root 'unpack tar'
+Expand-BtTar $tgz $tx
+Check ((Get-Content -Raw (Join-Path $tx 'xwin-1\xwin.exe')) -eq 'w') 'tar.exe unpacks the archive (not tar.exe itself)'
+$py = (Get-Command python -CommandType Application -ErrorAction SilentlyContinue | Where-Object { $_.Source -notmatch '\\WindowsApps\\' } | Select-Object -First 1).Source
+if ($py) {
+    $px = Join-Path $Root 'unpack py'; Expand-BtTar $tgz $px $py -TarExe ''
+    Check ((Get-Content -Raw (Join-Path $px 'xwin-1\xwin.exe')) -eq 'w') 'no tar.exe: Python tarfile unpacks it'
+} else { Write-Host '  skip Python tarfile fallback (no python on PATH)' }
+
 Write-Host '-- portable install (mocked downloads)'
 # local stand-ins for the pinned archives, with their real hashes
 $src = Join-Path $Root 'src'
