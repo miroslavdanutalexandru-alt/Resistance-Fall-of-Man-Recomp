@@ -172,6 +172,15 @@ u32 rsx_log2_ceil(u32 v);
 void rsx_texture_decode(void* dst, u32 dst_pitch,
                         const u8* src, u32 w, u32 h,
                         const rsx_tex_layout* tl, int argb_as_rgba);
+/* The two halves of rsx_texture_decode, for the native-vs-reference harness:
+ * the SSE2 block decode (RSX_NATIVE_TEXDEC; returns 0 and writes nothing for
+ * a layout it leaves to the reference) and the reference decode itself. */
+int  rsx_texture_decode_native(void* dst, u32 dst_pitch,
+                               const u8* src, u32 w, u32 h,
+                               const rsx_tex_layout* tl, int argb_as_rgba);
+void rsx_texture_decode_reference(void* dst, u32 dst_pitch,
+                                  const u8* src, u32 w, u32 h,
+                                  const rsx_tex_layout* tl, int argb_as_rgba);
 
 /* Per-final-RGBA-lane gamma flags from TEXTURE_ADDRESS bits 20..23.
  * Float/depth/non-gamma formats return zero; source signed flags take

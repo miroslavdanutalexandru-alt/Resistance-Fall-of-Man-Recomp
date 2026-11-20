@@ -394,9 +394,20 @@ s32 cellAdecDecodeAu(CellAdecHandle handle, const CellAdecAuInfo* auInfo)
 
     AdecSlot* a = &s_adec[handle];
 
-    printf("[cellAdec] DecodeAu(handle=%u, addr=0x%X, size=%u)\n",
-           handle, vm_read32(GUEST_EA(auInfo) + (u32)offsetof(CellAdecAuInfo, startAddr)),
-           vm_read32(GUEST_EA(auInfo) + (u32)offsetof(CellAdecAuInfo, size)));
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#endif
+    /* Resistance port: logs the first 8 AUs; ADEC_LOG=1 logs all (old). */
+    { static int lg = -1; static unsigned n = 0;
+      if (lg < 0) { const char* e = getenv("ADEC_LOG"); lg = e ? atoi(e) : 0; }
+      if (lg || n < 8) { n++;
+          printf("[cellAdec] DecodeAu(handle=%u, addr=0x%X, size=%u)\n",
+                 handle, vm_read32(GUEST_EA(auInfo) + (u32)offsetof(CellAdecAuInfo, startAddr)),
+                 vm_read32(GUEST_EA(auInfo) + (u32)offsetof(CellAdecAuInfo, size))); } }
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
 
     /* Step 1: report the AU consumed. msgData is the AU INFO ADDRESS, not a
      * status -- see RPCS3 Modules/cellAdec.cpp:1345. A decoder that tracks its

@@ -108,7 +108,7 @@ static int ms_enabled(void)
             if (g_out) {
                 fprintf(g_out, "# ps3recomp milestone log v1\n");
                 fflush(g_out);
-                atexit(ps3_ms_dump);
+                ps3_exit_hook_register(ps3_ms_dump);
                 e = 1;
             } else {
                 fprintf(stderr, "[milestone] cannot open %s -- log disabled\n", path);
@@ -287,4 +287,34 @@ void ps3_ms_dump(void)
     fclose(g_out);
     g_out = NULL;
     ms_unlock();
+}
+
+/* ------------------------------------------------------------------------- */
+/* Exit hooks (see milestone.h). Fixed list; registration is rare (a handful of
+ * one-time diagnostics), so a spin lock is enough. */
+#define EXIT_HOOK_MAX 16
+static void (*g_exit_hooks[EXIT_HOOK_MAX])(void);
+static int  g_exit_hook_n;
+static int  g_exit_hook_lock;
+
+void ps3_exit_hook_register(void (*fn)(void))
+{
+    if (!fn) return;
+    while (__atomic_exchange_n(&g_exit_hook_lock, 1, __ATOMIC_ACQUIRE)) { }
+    if (g_exit_hook_n < EXIT_HOOK_MAX) g_exit_hooks[g_exit_hook_n++] = fn;
+    else fprintf(stderr, "[exit] hook list full; hook runs only on a CRT exit\n");
+    __atomic_store_n(&g_exit_hook_lock, 0, __ATOMIC_RELEASE);
+    atexit(fn);
+}
+
+void ps3_exit_hooks_run(void)
+{
+    for (;;) {
+        void (*fn)(void) = NULL;
+        while (__atomic_exchange_n(&g_exit_hook_lock, 1, __ATOMIC_ACQUIRE)) { }
+        if (g_exit_hook_n > 0) fn = g_exit_hooks[--g_exit_hook_n];
+        __atomic_store_n(&g_exit_hook_lock, 0, __ATOMIC_RELEASE);
+        if (!fn) break;
+        fn();
+    }
 }

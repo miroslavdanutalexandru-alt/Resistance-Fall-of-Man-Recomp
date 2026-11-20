@@ -6,6 +6,7 @@
 #define SYS_EVENT_H
 
 #include "lv2_syscall_table.h"
+#include "../platform/port_cacheline.h"   /* PS3_CACHELINE_ALIGN (perf final pass) */
 #include "../ppu/ppu_context.h"
 #include "../../include/ps3emu/ps3types.h"
 #include "../../include/ps3emu/error_codes.h"
@@ -45,7 +46,7 @@ typedef struct sys_event_t {
 #define SYS_PPU_QUEUE   1
 #define SYS_SPU_QUEUE   2
 
-typedef struct sys_event_queue_info {
+typedef struct PS3_CACHELINE_ALIGN sys_event_queue_info {
     int      active;
     uint32_t protocol;
     int32_t  type;
@@ -104,7 +105,7 @@ extern sys_event_port_info g_sys_event_ports[SYS_EVENT_PORT_MAX];
 #define SYS_EVENT_FLAG_WAIT_CLEAR      0x10
 #define SYS_EVENT_FLAG_WAIT_CLEAR_ALL  0x20
 
-typedef struct sys_event_flag_info {
+typedef struct PS3_CACHELINE_ALIGN sys_event_flag_info {
     int      active;
     uint32_t protocol;
     uint32_t type;       /* single / multi waiter */

@@ -38,7 +38,9 @@
  * colour / depth / motion / jitter inputs. NVIDIA code lives only in
  * rfom_dlss.dll (project/rfom_dlss.cpp) + nvngx_dlss.dll beside the exe; if either
  * is missing or the GPU can't run DLSS it falls back to FSR 3.1.
- * RSX_DLSS_PRESET=<n>: NGX render preset (0 = NVIDIA default, 11 = K, 10 = J).
+ * RSX_DLSS_PRESET=<letter or n>: NGX render preset. Empty / 0 / auto = NVIDIA default; E (5), F (6) =
+ * CNN models (deprecated by NVIDIA, still accepted by the 310.x DLL); J (10), K (11), L (12), M (13) =
+ * transformer models. Anything else (removed A-D, the "do not use" G/H/I/N/O, junk) -> default + a log line.
  * RSX_DLSS_JITTER_SIGN=-1: negate the jitter passed to DLSS (diagnostic).
  *
  * RSX_FSR=3: Intel XeSS (XeSS-SR, xessD3D12* from libxess.dll beside the exe, any
@@ -63,6 +65,7 @@
  * =========================================================================*/
 #include <stdbool.h>
 #include "rsx_vp_cpu.h"   /* RFOM_DLSS_CAM: CPU evaluation of the vertex program's position */
+#include "port_dlss_quality.h"   /* PORT_DLSS_BIAS_MASK / PORT_DLSS_RESET_CUTS / PORT_DLSS_RESET_HITCH_MS */
 #if __has_include("../../../tools/xess/inc/xess/xess_d3d12.h")
 #define XESS_TYPES_ONLY 1
 #include "../../../tools/xess/inc/xess/xess_d3d12.h"
@@ -131,6 +134,19 @@ static float fsr_halton(u32 i, u32 b) { float f = 1.0f, r = 0.0f; while (i) { f 
  * 3 FSR bypassed (no jitter, no FSR) -- live A/B for the flicker. */
 static volatile int s_fsr_ab;
 static int s_fsr_ab_ctx;   /* auto-exposure state the context was made with */
+/* UPSCALER_ARTIFACTS F4: the view camera's real near / far / vertical FOV,
+ * published by the camera setter hook (stubs.cpp rfom_cam_capture). FSR uses
+ * them for depth-based disocclusion and reprojection tolerance; the 0.1 / 1000
+ * / 1.0 placeholders over- or under-reject. RSX_FSR_CAMERA=0 = placeholders. */
+volatile float g_rfom_cam_near, g_rfom_cam_far, g_rfom_cam_vfov;
+static void fsr_camera(float* n, float* f, float* fov)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("RSX_FSR_CAMERA"); on = (e && e[0] == '0') ? 0 : 1; }
+    *n = 0.1f; *f = 1000.0f; *fov = 1.0f;
+    const float cn = g_rfom_cam_near, cf = g_rfom_cam_far, cv = g_rfom_cam_vfov;
+    if (on && cn > 0.0f && cf > cn && cv > 0.0f) { *n = cn; *f = cf; *fov = cv; }
+}
 static void fsr_jitter(u32 frame, float* jx, float* jy)
 {
     static int jon = -1; if (jon < 0) { const char* e = getenv("RSX_FSR_JITTER"); jon = e ? atoi(e) : 1; }
@@ -221,6 +237,18 @@ static u32 s_fsr_bankf[2][FSR_VARY_VS];
 static u8 s_fsr_multi[FSR_VARY_VS];   /* repeat draws of a program within a frame seen (saturates): its vary rows are meaningful */
 static volatile u32 s_fsr_st_rec, s_fsr_st_match, s_fsr_st_over, s_fsr_st_wait, s_fsr_st_exact;   /* v184 stats */
 static volatile u32 s_fsr_st_cam;                 /* draws given camera-only motion (no previous-frame match) */
+static volatile u32 s_fsr_st_amb;                 /* nearest matches refused as ambiguous (RSX_DLSS_MATCH_RATIO) */
+static u32 s_fsr_st_zr;                           /* motion-pass draws with a CLIP_MIN/MAX depth range (render thread) */
+/* RSX_DLSS_MATCH_RATIO (default 0.5, 0 = off): a nearest-by-constants match is kept only when it is at most this
+ * fraction of the distance of the nearest distinct other candidate; otherwise the draw is "unmatched" and gets
+ * the camera's motion (fsr_cam_prev / cam_fill) -- right for static world pieces, which are most of them. */
+static float fsr_match_ratio(void)
+{
+    static float v = -1.0f;
+    if (v < 0.0f) { const char* e = getenv("RSX_DLSS_MATCH_RATIO"); v = e && *e ? (float)atof(e) : 0.5f; if (!(v >= 0.0f) || v > 1.0f) v = 0.5f;
+                    fprintf(stderr, "[DLSS] nearest-match ambiguity ratio %.2f%s (RSX_DLSS_MATCH_RATIO)%c", v, v > 0.0f ? "" : " (off)", 10); }
+    return v;
+}
 static volatile u64 s_fsr_st_tsc;                 /* record-thread TSC ticks spent in fsr_record */
 static volatile u32 s_fsr_disp_frame; static volatile ULONGLONG s_fsr_disp_ms;   /* v184: last FSR dispatch (render thread) */
 /* RSX_DLSS_OBJMV (all three upscalers): 1 = per-object motion (previous-frame draw
@@ -240,7 +268,8 @@ static int fsr_objmv(void)
  *         motion (static geometry must not be blue while the camera moves)
  * depth = depth fed to DLSS (magenta = no motion-pass draw covered the pixel)
  * match = per-draw previous-frame match: green exact, cyan exact instance,
- *         yellow nearest-by-constants, blue camera fallback, red none
+ *         yellow nearest-by-constants, orange ambiguous nearest (RSX_DLSS_MATCH_RATIO),
+ *         blue camera fallback, red none
  *         (depth fed to DLSS is invalid in this mode). */
 static int fsr_dbg_view(void)
 {
@@ -326,6 +355,39 @@ static int dlss_env_i(const char* name, int def, int lo, int hi)
     return v < lo ? lo : v > hi ? hi : v;
 }
 static int dlss_cam_n(void) { static int v = -1; if (v < 0) v = dlss_env_i("RFOM_DLSS_CAM_N", 8, 2, 16); return v; }
+/* RFOM_DLSS_CAM_PLURALITY (default 0): when the vote fails, use a unique largest
+ * agreeing group of 2+ (see cam_solve). RFOM_DLSS_CAM_TOL: agreement in ndc (2e-3). */
+static int dlss_cam_plur(void) { static int v = -1; if (v < 0) v = dlss_env_i("RFOM_DLSS_CAM_PLURALITY", 0, 0, 1); return v; }
+/* RFOM_DLSS_CAM_MEDOID (default 1; 0 = off): when the vote fails, the medoid candidate if the candidates agree
+ * far better than "no camera motion" would (vpcpu_medoid); the fill and DLSS-G get it instead of zero motion. */
+static int dlss_cam_med(void) { static int v = -1; if (v < 0) v = dlss_env_i("RFOM_DLSS_CAM_MEDOID", 1, 0, 1); return v; }
+static double dlss_cam_tol(void)
+{
+    static double v = -1.0;
+    if (v < 0.0) { const char* e = getenv("RFOM_DLSS_CAM_TOL"); v = e && *e ? atof(e) : 2e-3; if (!(v > 0.0) || v > 0.1) v = 2e-3; }
+    return v;
+}
+/* RFOM_DLSS_CAM_TOL2 (default 0.01 ndc, 0 = off): when the strict vote fails, a second vote at this looser
+ * tolerance (a majority of 3+ candidates). R1 r1_1424: 50-91% of combat frames fell back to the 3-frame hold /
+ * no camera motion while 5-8 of 8 candidates agreed within 0.004-0.01 ndc; a few px of camera error is far
+ * nearer than no camera motion for DLSS-G during a pan. */
+static double dlss_cam_tol2(void)
+{
+    static double v = -1.0;
+    if (v < 0.0) { const char* e = getenv("RFOM_DLSS_CAM_TOL2"); v = e && *e ? atof(e) : 0.01; if (!(v >= 0.0) || v > 0.05) v = 0.01; }
+    return v;
+}
+/* RFOM_DLSS_CAM_MEDOID_REL (default 0.75, 0 = the old 1/3 with a 0.02 ndc cap): the medoid is taken when its
+ * median spread is at most this fraction of its motion (cap 0.05 ndc). R1 r1_1500: unsolved combat frames had
+ * 6 of 8 candidates within 15-25% of each other's motion (spread 0.3-0.7x of 0.02-0.09 ndc motion, growing with
+ * shake); identity is off by the whole motion and the 3-frame hold by the shake's frame-to-frame change. */
+static double dlss_cam_med_rel(void)
+{
+    static double v = -1.0;
+    if (v < 0.0) { const char* e = getenv("RFOM_DLSS_CAM_MEDOID_REL"); v = e && *e ? atof(e) : 0.75;
+                   if (!(v >= 0.0) || v > 1.0) v = 0.75; }
+    return v;
+}
 static int dlss_cut_on(void) { static int v = -1; if (v < 0) v = dlss_env_i("RFOM_DLSS_CUT", 1, 0, 1); return v; }
 static int dlss_mv_zoff(void) { static int v = -1; if (v < 0) v = dlss_env_i("RFOM_DLSS_MV_ZOFF", 1, 0, 1); return v; }
 #define CAM_MAX 16
@@ -558,14 +620,44 @@ static void fsr_record_impl(D3D12DrawRecord* dr, int vs_idx, char* dst, const ch
                     if (dsum == dsum) { best = c; bd = dsum; if (dsum <= ot * mag) n = 1 << 20; else n = 32; }
                 }
             }
+            const float ratio = fsr_match_ratio();
+            float bd2 = 3.0e38f;   /* nearest distinct runner-up (an identical signature is the same draw drawn twice) */
+            const int searched = n < 64;
             for (u32 c = e->val ? e->val - 1u : 0xFFFFFFFFu; c != 0xFFFFFFFFu && n < 64; c = s_fsr_next[pr][c], n++) {   /* v184j: 256 -> 64 */
                 const float* ps = s_fsr_sig[pr][c]; float dsum = 0.0f;
+                const float lim = ratio > 0.0f ? bd2 : bd;
                 for (u32 k = 0; k < FSR_SIG_ROWS * 4; k += 4) {
                     for (u32 j = 0; j < 4; j++) { const float df = ps[k + j] - sig[k + j]; dsum += df < 0.0f ? -df : df; }
-                    if (dsum >= bd) break;   /* v184e: can't win */
+                    if (dsum >= lim) break;   /* v184e: can't win (nor be the runner-up) */
                 }
                 if (!(dsum == dsum)) continue;
-                if (dsum < bd) { bd = dsum; best = c; if (dsum == 0.0f) break; }
+                if (rfom_nn_feed(dsum, &bd, &bd2)) { best = c; if (dsum == 0.0f) break; }
+            }
+            /* RSX_DLSS_MATCH_RATIO: a nearest-by-constants match whose runner-up (another instance of the same
+             * program/mesh/material) is nearly as close is a guess -- during a turn, repeated building pieces
+             * (York arches, pillars) pair with their neighbour and the whole piece gets that neighbour's motion
+             * (a doubled block in generated frames). Such draws drop the match and take their own exact camera-only
+             * motion (fsr_cam_prev, below), else the camera fill. RSX_DLSS_AMBIG_KEEP=1: keep it as mt 5 instead
+             * (camera fill if this frame has a camera, else the guessed match -- r1_fg12; regressed the York doorway). */
+            if (searched && best != 0xFFFFFFFFu && !dr->fsr_mt && bd2 < 3.0e38f) {
+                /* the signature also samples the shared rows (camera / projection), whose change since last frame
+                 * adds the same term to every candidate's distance; only the per-instance rest is compared */
+                float cshared = 0.0f;
+                if (vs_idx >= 0 && vs_idx < FSR_VARY_VS && nr) {
+                    const u8* vy = s_fsr_vary[vs_idx]; const float* ps = s_fsr_sig[pr][best];
+                    for (u32 q = 0; q < FSR_SIG_ROWS; q++) {
+                        if (vy[rows[(u32)(((u64)q * nr) / FSR_SIG_ROWS)]]) continue;
+                        for (u32 j = 0; j < 4; j++) { const float df = ps[q * 4 + j] - sig[q * 4 + j]; cshared += df < 0.0f ? -df : df; }
+                    }
+                }
+                if (rfom_nn_ambiguous_c(bd, bd2, cshared, ratio)) {
+                    static int keep = -1;
+                    if (keep < 0) { keep = dlss_env_i("RSX_DLSS_AMBIG_KEEP", 0, 0, 1);
+                                    fprintf(stderr, "[DLSS] ambiguous matches: %s%c", keep ? "kept, camera fill (RSX_DLSS_AMBIG_KEEP=1)"
+                                                                                          : "per-draw camera motion (RSX_DLSS_AMBIG_KEEP=1: keep)", 10); }
+                    s_fsr_st_amb++;
+                    if (rfom_nn_ambig_action(1, keep) == 5) dr->fsr_mt = 5; else best = 0xFFFFFFFFu;
+                }
             }
             if (best != 0xFFFFFFFFu) { prev_off = ((u64)pr * s_fsr_slots + best) * FSR_HIST_STRIDE; s_fsr_st_match++;
                                        if (!dr->fsr_mt) dr->fsr_mt = 3; dr->fsr_bd = bd; dr->fsr_pslot = best; }
@@ -632,9 +724,11 @@ static u32 s_dlss_rw, s_dlss_rh;     /* render size the DLSS feature was made fo
 static float s_fsr_up_r;             /* render thread: upscale share of the scene being built */
 /* RFOM_DLSS_CAM render side (see dlss_cam_exact): the motion / depth targets are
  * cleared to the depth sentinel 4.0 ("no draw wrote here"), draws without a
- * previous-frame match write 2 + depth ("camera motion, at this depth"), and the
- * camera fill (cam_fill, before the upscaler) turns both into camera motion. */
+ * previous-frame match write -1 - depth ("camera motion, at this depth"), ambiguous
+ * matches -3 - depth (camera motion if any, else their own), and the camera fill
+ * (cam_fill, before the upscaler) decodes them all back to a depth in 0..1. */
 static int s_cf_armed;                            /* this frame's targets carry the sentinels */
+static int cf_init(void);
 static int s_cf_zi = -1, s_cf_rti = -1; static u32 s_cf_zoff;   /* the scene depth the motion pass tested against */
 static int  (*p_dlss_init)(ID3D12Device*, const wchar_t*, RfomDlssLog);
 static int  (*p_dlss_create)(ID3D12GraphicsCommandList*, unsigned, unsigned, unsigned, unsigned, int, unsigned);
@@ -655,6 +749,86 @@ static int dlss_load_impl(void);
  * it only waits for whatever is left; 2 = synchronously at device creation;
  * 0 = the old lazy init. */
 static HANDLE s_dlss_early_th; static volatile LONG s_dlss_early_res = -1;
+/* RFOM_DLSS_PRECREATE (default 1): the DLSS feature creation (~1 s: NGX loads
+ * and builds the model) ran on the render thread at the first upscaled frame,
+ * a visible hitch at the start of the first level. The early-init thread now
+ * also creates the feature for the sizes and preset this program used last
+ * time (shadercache\dlss_feature_<program>.txt, written at every creation on
+ * the render thread) on its own command list; the first dispatch adopts it
+ * when render size, output size and preset all match, otherwise it creates
+ * its own exactly as before. 0 = the old lazy creation only. */
+static int s_dlss_pre_ok; static u32 s_dlss_pre[5];   /* rw rh ow oh preset of the pre-created feature */
+static int dlss_preset_env(void);
+static int dlss_preset_once(void) { static int pr = -2; if (pr == -2) pr = dlss_preset_env(); return pr; }
+static const char* dlss_hist_path(void)
+{
+    const char* bp = getenv("PS3_BOOT_PATH");
+    return (bp && strstr(bp, "game.self")) ? "shadercache\\dlss_feature_game.txt" : "shadercache\\dlss_feature_fe.txt";
+}
+static int dlss_hist_read(u32 v[5])
+{
+    FILE* f = fopen(dlss_hist_path(), "rb");
+    if (!f) return 0;
+    unsigned a[5];
+    const int n = fscanf(f, "%u %u %u %u %u", &a[0], &a[1], &a[2], &a[3], &a[4]);
+    fclose(f);
+    if (n != 5) return 0;
+    for (int i = 0; i < 4; i++) if (!a[i] || a[i] > 16384u) return 0;
+    for (int i = 0; i < 5; i++) v[i] = a[i];
+    return 1;
+}
+static void dlss_hist_save(u32 rw, u32 rh, u32 ow, u32 oh, u32 pr)
+{
+    u32 old[5]; const u32 now[5] = { rw, rh, ow, oh, pr };
+    if (dlss_hist_read(old) && !memcmp(old, now, sizeof old)) return;
+    CreateDirectoryA("shadercache", NULL);
+    FILE* f = fopen(dlss_hist_path(), "wb");
+    if (f) { fprintf(f, "%u %u %u %u %u\n", rw, rh, ow, oh, pr); fclose(f); }
+}
+static int dlss_precreate_on(void)
+{
+    static int m = -1;
+    if (m < 0) { const char* e = getenv("RFOM_DLSS_PRECREATE"); m = e ? (atoi(e) != 0) : 1; }
+    return m;
+}
+static void dlss_precreate(void)
+{
+    u32 v[5];
+    if (!dlss_precreate_on() || !s_d3d.device || !s_d3d.cmd_queue || !dlss_hist_read(v)) return;
+    const int pr = dlss_preset_once();
+    if ((u32)pr != v[4]) {
+        fprintf(stderr, "[DLSS] preset changed since the last run (%u -> %d): feature not pre-created%c", v[4], pr, 10);
+        return;
+    }
+    ID3D12Device* d = s_d3d.device;
+    ID3D12CommandAllocator* ca = NULL; ID3D12GraphicsCommandList* cl = NULL; ID3D12Fence* fe = NULL; HANDLE ev = NULL;
+    LARGE_INTEGER qf, a, b; QueryPerformanceFrequency(&qf); QueryPerformanceCounter(&a);
+    int ok = 0;
+    if (SUCCEEDED(d->lpVtbl->CreateCommandAllocator(d, D3D12_COMMAND_LIST_TYPE_DIRECT, &IID_ID3D12CommandAllocator, (void**)&ca)) &&
+        SUCCEEDED(d->lpVtbl->CreateCommandList(d, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, ca, NULL, &IID_ID3D12GraphicsCommandList, (void**)&cl)) &&
+        SUCCEEDED(d->lpVtbl->CreateFence(d, 0, D3D12_FENCE_FLAG_NONE, &IID_ID3D12Fence, (void**)&fe)) &&
+        (ev = CreateEventA(NULL, FALSE, FALSE, NULL)) != NULL) {
+        const int made = p_dlss_create(cl, v[0], v[1], v[2], v[3], 0, v[4]);
+        if (SUCCEEDED(cl->lpVtbl->Close(cl)) && made) {
+            ID3D12CommandList* lists[1] = { (ID3D12CommandList*)cl };
+            s_d3d.cmd_queue->lpVtbl->ExecuteCommandLists(s_d3d.cmd_queue, 1, lists);
+            if (SUCCEEDED(s_d3d.cmd_queue->lpVtbl->Signal(s_d3d.cmd_queue, fe, 1))) {
+                if (fe->lpVtbl->GetCompletedValue(fe) < 1 && SUCCEEDED(fe->lpVtbl->SetEventOnCompletion(fe, 1, ev)))
+                    WaitForSingleObject(ev, INFINITE);
+                ok = fe->lpVtbl->GetCompletedValue(fe) >= 1;
+            }
+        }
+    }
+    if (ev) CloseHandle(ev);
+    if (fe) fe->lpVtbl->Release(fe);
+    if (cl) cl->lpVtbl->Release(cl);
+    if (ca) ca->lpVtbl->Release(ca);
+    QueryPerformanceCounter(&b);
+    if (ok) { memcpy(s_dlss_pre, v, sizeof s_dlss_pre); s_dlss_pre_ok = 1; }
+    fprintf(stderr, "[DLSS] feature %s off the render thread in %.0f ms (%ux%u -> %ux%u, preset %u; RFOM_DLSS_PRECREATE=0 = old)%c",
+            ok ? "pre-created" : "pre-creation failed", (double)(b.QuadPart - a.QuadPart) * 1000.0 / (double)qf.QuadPart,
+            v[0], v[1], v[2], v[3], v[4], 10);
+}
 static DWORD WINAPI dlss_early_thread(LPVOID p)
 {
     (void)p;
@@ -663,8 +837,31 @@ static DWORD WINAPI dlss_early_thread(LPVOID p)
     QueryPerformanceCounter(&b);
     fprintf(stderr, "[DLSS] early init %s in %.0f ms%c", r ? "done" : "failed",
             (double)(b.QuadPart - a.QuadPart) * 1000.0 / (double)f.QuadPart, 10);
+    if (r) dlss_precreate();
     InterlockedExchange(&s_dlss_early_res, r);
     return 0;
+}
+/* RFOM_DLSS_PANEL_WAIT (default 0 = off, the old behaviour): when the start-up
+ * shader precompile panel was shown, keep it up ("Initialising DLSS") until
+ * the early NGX init and feature pre-creation are done, so their remainder
+ * cannot land on the first frames. 1 = only when the precompile was forced by
+ * a GPU/driver change (NGX init is slowest then), 2 = whenever the panel ran.
+ * Only waits when this program has used DLSS before (a feature history). */
+static void dlss_early_wait_panel(int forced)
+{
+    static int m = -1;
+    if (m < 0) { const char* e = getenv("RFOM_DLSS_PANEL_WAIT"); m = e ? atoi(e) : 0; if (m < 0 || m > 2) m = 0; }
+    if (!m || (m == 1 && !forced) || !s_dlss_early_th) return;
+    u32 v[5]; if (!dlss_hist_read(v)) return;
+    LARGE_INTEGER qf, a, b; QueryPerformanceFrequency(&qf); QueryPerformanceCounter(&a);
+    rfpf_status("Initialising DLSS");
+    while (WaitForSingleObject(s_dlss_early_th, 15) == WAIT_TIMEOUT) {
+        MSG msg; while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessageA(&msg); }
+    }
+    rfpf_status(NULL);
+    QueryPerformanceCounter(&b);
+    fprintf(stderr, "[DLSS] waited %.0f ms under the start-up panel for the early NGX init (RFOM_DLSS_PANEL_WAIT=%d)%c",
+            (double)(b.QuadPart - a.QuadPart) * 1000.0 / (double)qf.QuadPart, m, 10);
 }
 static int dlss_early_mode(void)
 {
@@ -994,11 +1191,48 @@ static D3D12_CPU_DESCRIPTOR_HANDLE fsr_rtv(int i)
     h.ptr += (u64)i * s_d3d.device->lpVtbl->GetDescriptorHandleIncrementSize(s_d3d.device, D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     return h;
 }
+/* PORT_DLSS_AUTO_ARCH (default 1; old name PORT_DLSS_AUTO_K): RSX_DLSS_PRESET unset / auto picks by GPU
+ * architecture -- E (CNN) on RTX 20/30, where the transformer costs several times more; NVIDIA's default
+ * (0: K / M / L by quality mode) on RTX 40/50 and unknown GPUs. =0: the old auto (always 0). */
+static int dlss_auto_preset(void)
+{
+    if (!pdq_auto_arch_enabled(1)) return 0;
+    const int arch = pdq_nv_arch(s_gpu_vendor, s_gpu_device);
+    const int p = pdq_auto_preset(arch);
+    if (p > 0) fprintf(stderr, "[DLSS] auto preset %c (%s, device %04X; RSX_DLSS_PRESET=default for NVIDIA's choice, PORT_DLSS_AUTO_ARCH=0 for the old auto)%c",
+                       pdq_preset_letter((unsigned)p), pdq_arch_name(arch), s_gpu_device, 10);
+    else if (p == 0) fprintf(stderr, "[DLSS] auto preset: NVIDIA default, K / M / L by quality mode (%s, device %04X)%c", pdq_arch_name(arch), s_gpu_device, 10);
+    else fprintf(stderr, "[DLSS] auto preset: NVIDIA default (GPU %04X:%04X not classified)%c", s_gpu_vendor, s_gpu_device, 10);
+    return p > 0 ? p : 0;
+}
+/* RSX_DLSS_PRESET -> NVSDK_NGX_DLSS_Hint_Render_Preset; unsupported values fall back to auto. */
+static int dlss_preset_env(void)
+{
+    const char* e = getenv("RSX_DLSS_PRESET");
+    if (!e) return dlss_auto_preset();
+    { const char* raw = getenv("RSX_DLSS_PRESET_RAW");   /* =1: old behaviour, the number passed through unchecked */
+      if (raw && *raw == '1') { const int n = atoi(e); return n < 0 ? 0 : n; } }
+    while (*e == ' ') e++;
+    if (!*e || !_stricmp(e, "auto")) return dlss_auto_preset();
+    if (!_stricmp(e, "default") || !_stricmp(e, "nvidia")) return 0;
+    int v = -1;
+    if (((*e | 0x20) >= 'a' && (*e | 0x20) <= 'z') && (!e[1] || e[1] == ' ')) v = (*e | 0x20) - 'a' + 1;   /* A = 1 ... */
+    else { char* end = NULL; long n = strtol(e, &end, 10); if (end != e && (!*end || *end == ' ')) v = (int)n; }
+    switch (v) {
+    case 0: case 5: case 6: case 10: case 11: case 12: case 13:
+        if (v) fprintf(stderr, "[DLSS] preset %c (%d)%s%c", 'A' + v - 1, v, v < 10 ? " -- CNN model" : " -- transformer model", 10);
+        return v;
+    default:
+        fprintf(stderr, "[DLSS] RSX_DLSS_PRESET=%s is not a preset this DLSS accepts (E F J K L M) -- using Auto%c", e, 10);
+        return dlss_auto_preset();
+    }
+}
+
 static void fsr_release(void)
 {
     if (s_fsr_ctx && p_ffxDestroyContext) { wait_for_gpu(); p_ffxDestroyContext(&s_fsr_ctx, NULL); }
     s_fsr_ctx = NULL;
-    if (s_dlss_on) { wait_for_gpu(); p_dlss_release(); s_dlss_on = 0; }
+    if (s_dlss_on) { wait_for_gpu(); p_dlss_release(); s_dlss_on = 0; s_dlss_pre_ok = 0; }
     s_dlss_rw = s_dlss_rh = 0;
     if (s_xess_on) { wait_for_gpu(); s_xess_on = 0; }   /* the context is kept; re-initialised on the next dispatch */
     s_xess_rw = s_xess_rh = 0;
@@ -1014,6 +1248,7 @@ static int fsr_ensure(u32 w, u32 h, DXGI_FORMAT colour_fmt)
     if (!fsr_mode()) return 0;
     if (fsr_live() && s_fsr_cw == w && s_fsr_ch == h) return 1;
     const int use_dlss = fsr_mode() == 2 && !s_dlss_bad && dlss_load();
+    if (!use_dlss && s_dlss_pre_ok && p_dlss_release) { p_dlss_release(); s_dlss_pre_ok = 0; }   /* its GPU work finished on the early thread */
     const int use_xess = !use_dlss && fsr_mode() == 3 && !s_xess_bad && xess_load();
     if (!use_dlss && !use_xess && (s_ffx_dll_fail || s_fsr_ctx_fail)) return 0;
     if (!use_dlss && !use_xess && !s_ffx_dll) {
@@ -1045,6 +1280,11 @@ static int fsr_ensure(u32 w, u32 h, DXGI_FORMAT colour_fmt)
     cd.maxUpscaleSize.width = w; cd.maxUpscaleSize.height = h;
     /* v165c: auto exposure (AMD's recommendation; without an exposure input the
      * first build came out black). Debug checking only with RSX_FSR_DEBUG=1. */
+    /* UPSCALER_ARTIFACTS F10: on LDR sRGB input auto-exposure can pump on
+     * flashes. RSX_FSR_AUTOEXP=0 makes Home mode 1 (exposure 1) permanent;
+     * default stays on until mode 1 is confirmed not to come out black. */
+    { static int ae = -1; if (ae < 0) { const char* e = getenv("RSX_FSR_AUTOEXP"); ae = (e && e[0] == '0') ? 0 : 1;
+                                        if (!ae && s_fsr_ab == 0) s_fsr_ab = 1; } }
     cd.flags = s_fsr_ab == 1 ? 0u : FFX_UPSCALE_ENABLE_AUTO_EXPOSURE;
     s_fsr_ab_ctx = s_fsr_ab == 1;
     { const char* e = getenv("RSX_FSR_LINEAR"); if (!(e && atoi(e))) cd.flags |= FFX_UPSCALE_ENABLE_NON_LINEAR_COLORSPACE; }
@@ -1091,9 +1331,10 @@ static int fsr_ensure(u32 w, u32 h, DXGI_FORMAT colour_fmt)
 static const char s_mv_ps_hlsl[] =
 "struct MVOut { float4 pos:SV_Position; float4 cur:TEXCOORD0; float4 prv:TEXCOORD1; };\n"
 "struct MVT { float2 mv:SV_Target0; float z:SV_Target1; float rx:SV_Target2; };\n"
+"cbuffer MVK : register(b4) { float4 mv_k; };\n"   /* w -1: unmatched (-1 - depth), -2: ambiguous match (-3 - depth) for the fill; negative keeps the precision */
 "#ifndef RXV\n#define RXV 0.0\n#endif\n"
 "MVT main(MVOut i) {\n"
-"    MVT o; o.rx = RXV; o.z = i.prv.z > 1e29 ? i.cur.z : i.prv.z < -0.5 ? 2.0 + i.pos.z : i.pos.z;\n"
+"    MVT o; o.rx = RXV; o.z = i.prv.z > 1e29 ? i.cur.z : i.prv.z < -0.5 ? (mv_k.w < -1.5 ? -3.0 : -1.0) - saturate(i.pos.z) : i.pos.z;\n"
 "    if (abs(i.prv.w) < 1e-6 || abs(i.cur.w) < 1e-6) { o.mv = float2(0, 0); return o; }\n"
 "    float2 c = i.cur.xy / i.cur.w, p = i.prv.xy / i.prv.w;\n"
 "    o.mv = (p - c) * float2(0.5, -0.5);\n"   /* UV units, previous minus current */
@@ -1109,7 +1350,7 @@ static int mv_init(void)
     rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV; rp[1].Descriptor.ShaderRegister = 3; rp[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
     rp[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; rp[2].Descriptor.ShaderRegister = 30; rp[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
     rp[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS; rp[3].Constants.ShaderRegister = 4;
-    rp[3].Constants.Num32BitValues = 4; rp[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+    rp[3].Constants.Num32BitValues = 4; rp[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;   /* the PS reads mv_k.w too */
     D3D12_ROOT_SIGNATURE_DESC rd = {0};
     rd.NumParameters = 4; rd.pParameters = rp;
     rd.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
@@ -1148,8 +1389,229 @@ static char* mv_subst(const char* s, size_t n, const char* const* from, const ch
     out[o] = 0;
     return out;
 }
-/* The decompiled program (or its GPU-fetch form) -> motion-vector VS. */
-static char* mv_make_vs_text(const char* base)
+/* RSX_FSR_MV_PRUNE (default 1; 0 = the old text): the motion VS uses only the
+ * position of each of its two inlined copies of the game's VS, but FXC still
+ * chewed through the whole program twice (1-15 s per program on a 6-core while
+ * playing). Drop the statements whose result never reaches o[0] before the text
+ * is built: a backward liveness pass over the translator's straight-line form
+ * ({ float4 _v = ...; r[N].m = _v.m; } blocks, a0/a1 loads, v[N] fetches).
+ * Anything else (flow control, dynamic register indexing, an unknown line)
+ * keeps the full text. It removes only code FXC removes anyway: all 383 such
+ * programs of a full local cache compiled to identical assembly, 37% less FXC
+ * time. The worker first looks the unpruned text up in the cache, so programs
+ * cached earlier (or seeded by shaderscan) are not compiled again. */
+static int mv_prune_on(void)
+{
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("RSX_FSR_MV_PRUNE"); v = (e && e[0] == '0') ? 0 : 1; }
+    return v;
+}
+#define MVP_REGS 64
+typedef struct { const char* p; size_t n; u8 isv, ndef; u8 dk[8], di[8], dm[8], dc[8]; u64 use[5]; } MvpStmt;
+static int mvp_ident(char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'; }
+static int mvp_lit(const char* s, const char* e, const char* lit)
+{
+    const size_t L = strlen(lit);
+    return (size_t)(e - s) >= L && !memcmp(s, lit, L);
+}
+/* register reads in [s, e): r o v cc (constant index) and a0/a1. 0 = not modelled. */
+static int mvp_uses(const char* s, const char* e, u64 use[5])
+{
+    static const char* const pre[4] = { "cc[", "r[", "o[", "v[" };
+    static const int kind[4] = { 3, 0, 1, 2 };
+    for (const char* p = s; p < e; p++) {
+        if (p > s && mvp_ident(p[-1])) continue;
+        if (*p == 'a' && p + 1 < e && (p[1] == '0' || p[1] == '1') && (p + 2 >= e || !mvp_ident(p[2]))) {
+            use[4] |= 1ull << (p[1] - '0'); p++; continue;
+        }
+        for (int k = 0; k < 4; k++) {
+            if (!mvp_lit(p, e, pre[k])) continue;
+            const char* q = p + strlen(pre[k]);
+            int idx = 0, nd = 0;
+            while (q < e && *q >= '0' && *q <= '9' && nd < 3) { idx = idx * 10 + (*q - '0'); q++; nd++; }
+            if (!nd || q >= e || *q != ']' || idx >= MVP_REGS) return 0;
+            use[kind[k]] |= 1ull << idx;
+            p = q;
+            break;
+        }
+    }
+    return 1;
+}
+static int mvp_mask(const char** pp, const char* e, u8* m)
+{
+    const char* p = *pp; *m = 0;
+    while (p < e && (*p == 'x' || *p == 'y' || *p == 'z' || *p == 'w')) {
+        *m |= (u8)(*p == 'x' ? 1 : *p == 'y' ? 2 : *p == 'z' ? 4 : 8); p++; }
+    if (p == *pp || p - *pp > 4) return 0;
+    *pp = p; return 1;
+}
+/* "[if (COND) ](r|o|cc)[N].MASK = _v.MASK;" */
+static int mvp_def(const char* s, const char* e, MvpStmt* st)
+{
+    u8 cond = 0;
+    if (mvp_lit(s, e, "if (")) {
+        const char* q = NULL;
+        for (const char* p = s; p + 1 < e; p++) if (p[0] == ')' && p[1] == ' ') q = p;
+        if (!q) return 0;
+        if (!mvp_uses(s + 4, q, st->use)) return 0;
+        s = q + 2; cond = 1;
+    }
+    int k;
+    if (mvp_lit(s, e, "cc[")) { k = 3; s += 3; } else if (mvp_lit(s, e, "r[")) { k = 0; s += 2; }
+    else if (mvp_lit(s, e, "o[")) { k = 1; s += 2; } else return 0;
+    int idx = 0, nd = 0;
+    while (s < e && *s >= '0' && *s <= '9' && nd < 3) { idx = idx * 10 + (*s - '0'); s++; nd++; }
+    if (!nd || idx >= MVP_REGS || !mvp_lit(s, e, "].")) return 0;
+    s += 2;
+    u8 m, m2;
+    if (!mvp_mask(&s, e, &m) || !mvp_lit(s, e, " = _v.")) return 0;
+    s += 6;
+    if (!mvp_mask(&s, e, &m2) || e - s != 1 || *s != ';' || st->ndef >= 8) return 0;
+    st->dk[st->ndef] = (u8)k; st->di[st->ndef] = (u8)idx; st->dm[st->ndef] = m; st->dc[st->ndef] = cond; st->ndef++;
+    return 1;
+}
+/* m: "VSOutput main(...) {" through the end of the text. malloc'd pruned
+ * function, NULL = keep the original (not the modelled form, or nothing to drop). */
+static char* mv_prune_main(const char* m)
+{
+    const size_t fn = strlen(m);
+    size_t nl = 1;
+    for (size_t i = 0; i < fn; i++) nl += m[i] == '\n';
+    const char** ls = (const char**)malloc(nl * sizeof *ls);
+    size_t* ln = (size_t*)malloc(nl * sizeof *ln);
+    MvpStmt* st = (MvpStmt*)calloc(nl * 4 + 16, sizeof *st);   /* a v[] line holds up to 4 fetches */
+    u8* keep = (u8*)calloc(nl * 4 + 16, 1);
+    u8* head = (u8*)calloc(nl, 1);
+    char* out = NULL;
+    size_t L = 0, ns = 0, endi = 0;
+    int ok = ls && ln && st && keep && head, only_v = 1;
+    if (ok) {
+        const char* p = m;
+        for (size_t i = 0; i < nl; i++) {
+            const char* q = strchr(p, '\n');
+            ls[L] = p; ln[L] = q ? (size_t)(q - p) : strlen(p); L++;
+            if (!q) break;
+            p = q + 1;
+        }
+        ok = 0;
+        for (size_t i = 1; i + 2 < L; i++) {
+            const char* t = ls[i]; const char* e = t + ln[i];
+            while (t < e && *t == ' ') t++;
+            if (e - t == 13 && !memcmp(t, "VSOutput Out;", 13)) { endi = i; ok = 1; break; }
+        }
+    }
+    if (ok) {   /* the position must come from o[0] alone */
+        const char* t = ls[endi + 1]; const char* e = t + ln[endi + 1];
+        while (t < e && *t == ' ') t++;
+        const char* t2 = ls[endi + 2]; const char* e2 = t2 + ln[endi + 2];
+        while (t2 < e2 && *t2 == ' ') t2++;
+        ok = e - t == 17 && !memcmp(t, "float4 _p = o[0];", 17) &&
+             mvp_lit(t2, e2, "Out.pos = float4(_p.xyz * vp_posscale.xyz + _p.w * vp_posoffset.xyz, _p.w);");
+    }
+    static const char* const hp[] = { "float4 v[", "float4 r[", "[unroll] for (int _i", "[unroll] for (int _j",
+                                       "int4 a0 = (int4)0;", "float4 cc[2];" };
+    for (size_t i = 1; ok && i < endi; i++) {
+        const char* t = ls[i]; const char* e = t + ln[i];
+        while (t < e && *t == ' ') t++;
+        while (e > t && (e[-1] == ' ' || e[-1] == '\r')) e--;
+        if (t == e) continue;
+        if (mvp_lit(t, e, "{ float4 _v =")) {
+            MvpStmt* s = &st[ns];
+            s->p = ls[i];
+            if (memchr(t, '}', (size_t)(e - t)) || !mvp_uses(t, e, s->use)) { ok = 0; break; }
+            size_t j = i + 1;
+            for (; j < endi; j++) {
+                const char* a = ls[j]; const char* b = a + ln[j];
+                while (a < b && *a == ' ') a++;
+                while (b > a && (b[-1] == ' ' || b[-1] == '\r')) b--;
+                if (b - a == 1 && *a == '}') break;
+                if (!mvp_def(a, b, s)) { ok = 0; break; }
+            }
+            if (!ok || j >= endi) { ok = 0; break; }
+            s->n = (size_t)(ls[j] + ln[j] - s->p);
+            ns++; only_v = 0; i = j;
+            continue;
+        }
+        if (mvp_lit(t, e, "{ int4 _a = ")) {   /* "{ int4 _a = EXPR; aN.MASK = _a.MASK; }" */
+            const char* q = NULL;
+            for (const char* p = t; p + 4 < e; p++) if (p[0] == ';' && p[1] == ' ' && p[2] == 'a' && (p[3] == '0' || p[3] == '1') && p[4] == '.') q = p;
+            MvpStmt* s = &st[ns];
+            u8 m1, m2;
+            const char* r = q ? q + 5 : NULL;
+            if (!q || !mvp_uses(t + 12, q, s->use) || !mvp_mask(&r, e, &m1) || !mvp_lit(r, e, " = _a.")) { ok = 0; break; }
+            r += 6;
+            if (!mvp_mask(&r, e, &m2) || e - r != 3 || memcmp(r, "; }", 3)) { ok = 0; break; }
+            s->p = ls[i]; s->n = ln[i];
+            s->dk[0] = 4; s->di[0] = (u8)(q[3] - '0'); s->dm[0] = m1; s->ndef = 1;
+            ns++; only_v = 0;
+            continue;
+        }
+        if (mvp_lit(t, e, "v[")) {   /* "v[N]=EXPR;  v[N]=EXPR; ..." */
+            const char* p = t;
+            while (ok && p < e) {
+                while (p < e && *p == ' ') p++;
+                if (p >= e) break;
+                const char* sc = (const char*)memchr(p, ';', (size_t)(e - p));
+                if (!sc || !mvp_lit(p, sc, "v[")) { ok = 0; break; }
+                const char* q = p + 2;
+                int idx = 0, nd = 0;
+                while (q < sc && *q >= '0' && *q <= '9' && nd < 3) { idx = idx * 10 + (*q - '0'); q++; nd++; }
+                if (!nd || idx >= MVP_REGS || !mvp_lit(q, sc, "]=")) { ok = 0; break; }
+                MvpStmt* s = &st[ns];
+                if (!mvp_uses(q + 2, sc, s->use) || ns + 1 >= nl * 4 + 16) { ok = 0; break; }
+                s->p = p; s->n = (size_t)(sc - p); s->isv = 1;
+                s->dk[0] = 2; s->di[0] = (u8)idx; s->dm[0] = 15; s->ndef = 1;
+                ns++;
+                p = sc + 1;
+            }
+            continue;
+        }
+        int h = 0;
+        for (size_t k = 0; k < sizeof hp / sizeof hp[0]; k++) if (mvp_lit(t, e, hp[k])) h = 1;
+        if (!h || !only_v) { ok = 0; break; }
+        head[i] = 1;
+    }
+    size_t kept = 0;
+    if (ok) {
+        u8 live[5][MVP_REGS];
+        memset(live, 0, sizeof live);
+        live[1][0] = 15;
+        for (size_t k = ns; k-- > 0;) {
+            const MvpStmt* s = &st[k];
+            int any = 0;
+            for (int d = 0; d < s->ndef; d++) any |= live[s->dk[d]][s->di[d]] & s->dm[d];
+            if (!any) continue;
+            keep[k] = 1; kept++;
+            for (int d = 0; d < s->ndef; d++) if (!s->dc[d]) live[s->dk[d]][s->di[d]] &= (u8)~s->dm[d];
+            for (int c = 0; c < 5; c++)
+                for (int r = 0; r < MVP_REGS; r++) if (s->use[c] >> r & 1) live[c][r] = 15;
+        }
+        ok = kept < ns;
+    }
+    if (ok) {
+        out = (char*)malloc(fn + ns * 8 + 16);
+        if (out) {
+            size_t o = 0;
+            memcpy(out + o, ls[0], ln[0]); o += ln[0]; out[o++] = '\n';
+            for (size_t i = 1; i < endi; i++) if (head[i]) { memcpy(out + o, ls[i], ln[i]); o += ln[i]; out[o++] = '\n'; }
+            for (size_t k = 0; k < ns; k++) {
+                if (!keep[k]) continue;
+                if (st[k].isv) { memcpy(out + o, "    ", 4); o += 4; memcpy(out + o, st[k].p, st[k].n); o += st[k].n; out[o++] = ';'; }
+                else { memcpy(out + o, st[k].p, st[k].n); o += st[k].n; }
+                out[o++] = '\n';
+            }
+            const size_t tl = fn - (size_t)(ls[endi] - m);
+            memcpy(out + o, ls[endi], tl); o += tl;
+            out[o] = 0;
+        }
+    }
+    free((void*)ls); free(ln); free(st); free(keep); free(head);
+    return out;
+}
+/* The decompiled program (or its GPU-fetch form) -> motion-vector VS.
+ * prune: drop what cannot reach the position (mv_prune_main); *pruned = 1
+ * when that changed the text. */
+static char* mv_make_vs_text(const char* base, int prune, int* pruned)
 {
     static const char sigA[] = "VSOutput main(VSInput input) {";
     static const char sigB[] = "VSOutput main(uint _vid : SV_VertexID) {";
@@ -1157,13 +1619,18 @@ static char* mv_make_vs_text(const char* base)
     if (!m || strstr(base, "rsx_vtex")) return NULL;     /* vertex texture fetch: not handled */
     const int gfv = !strncmp(m, sigB, sizeof sigB - 1);
     if (!gfv && strncmp(m, sigA, sizeof sigA - 1)) return NULL;
-    const size_t pre = (size_t)(m - base), fn = strlen(m);
+    const size_t pre = (size_t)(m - base);
+    char* pm = prune ? mv_prune_main(m) : NULL;
+    if (pruned) *pruned = pm != NULL;
+    if (pm) m = pm;
+    const size_t fn = strlen(m);
     static const char* f1[] = { "VSOutput main(", "uint _vid : SV_VertexID" };
     static const char* t1[] = { "VSOutput mv_cur(", "uint _vid" };
     static const char* f2[] = { "VSOutput main(", "uint _vid : SV_VertexID", "vp_c[", "vp_posscale", "vp_posoffset" };
     static const char* t2[] = { "VSOutput mv_prv(", "uint _vid", "vp_cp[", "vp_pps", "vp_ppo" };
     char* c1 = mv_subst(m, fn, f1, t1, 2);
     char* c2 = mv_subst(m, fn, f2, t2, 5);
+    free(pm);
     if (!c1 || !c2) { free(c1); free(c2); return NULL; }
     static const char extra[] =
         "cbuffer VPPrev : register(b3) { float4 vp_cp[512]; float4 vp_pps; float4 vp_ppo; uint4 vp_pbr; };\n"
@@ -1186,10 +1653,10 @@ static char* mv_make_vs_text(const char* base)
     return out;
 }
 
-typedef struct { u32 hash; u8 gf, cull, used; ID3D12PipelineState* pso; } MvPso;
+typedef struct { u32 hash; u8 gf, cull, used; ID3D12PipelineState* pso; ID3DBlob* vs; volatile LONG state; } MvPso;   /* state 1 queued, 2 done */
 #define MV_PSO_N 4096u
 static MvPso s_mv_pso[MV_PSO_N];
-typedef struct { u32 hash; u8 gf, used; ID3DBlob* vs; volatile LONG state; char* text; } MvVs;   /* state 1 queued, 2 done */
+typedef struct { u32 hash; u8 gf, used; ID3DBlob* vs; volatile LONG state; char* text; char* full; } MvVs;   /* full: unpruned text (cache lookup only) */   /* state 1 queued, 2 done */
 #define MV_VS_N 2048u
 static MvVs s_mv_vs[MV_VS_N];
 static char* gf_make_text(const char* hlsl, size_t* olen);   /* fwd */
@@ -1200,21 +1667,64 @@ static char* gf_make_text(const char* hlsl, size_t* olen);   /* fwd */
 static SRWLOCK s_mvq_lock = SRWLOCK_INIT;
 static u32 s_mvq[MV_VS_N], s_mvq_head, s_mvq_tail;
 static HANDLE s_mvq_ev;
+/* RSX_FSR_MV_PSO_ASYNC (default 1): the motion PSO for a ready VS is also
+ * created on this worker instead of the render thread (a driver PSO compile
+ * is 10-100+ ms on first use). Until it is ready the draw writes no motion,
+ * exactly as while its VS compiles. 0 = create on the render thread. */
+static u32 s_mvpq[MV_PSO_N], s_mvpq_head, s_mvpq_tail;
+static ID3D12PipelineState* mv_build_pso(ID3DBlob* vs, int gf, u8 cull, u32 hash);
+static int mv_pso_async_on(void)
+{
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("RSX_FSR_MV_PSO_ASYNC"); v = (e && e[0] == '0') ? 0 : 1; }
+    return v;
+}
 static DWORD WINAPI mv_worker(LPVOID p)
 {
     (void)p;
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    /* RSX_FSR_MV_BG=1 (opt-in; default 0 = below normal on any CPU): run FXC at
+     * the lowest priority on the last logical CPU (an E-core on hybrid Intel)
+     * when there are 8+, so a seconds-long compile can only take that one CPU
+     * from the game. Opt-in: a starved compile holds its allocator locks longer. */
+    { const char* e = getenv("RSX_FSR_MV_BG");
+      if (e && e[0] == '1') {
+          char d[48] = "any CPU";
+          DWORD_PTR proc = 0, sys = 0;
+          SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+          if (GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys) && proc) {
+              int n = 0, last = -1;
+              for (int c = 0; c < 64; c++) if (proc >> c & 1) { n++; last = c; }
+              if (n >= 8 && SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR)1 << last)) snprintf(d, sizeof d, "CPU %d", last);
+          }
+          fprintf(stderr, "[FSR] motion-shader worker: lowest priority, %s (RSX_FSR_MV_BG=1)%c", d, 10);
+      } }
     for (;;) {
         WaitForSingleObject(s_mvq_ev, INFINITE);
         for (;;) {
-            u32 i = 0xFFFFFFFFu;
+            u32 i = 0xFFFFFFFFu, pi = 0xFFFFFFFFu;
             AcquireSRWLockExclusive(&s_mvq_lock);
             if (s_mvq_head != s_mvq_tail) { i = s_mvq[s_mvq_head % MV_VS_N]; s_mvq_head++; }
+            else if (s_mvpq_head != s_mvpq_tail) { pi = s_mvpq[s_mvpq_head % MV_PSO_N]; s_mvpq_head++; }
             ReleaseSRWLockExclusive(&s_mvq_lock);
+            if (pi != 0xFFFFFFFFu) {
+                MvPso* q = &s_mv_pso[pi];
+                q->pso = mv_build_pso(q->vs, q->gf, q->cull, q->hash);
+                MemoryBarrier();
+                InterlockedExchange(&q->state, 2);
+                continue;
+            }
             if (i == 0xFFFFFFFFu) break;
             MvVs* m = &s_mv_vs[i];
             ID3DBlob *vb = NULL, *e = NULL;
-            HRESULT hr = shc_compile(m->text, strlen(m->text), "fsr_mv_vs", "main", "vs_5_0", &vb, &e);
+            HRESULT hr = E_FAIL;
+            if (m->full) {   /* cached before pruning, or seeded by shaderscan: no FXC */
+                hr = shc_compile_ex(m->full, strlen(m->full), "fsr_mv_vs", "main", "vs_5_0", &vb, &e, 1);
+                if (FAILED(hr) && vb) { vb->lpVtbl->Release(vb); vb = NULL; }
+                if (e) { e->lpVtbl->Release(e); e = NULL; }
+                free(m->full); m->full = NULL;
+            }
+            if (!vb) hr = shc_compile(m->text, strlen(m->text), "fsr_mv_vs", "main", "vs_5_0", &vb, &e);
             if (FAILED(hr) || !vb) {
                 static int n = 0; if (n < 4 && ++n) {
                     fprintf(stderr, "[FSR] MV VS compile failed (vs 0x%08X gf %d): %s%c", m->hash, m->gf,
@@ -1242,18 +1752,20 @@ static ID3DBlob* mv_get_vs(int vreal, int gf)
     }
     if (s_mv_vs[i].used) return NULL;            /* table full */
     MvVs* m = &s_mv_vs[i];
-    m->used = 1; m->hash = ve->hash; m->gf = (u8)gf; m->vs = NULL; m->state = 2; m->text = NULL;
+    m->used = 1; m->hash = ve->hash; m->gf = (u8)gf; m->vs = NULL; m->state = 2; m->text = NULL; m->full = NULL;
     if (!ve->src) return NULL;
     char* base = NULL; size_t bl = 0;
     if (gf) { base = gf_make_text(ve->src, &bl); if (!base) return NULL; }
-    char* t = mv_make_vs_text(gf ? base : ve->src);
+    int pruned = 0;
+    char* t = mv_make_vs_text(gf ? base : ve->src, mv_prune_on(), &pruned);
+    char* full = pruned ? mv_make_vs_text(gf ? base : ve->src, 0, NULL) : NULL;
     free(base);
-    if (!t) return NULL;
+    if (!t) { free(full); return NULL; }
     if (!s_mvq_ev) {
         s_mvq_ev = CreateEventA(NULL, FALSE, FALSE, NULL);
         CreateThread(NULL, 1u << 20, mv_worker, NULL, 0, NULL);
     }
-    m->text = t; m->state = 1;
+    m->text = t; m->full = full; m->state = 1;
     AcquireSRWLockExclusive(&s_mvq_lock);
     s_mvq[s_mvq_tail % MV_VS_N] = i; s_mvq_tail++;
     ReleaseSRWLockExclusive(&s_mvq_lock);
@@ -1271,12 +1783,29 @@ static ID3D12PipelineState* mv_get_pso(const D3D12DrawRecord* dr, int rx, int zo
     u32 i = (hash * 2654435761u ^ ((u32)gf << 3 | cull) * 40503u) & (MV_PSO_N - 1u);
     for (u32 n = 0; n < MV_PSO_N; n++, i = (i + 1u) & (MV_PSO_N - 1u)) {
         if (!s_mv_pso[i].used) break;
-        if (s_mv_pso[i].hash == hash && s_mv_pso[i].gf == (u8)gf && s_mv_pso[i].cull == cull) return s_mv_pso[i].pso;
+        if (s_mv_pso[i].hash == hash && s_mv_pso[i].gf == (u8)gf && s_mv_pso[i].cull == cull)
+            return s_mv_pso[i].state == 2 ? s_mv_pso[i].pso : NULL;
     }
     if (s_mv_pso[i].used) return NULL;
     ID3DBlob* vs = mv_get_vs(vreal, gf);
     if (!vs) return NULL;                         /* compiling (or failed): retry later, cache nothing */
-    s_mv_pso[i].used = 1; s_mv_pso[i].hash = hash; s_mv_pso[i].gf = (u8)gf; s_mv_pso[i].cull = cull; s_mv_pso[i].pso = NULL;
+    MvPso* q = &s_mv_pso[i];
+    q->hash = hash; q->gf = (u8)gf; q->cull = cull; q->pso = NULL; q->vs = vs;
+    if (mv_pso_async_on() && s_mvq_ev) {
+        q->state = 1; q->used = 1;
+        AcquireSRWLockExclusive(&s_mvq_lock);
+        s_mvpq[s_mvpq_tail % MV_PSO_N] = i; s_mvpq_tail++;
+        ReleaseSRWLockExclusive(&s_mvq_lock);
+        SetEvent(s_mvq_ev);
+        return NULL;
+    }
+    q->pso = mv_build_pso(vs, gf, cull, hash);
+    q->state = 2; q->used = 1;
+    return q->pso;
+}
+static ID3D12PipelineState* mv_build_pso(ID3DBlob* vs, int gf, u8 cull, u32 hash)
+{
+    const int rx = (cull & 0x80u) != 0, zoff = (cull & 0x40u) != 0;
     D3D12_INPUT_ELEMENT_DESC il[16];
     for (int k = 0; k < 16; k++) {
         il[k].SemanticName = "ATTR"; il[k].SemanticIndex = k; il[k].Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
@@ -1290,8 +1819,8 @@ static ID3D12PipelineState* mv_get_pso(const D3D12DrawRecord* dr, int rx, int zo
       pd.PS.pShaderBytecode = ps->lpVtbl->GetBufferPointer(ps); pd.PS.BytecodeLength = ps->lpVtbl->GetBufferSize(ps); }
     pd.InputLayout.pInputElementDescs = gf ? NULL : il; pd.InputLayout.NumElements = gf ? 0 : 16;
     pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-    pd.RasterizerState.CullMode = (dr->cull & 1u) ? ((dr->cull & 2u) ? D3D12_CULL_MODE_FRONT : D3D12_CULL_MODE_BACK) : D3D12_CULL_MODE_NONE;
-    pd.RasterizerState.FrontCounterClockwise = (dr->cull & 4u) ? TRUE : FALSE;
+    pd.RasterizerState.CullMode = (cull & 1u) ? ((cull & 2u) ? D3D12_CULL_MODE_FRONT : D3D12_CULL_MODE_BACK) : D3D12_CULL_MODE_NONE;
+    pd.RasterizerState.FrontCounterClockwise = (cull & 4u) ? TRUE : FALSE;
     /* v189: the motion pass tests against the scene's depth (LEQUAL) with its own
      * compile of the game's VS. Trees sway with sin() wind math, and the separate
      * compile rounds a hair differently -- the depth came out 1-2 units behind the
@@ -1323,7 +1852,6 @@ static ID3D12PipelineState* mv_get_pso(const D3D12DrawRecord* dr, int rx, int zo
         static int n = 0; if (n < 4 && ++n) fprintf(stderr, "[FSR] MV pipeline failed (vs 0x%08X)%c", hash, 10);
         pso = NULL;
     }
-    s_mv_pso[i].pso = pso;
     return pso;
 }
 
@@ -1344,7 +1872,7 @@ static void fsr_mv_replay(u32 d0, u32 d1, D3D12_CPU_DESCRIPTOR_HANDLE dsv, int r
     if (!s_fsr_mv_started) {
         static const float z4[4] = {0, 0, 0, 0}, o4[4] = {1, 1, 1, 1}, s4[4] = {4, 4, 4, 4};
         /* RFOM_DLSS_CAM: depth cleared to the "nothing wrote here" sentinel for the camera fill */
-        s_cf_armed = dlss_cam_exact() && s_fsr_ab != 4 && s_fsr_ab != 5 && fsr_dbg_view() != 3;
+        s_cf_armed = dlss_cam_exact() && s_fsr_ab != 4 && s_fsr_ab != 5 && fsr_dbg_view() != 3 && cf_init();   /* no fill = no sentinels */
         s_cf_zi = s_cf_rti = -1;
         cl->lpVtbl->ClearRenderTargetView(cl, rh[0], z4, 0, NULL);
         cl->lpVtbl->ClearRenderTargetView(cl, rh[1], s_cf_armed ? s4 : o4, 0, NULL);
@@ -1430,6 +1958,12 @@ static void fsr_mv_replay(u32 d0, u32 d1, D3D12_CPU_DESCRIPTOR_HANDLE dsv, int r
         if (!pso) continue;
         if (pso != last) { cl->lpVtbl->SetPipelineState(cl, pso); last = pso; }
         D3D12_VIEWPORT vp = {0, 0, tw, th, 0.0f, 1.0f};
+        /* CLIP_MIN/MAX: the draw's VS remaps z into the range (vp_record_cb_impl) and the scene replay's viewport
+         * maps it back; so must this one, or such a draw (e.g. a depth-range viewmodel) lands at the wrong depth,
+         * fails the test against the scene and keeps the camera motion of what is behind it.
+         * RSX_DLSS_MV_ZRANGE=0 = the old 0..1 viewport. */
+        { static int zr = -1; if (zr < 0) zr = dlss_env_i("RSX_DLSS_MV_ZRANGE", 1, 0, 1);
+          if (zr && dr->zmax > dr->zmin && (dr->zmin != 0.0f || dr->zmax != 1.0f)) { vp.MinDepth = dr->zmin; vp.MaxDepth = dr->zmax; s_fsr_st_zr++; } }
         if (dr->vp_w >= 2 && dr->vp_h >= 2 && (float)(dr->vp_x + dr->vp_w) <= tw + 0.5f && (float)(dr->vp_y + dr->vp_h) <= th + 0.5f) {
             vp.TopLeftX = (float)dr->vp_x; vp.TopLeftY = (float)dr->vp_y; vp.Width = (float)dr->vp_w; vp.Height = (float)dr->vp_h; }
         vp.TopLeftX = SCF(vp.TopLeftX); vp.TopLeftY = SCF(vp.TopLeftY); vp.Width = SCF(vp.Width); vp.Height = SCF(vp.Height);
@@ -1443,6 +1977,7 @@ static void fsr_mv_replay(u32 d0, u32 d1, D3D12_CPU_DESCRIPTOR_HANDLE dsv, int r
         { float k[4] = { dr->fsr_jnx, dr->fsr_jny, (float)d, s_fsr_ab == 5 ? 1.0f : 0.0f };
           if (fsr_dbg_view() == 3 && s_fsr_ab != 5) { k[2] = 10.0f + (float)dr->fsr_mt; k[3] = 1.0f; }
           else if (s_cf_armed && dr->fsr_mt == 0 && !rx) k[3] = -1.0f;   /* no match: camera motion at its depth (fill) */
+          else if (s_cf_armed && dr->fsr_mt == 5 && !rx) k[3] = -2.0f;   /* ambiguous match: camera motion if the frame has one, else its own */
           cl->lpVtbl->SetGraphicsRoot32BitConstants(cl, 3, 4, k, 0); }
         if (dr->ib_count && s_vp_ib)
             cl->lpVtbl->DrawIndexedInstanced(cl, dr->ib_count, 1, dr->ib_first, dr->gf ? 0 : (INT)(dr->vb_byte_offset / 256), 0);
@@ -1503,7 +2038,7 @@ static const char s_mg_hlsl[] =
 "    if (k.x < 2.5) { if (z >= 1.0) return float4(0.8, 0, 0.8, c.a); float g = 1.0 - pow(saturate(z), 64.0); return float4(g, g, g, c.a); }\n"
 "    if (z < 9.5) return float4(l, c.a);\n"
 "    int t = (int)(z - 9.5);\n"
-"    float3 mc = t == 1 ? float3(0, 1, 0) : t == 2 ? float3(0, 1, 1) : t == 3 ? float3(1, 1, 0) : t == 4 ? float3(0.2, 0.4, 1) : float3(1, 0, 0);\n"
+"    float3 mc = t == 1 ? float3(0, 1, 0) : t == 2 ? float3(0, 1, 1) : t == 3 ? float3(1, 1, 0) : t == 4 ? float3(0.2, 0.4, 1) : t == 5 ? float3(1, 0.5, 0) : float3(1, 0, 0);\n"
 "    return float4(l + mc * 0.6, c.a);\n"
 "}\n";
 static int fsr_merge(int slot)
@@ -1588,7 +2123,7 @@ static int fsr_merge(int slot)
         const float k[4] = { (float)fsr_dbg_view(), uf, fsr_dbg_scale(), 0.0f };
         cl->lpVtbl->SetGraphicsRoot32BitConstants(cl, 1, 4, k, 0); }
     cl->lpVtbl->DrawInstanced(cl, 3, 1, 0, 0);
-    { ID3D12DescriptorHeap* heaps[] = { s_d3d.srv_heap }; cl->lpVtbl->SetDescriptorHeaps(cl, 1, heaps); }
+    vp_set_heaps(cl);   /* + the guest sampler heap (Phase 2) */
     cl->lpVtbl->SetGraphicsRootSignature(cl, s_d3d.vp_root_sig);
     if (s_gf_buf)
         cl->lpVtbl->SetGraphicsRootShaderResourceView(cl, 3, s_gf_buf->lpVtbl->GetGPUVirtualAddress(s_gf_buf) + (u64)T_PARITY * GF_CAP);
@@ -1608,7 +2143,7 @@ void fsr_cap_dump(const char* dir, u32 fi, u32 nd)
     snprintf(path, sizeof path, "%s/fsr_draws.txt", dir);
     FILE* f = fopen(path, "w");
     if (f) {
-        fprintf(f, "# d mt(0 none,1 exact,2 exact-instance,3 nearest) chain bd slot pslot fp vs tex0 tex1 count\n");
+        fprintf(f, "# d mt(0 none,1 exact,2 exact-instance,3 nearest,4 camera-split,5 ambiguous nearest) chain bd slot pslot fp vs tex0 tex1 count\n");
         for (u32 d = 0; d < nd && d < MAX_DRAWS; d++) {
             const D3D12DrawRecord* dr = &T_DRAWS[d];
             if (dr->fsr != 1) continue;
@@ -1622,7 +2157,7 @@ void fsr_cap_dump(const char* dir, u32 fi, u32 nd)
 /* ---- RFOM_DLSS_CAM: camera solve (render thread) and the camera fill ---- */
 static ID3D12RootSignature* s_cf_rs; static ID3D12PipelineState* s_cf_pso; static ID3D12DescriptorHeap* s_cf_heap;
 static UINT s_cf_inc; static u32 s_cf_ring; static int s_cf_fail;
-static u32 s_cf_st[4], s_cf_cut, s_cf_dep[2];   /* per frame: exact / fallback (no agreement) / none (no candidates) / no record data; cuts; fill with / without scene depth */
+static u32 s_cf_st[4], s_cf_cut, s_cf_dep[2], s_cf_plur, s_cf_med, s_cf_held, s_cf_loose, s_cf_run[4];   /* per frame: exact / fallback (no agreement) / none (no candidates) / no record data; cuts; fill with / without scene depth */
 static u32 s_cf_cand, s_cf_elig, s_cf_tried, s_cf_bad, s_cf_mt[5];
 static const char s_cf_hlsl[] =
 "Texture2D<float> dep : register(t0);\n"
@@ -1634,8 +2169,9 @@ static const char s_cf_hlsl[] =
 "    float z = zo[id.xy];\n"
 "    float d = 1.0;\n"
 "    if (z == 4.0) d = f.x ? dep[id.xy] : 1.0;\n"      /* no draw wrote here: the scene's depth */
-"    else if (z >= 2.0 && z < 3.0) d = z - 2.0;\n"     /* a draw with no previous-frame match: its depth */
-"    else return;\n"
+"    else if (z <= -0.5 && z > -2.5) d = saturate(-1.0 - z);\n"     /* a draw with no previous-frame match: its depth */
+"    else if (z <= -2.5 && z > -4.5) { d = saturate(-3.0 - z); if (!f.y) { zo[id.xy] = d; return; } }\n"   /* ambiguous match: its own motion unless there is a camera */
+"    else { if (!(z >= 0.0 && z <= 1.0)) zo[id.xy] = saturate(z); return; }\n"   /* never hand the upscaler / FG a depth outside 0..1 */
 "    zo[id.xy] = d;\n"
 "    float2 mv = float2(0, 0);\n"
 "    if (f.y) {\n"
@@ -1706,8 +2242,74 @@ static int cam_solve(u32 fr, double M[16], float j[2], int* cut)
     for (int k = 0; k < 5; k++) s_cf_mt[k] += mt[k];
     if (!n) return 0;
     int agree = 0;
-    const int b = vpcpu_vote((const double (*)[16])Ms, (int)n, 2e-3, &agree);
-    if (b < 0) return 2;
+    const double tol = dlss_cam_tol();
+    const int b = vpcpu_vote((const double (*)[16])Ms, (int)n, tol, &agree);
+    if (b < 0) {
+        /* Why the candidates disagree (first 16 fallbacks; every 600th after that): the
+         * group sizes and each candidate's distance to the largest group's matrix. */
+        int cnt[CAM_MAX], g = -1, gc = 0, uniq = 1;
+        for (u32 i = 0; i < n; i++) {
+            cnt[i] = 0;
+            for (u32 k = 0; k < n; k++) if (i == k || vpcpu_mdist(Ms[i], Ms[k]) <= tol) cnt[i]++;
+            if (cnt[i] > gc) { gc = cnt[i]; g = (int)i; }
+        }
+        for (u32 i = 0; i < n && g >= 0; i++)
+            if (cnt[i] == gc && vpcpu_mdist(Ms[g], Ms[i]) > tol) uniq = 0;
+        static u32 nlog;
+        if (g >= 0 && (nlog < 16 || nlog % 600 == 0)) {
+            char line[1024]; int o = snprintf(line, sizeof line, "[DLSS] camera candidates disagree (frame %u, %u candidates, largest group %d%s):",
+                                              fr, n, gc, uniq ? "" : ", tied");
+            for (u32 i = 0; i < n && o > 0 && o < (int)sizeof line - 48; i++) {
+                const double d = vpcpu_mdist(Ms[g], Ms[i]);
+                o += snprintf(line + o, sizeof line - (size_t)o, " %08X/%d/%.2g", cf->prog[i], cnt[i], d > 1e8 ? -1.0 : d);
+            }
+            fprintf(stderr, "%s (program/group/ndc to the largest group, -1 = behind)%c", line, 10);
+        }
+        nlog++;
+        /* RFOM_DLSS_CAM_PLURALITY=1: take a unique largest group of 2+ instead of no
+         * camera motion; no cut test on it. */
+        if (!dlss_cam_plur() || g < 0 || gc < 2 || !uniq) {
+            const double tol2 = dlss_cam_tol2();
+            if (tol2 > tol) {
+                int a2 = 0;
+                const int b2 = vpcpu_vote_majority((const double (*)[16])Ms, (int)n, tol2, 3, &a2);
+                if (b2 >= 0) {
+                    memcpy(M, Ms[b2], sizeof Ms[0]); s_cf_loose++;
+                    if (dlss_cut_on() && vpcpu_is_cut(M, 1.0)) *cut = 1;
+                    return 1;
+                }
+            }
+            double sp = 0.0, mo = 0.0;
+            if (dlss_cam_med()) {
+                const double rel = dlss_cam_med_rel();
+                const int m = vpcpu_medoid((const double (*)[16])Ms, (int)n, rel > 0.0 ? 0.05 : 0.02, rel > 0.0 ? rel : 1.0 / 3.0, &sp, &mo);
+                if (m >= 0) {
+                    memcpy(M, Ms[m], sizeof Ms[0]); s_cf_med++;
+                    if (rel > 0.0 && dlss_cut_on() && vpcpu_is_cut(M, 1.0)) *cut = 1;
+                    return 1;
+                }
+            }
+            /* Still unsolved after the loose vote and the medoid (first 24; every 200th after): each candidate's
+             * own motion (ndc vs "no camera motion"), so a second camera (near-zero motion: weapon / UI / scope)
+             * can be told from spread that grows with the motion (shake / recoil). */
+            static u32 ulog;
+            if (ulog < 24 || ulog % 200 == 0) {
+                static const double I[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
+                char line[1024]; int o = snprintf(line, sizeof line, "[DLSS] camera unsolved (frame %u, %u candidates, medoid spread %.3g motion %.3g):",
+                                                  fr, n, sp, mo > 1e8 ? -1.0 : mo);
+                for (u32 i = 0; i < n && o > 0 && o < (int)sizeof line - 40; i++) {
+                    const double d = vpcpu_mdist(Ms[i], I);
+                    o += snprintf(line + o, sizeof line - (size_t)o, " %08X/%.2g", cf->prog[i], d > 1e8 ? -1.0 : d);
+                }
+                fprintf(stderr, "%s (program/motion ndc, -1 = behind)%c", line, 10);
+            }
+            ulog++;
+            return 2;
+        }
+        memcpy(M, Ms[g], sizeof Ms[0]);
+        s_cf_plur++;
+        return 1;
+    }
     memcpy(M, Ms[b], sizeof Ms[0]);
     if (dlss_cut_on() && vpcpu_is_cut(M, 1.0)) *cut = 1;
     return 1;
@@ -1761,7 +2363,7 @@ static void cam_fill(u32 rw, u32 rh, float vw, float vh, const double* M, float 
 static void fsr_dispatch(void)
 {
     s_rs_epoch++;
-    { static int hw = 0; const int hd = (GetAsyncKeyState(VK_HOME) & 0x8000) != 0;
+    { static int hw = 0; const int hd = rsx_debug_keys() && (GetAsyncKeyState(VK_HOME) & 0x8000) != 0;   /* PORT_DEBUG_KEYS=1 */
       if (hd && !hw) {
           s_fsr_ab = (s_fsr_ab + 1) % 6;
           static const char* nm[6] = { "normal", "no auto-exposure", "no jitter", "FSR off (bypass)", "no jitter + no motion data", "draw-id debug (F12)" };
@@ -1782,14 +2384,31 @@ static void fsr_dispatch(void)
     ID3D12GraphicsCommandList* cl = s_d3d.cmd_list;
     /* RFOM_DLSS_CAM: exact camera motion into the pixels no matched draw covered */
     int cam_cut = 0;
+    double fg_M[16]; int fg_has_M = 0;   /* DLSS-G: the camera the fill used (none = no camera motion) */
+    static rfom_fgcam_hold_t hold;       /* RFOM_DLSS_FG_CAM_HOLD */
+    if (!s_cf_armed) hold.has = 0;
     if (s_cf_armed) {
         double M[16]; float j[2] = { 0.0f, 0.0f };
         const int cs = cam_solve(s_fsr_frame_r, M, j, &cam_cut);
+        /* RFOM_DLSS_FG_CAM_HOLD (default 3, 0 = off): unsolved frames reuse the last solved camera for the
+         * fill and DLSS-G alike (never across a frame gap or cut: those reset the history anyway). */
+        static int hold_max = -1;
+        if (hold_max < 0) { const char* e = getenv("RFOM_DLSS_FG_CAM_HOLD"); hold_max = (e && *e) ? atoi(e) : 3;
+                            if (hold_max < 0) hold_max = 0; if (hold_max > 30) hold_max = 30;
+                            fprintf(stderr, "[DLSS] unsolved camera: %s%c", hold_max ? "last solved camera held (RFOM_DLSS_FG_CAM_HOLD=0: none)"
+                                                                                     : "no camera motion (RFOM_DLSS_FG_CAM_HOLD=0)", 10); }
+        const int hgap = s_fsr_last_frame == 0 || s_fsr_frame_r != s_fsr_last_frame + 1u;
+        const double* hM = rfom_fgcam_hold(&hold, cs == 1 ? M : NULL, hgap || (cs != 1 && cs != 2), cam_cut, hold_max);
+        if (hM) { memcpy(fg_M, hM, sizeof fg_M); fg_has_M = 1; }
+        if (cs == 2 && hM) s_cf_held++;
+        { static u32 run;   /* fallback streak lengths: why the hold (max hold_max frames) leaves frames uncovered */
+          if (cs == 2) run++;
+          else if (run) { s_cf_run[run <= 3 ? 0 : run <= 10 ? 1 : run <= 30 ? 2 : 3]++; run = 0; } }
         if (cs == 3) { float jx0, jy0; fsr_jitter(s_fsr_frame_r, &jx0, &jy0);
                        j[0] = 2.0f * jx0 / ((float)w * uf); j[1] = -2.0f * jy0 / ((float)h * uf); }
         s_cf_st[cs]++;
         if (cam_cut) s_cf_cut++;
-        cam_fill(rw, rh, (float)w * uf, (float)h * uf, cs == 1 ? M : NULL, j[0], j[1]);
+        cam_fill(rw, rh, (float)w * uf, (float)h * uf, fg_has_M ? fg_M : NULL, j[0], j[1]);
     }
     const D3D12_RESOURCE_STATES rd = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     off_rt_transition(slot, rd);
@@ -1818,12 +2437,29 @@ static void fsr_dispatch(void)
     LARGE_INTEGER now, qf; QueryPerformanceCounter(&now); QueryPerformanceFrequency(&qf);
     float dt = s_fsr_t_last.QuadPart ? (float)((double)(now.QuadPart - s_fsr_t_last.QuadPart) * 1000.0 / (double)qf.QuadPart) : 16.7f;
     s_fsr_t_last = now;
+    const float dt_raw = dt;   /* PORT_DLSS_RESET_HITCH_MS needs the unclamped gap */
     if (dt < 1.0f) dt = 1.0f; if (dt > 100.0f) dt = 100.0f;
     dd.frameTimeDelta = dt;
     dd.preExposure = 1.0f;
     dd.reset = (s_fsr_last_frame == 0 || s_fsr_frame_r != s_fsr_last_frame + 1u) || cam_cut;   /* RFOM_DLSS_CUT: camera cut */
-    dd.cameraNear = 0.1f; dd.cameraFar = 1000.0f;
-    dd.cameraFovAngleVertical = 1.0f;
+    { /* PORT_DLSS_RESET_HITCH_MS (gap > N ms) / PORT_DLSS_RESET_CUTS (render or output size change); both 0 = unchanged */
+      static int rq = -1; static pdq_reset_cfg rqc; static u32 prs[4]; static unsigned nlog; static uint32_t pgen;
+      if (rq < 0) { rqc.cuts = pdq_env_int("PORT_DLSS_RESET_CUTS", 0); rqc.hitch_ms = pdq_env_float("PORT_DLSS_RESET_HITCH_MS", 0.0f);
+                    rq = rqc.cuts || rqc.hitch_ms > 0.0f;
+                    if (rq) fprintf(stderr, "[DLSS] extra history resets: cuts/resolution %s, hitch %s%.0f ms%c", rqc.cuts ? "on" : "off",
+                                    rqc.hitch_ms > 0.0f ? "> " : "off ", rqc.hitch_ms > 0.0f ? rqc.hitch_ms : 0.0f, 10); }
+      if (rq) {
+          pdq_reset_in ri; memset(&ri, 0, sizeof ri);
+          ri.raw_dt_ms = pdq_pause_gap(s_fsr_last_frame ? dt_raw : 0.0f, &pgen, (uint32_t)rsx_pause_gen);   /* gap spans a pause: not a hitch */
+          ri.rw = rw; ri.rh = rh; ri.ow = w; ri.oh = h; ri.prw = prs[0]; ri.prh = prs[1]; ri.pow_ = prs[2]; ri.poh = prs[3];
+          const unsigned why = pdq_reset_reasons(&rqc, &ri);
+          prs[0] = rw; prs[1] = rh; prs[2] = w; prs[3] = h;
+          if (why && !dd.reset && nlog++ < 32)
+              fprintf(stderr, "[DLSS] history reset:%s%s (frame gap %.0f ms, %ux%u -> %ux%u)%c", (why & PDQ_RESET_HITCH) ? " hitch" : "",
+                      (why & PDQ_RESET_RESOLUTION) ? " resolution" : "", dt_raw, rw, rh, w, h, 10);
+          if (why) dd.reset = true;
+      } }
+    fsr_camera(&dd.cameraNear, &dd.cameraFar, &dd.cameraFovAngleVertical);
     dd.viewSpaceToMetersFactor = 1.0f;
     { const char* e = getenv("RSX_FSR_LINEAR"); dd.flags = (e && atoi(e)) ? 0u : FFX_UPSCALE_FLAG_NON_LINEAR_COLOR_SRGB; }
     /* RSX_FSR_TEST=1: no FSR, scene -> out -> scene through the same path (plumbing check). */
@@ -1836,14 +2472,29 @@ static void fsr_dispatch(void)
     } else if (s_dlss_on) {
         if (s_dlss_on && (s_dlss_rw != rw || s_dlss_rh != rh)) s_dlss_need = 1;   /* render size changed: new feature */
         if (s_dlss_need) {
-            static int pr = -2; if (pr == -2) { const char* e = getenv("RSX_DLSS_PRESET"); pr = e ? atoi(e) : 0; if (pr < 0) pr = 0; }
+            const int pr = dlss_preset_once();
             s_dlss_need = 0;
+            const int pre = s_dlss_pre_ok && s_dlss_pre[0] == rw && s_dlss_pre[1] == rh && s_dlss_pre[2] == w &&
+                            s_dlss_pre[3] == h && s_dlss_pre[4] == (u32)pr;
+            if (s_dlss_pre_ok) {
+                if (!pre) fprintf(stderr, "[DLSS] pre-created feature %ux%u -> %ux%u does not match %ux%u -> %ux%u: creating a new one%c",
+                                  s_dlss_pre[0], s_dlss_pre[1], s_dlss_pre[2], s_dlss_pre[3], rw, rh, w, h, 10);
+                else fprintf(stderr, "[DLSS] using the pre-created feature (%ux%u -> %ux%u)%c", rw, rh, w, h, 10);
+                s_dlss_pre_ok = 0;
+            }
             if (s_dlss_rw) wait_for_gpu();   /* the old feature may still be in flight */
             s_dlss_rw = rw; s_dlss_rh = rh;
-            if (!p_dlss_create(cl, rw, rh, w, h, 0, (unsigned)pr)) {
+            LARGE_INTEGER qa, qb; QueryPerformanceCounter(&qa);
+            if (pre) { /* created and executed on the early-init thread */ }
+            else if (!p_dlss_create(cl, rw, rh, w, h, 0, (unsigned)pr)) {
                 fprintf(stderr, "[DLSS] feature creation failed -- switching to FSR 3.1%c", 10);
                 s_dlss_bad = 1; s_dlss_on = 0; fsr_release();   /* fsr_ensure makes an FSR context next frame */
                 rc = FFX_API_RETURN_ERROR;
+            } else {
+                QueryPerformanceCounter(&qb);
+                fprintf(stderr, "[DLSS] feature creation on the render thread took %.0f ms%c",
+                        (double)(qb.QuadPart - qa.QuadPart) * 1000.0 / (double)qf.QuadPart, 10);
+                dlss_hist_save(rw, rh, w, h, (u32)pr);
             }
         }
         if (s_dlss_on) {
@@ -1857,15 +2508,17 @@ static void fsr_dispatch(void)
              * 0 = the old evaluation without it. */
             static int rxd = -1;
             if (rxd < 0) { const char* e = getenv("RFOM_DLSS_REACTIVE"); rxd = e ? atoi(e) : 1;
+                           rxd = pdq_env_int("PORT_DLSS_BIAS_MASK", rxd);   /* the cross-port switch, when set, wins */
                            fprintf(stderr, "[DLSS] reactive (bias current colour) mask: %s%c",
-                                   !rxd ? "off (RFOM_DLSS_REACTIVE=0)" : !p_dlss_eval2 ? "unavailable (old rfom_dlss.dll)" :
+                                   !rxd ? "off (RFOM_DLSS_REACTIVE / PORT_DLSS_BIAS_MASK = 0)" : !p_dlss_eval2 ? "unavailable (old rfom_dlss.dll)" :
                                    fsr_rx_val() <= 0.0f ? "off (RSX_FSR_REACTIVE=0)" : "on", 10); }
             const int ok = (rxd && p_dlss_eval2 && s_fsr_rx && fsr_rx_val() > 0.0f)
                 ? p_dlss_eval2(cl, rt->res, s_fsr_z, s_fsr_mv, s_fsr_out, js * jx, js * jy, (float)rw, (float)rh, dd.reset, dt, s_fsr_rx)
                 : p_dlss_eval(cl, rt->res, s_fsr_z, s_fsr_mv, s_fsr_out, js * jx, js * jy, (float)rw, (float)rh, dd.reset, dt);
             if (!ok) rc = FFX_API_RETURN_ERROR;
             else fg_tag_scene(cl, s_fsr_z, (unsigned)s_fsr_z_st, s_fsr_mv, (unsigned)s_fsr_mv_st, rw, rh,
-                              js * jx, js * jy, dd.reset);   /* DLSS-G: the same depth / motion / jitter */
+                              js * jx, js * jy, dd.reset, fg_has_M ? fg_M : NULL,
+                              dd.cameraNear, dd.cameraFar, dd.cameraFovAngleVertical);   /* DLSS-G: the same depth / motion / jitter / camera */
         }
     } else if (s_xess_on) {
 #if RSX_HAVE_XESS
@@ -1906,8 +2559,7 @@ static void fsr_dispatch(void)
     if (rc == FFX_API_RETURN_OK)   /* AMD FSR 3 frame generation: the same depth / motion / jitter / reset */
         f3_prepare(cl, s_fsr_z, s_fsr_z_st, s_fsr_mv, s_fsr_mv_st, w, h, rw, rh, jx, jy, dt, dd.reset);
     /* FFX bound its own descriptor heap / compute state. */
-    { ID3D12DescriptorHeap* heaps[] = { s_d3d.srv_heap };
-      cl->lpVtbl->SetDescriptorHeaps(cl, 1, heaps); }
+    vp_set_heaps(cl);   /* + the guest sampler heap (Phase 2) */
     cl->lpVtbl->SetGraphicsRootSignature(cl, s_d3d.vp_root_sig);
     if (s_gf_buf)
         cl->lpVtbl->SetGraphicsRootShaderResourceView(cl, 3, s_gf_buf->lpVtbl->GetGPUVirtualAddress(s_gf_buf) + (u64)T_PARITY * GF_CAP);
@@ -1915,6 +2567,7 @@ static void fsr_dispatch(void)
         static int n = 0; if (n < 5 && ++n) fprintf(stderr, "[FSR] dispatch failed (%u)%c", (unsigned)rc, 10);
         return;
     }
+    if (g_pc_photo_nohud) s_fgh.tagged = 1;   /* photo mode HUD hide: the HUD split needs the scene marked (any upscaler) */
     { static u32 nd = 0, nr = 0, gap = 0; nd++; if (dd.reset) { nr++; if (s_fsr_last_frame) gap += s_fsr_frame_r - s_fsr_last_frame; }
       if (nd % 600u == 0u) {
           const u32 rec = s_fsr_st_rec, mt = s_fsr_st_match, ov = s_fsr_st_over;
@@ -1922,27 +2575,27 @@ static void fsr_dispatch(void)
           QueryPerformanceCounter(&q1); QueryPerformanceFrequency(&qf);
           const double tpms = (q0.QuadPart && t1 > t0 && q1.QuadPart > q0.QuadPart) ? (double)(t1 - t0) / ((double)(q1.QuadPart - q0.QuadPart) * 1000.0 / (double)qf.QuadPart) : 0.0;   /* TSC ticks per ms (0 on the first report) */
           q0 = q1; t0 = t1;
-          fprintf(stderr, "[FSR] stats/600: history resets %u (frame gaps %u), scene draws %u, matched to last frame %.1f%%, over slot limit %u, lead waits %u, exact %.1f%%, camera fallback %.1f%%, record %.3f ms/frame%c",
+          fprintf(stderr, "[FSR] stats/600: history resets %u (frame gaps %u), scene draws %u, matched to last frame %.1f%%, over slot limit %u, lead waits %u, exact %.1f%%, camera fallback %.1f%%,           ambiguous %.1f%%, depth-range draws %u, record %.3f ms/frame%c",
                   nr, gap, rec, rec ? 100.0 * mt / rec : 0.0, ov, s_fsr_st_wait, rec ? 100.0 * s_fsr_st_exact / rec : 0.0,
-                  rec ? 100.0 * s_fsr_st_cam / rec : 0.0, tpms > 0.0 ? (double)s_fsr_st_tsc / tpms / 600.0 : 0.0, 10);
+                            rec ? 100.0 * s_fsr_st_cam / rec : 0.0, rec ? 100.0 * s_fsr_st_amb / rec : 0.0, s_fsr_st_zr, tpms > 0.0 ? (double)s_fsr_st_tsc / tpms / 600.0 : 0.0, 10);
           if (s_gt_frames) { fprintf(stderr, "[FSR] GPU/frame (%u frames): motion pass %.3f ms, upscaler %.3f ms%c", s_gt_frames, s_gt_ms[0] / s_gt_frames, s_gt_ms[1] / s_gt_frames, 10);
                              s_gt_ms[0] = s_gt_ms[1] = 0.0; s_gt_frames = 0; }
           /* one line for the next play session: where the camera motion came from */
           { const u32 cf = s_cf_st[0] + s_cf_st[1] + s_cf_st[2] + s_cf_st[3];
             const u32 md = s_cf_mt[0] + s_cf_mt[1] + s_cf_mt[2] + s_cf_mt[3] + s_cf_mt[4];
-            fprintf(stderr, "[DLSS] camera/600: %s | exact %u, fallback %u (candidates disagree), none %u (no candidates), no record %u, cuts->reset %u"
+            fprintf(stderr, "[DLSS] camera/600: %s | exact %u (plurality %u, loose vote %u, medoid %u), fallback %u (candidates disagree; last camera held %u; streaks 1-3/4-10/11-30/31+ %u/%u/%u/%u), none %u (no candidates), no record %u, cuts->reset %u"
                             " | candidates %.1f/frame (exact-instance draws %.1f, evaluated %.1f, refused %.1f) | fill depth scene %u / none %u"
                             " | draws exact %.1f%% instance %.1f%% nearest %.1f%% camera-split %.1f%% unmatched %.1f%%"
-                            " | render %ux%u of %ux%u (%.4f) | SSAO: none in R1%c",
+                            " | render %ux%u of %ux%u (%.4f) | SSAO: %s%c",
                     !dlss_cam_exact() ? "RFOM_DLSS_CAM=fallback" : s_cf_armed ? "exact" : "exact (idle: debug / Home mode)",
-                    s_cf_st[1], s_cf_st[2], s_cf_st[0], s_cf_st[3], s_cf_cut,
+                    s_cf_st[1], s_cf_plur, s_cf_loose, s_cf_med, s_cf_st[2], s_cf_held, s_cf_run[0], s_cf_run[1], s_cf_run[2], s_cf_run[3], s_cf_st[0], s_cf_st[3], s_cf_cut,
                     cf ? (double)s_cf_cand / cf : 0.0, cf ? (double)s_cf_elig / cf : 0.0, cf ? (double)s_cf_tried / cf : 0.0, cf ? (double)s_cf_bad / cf : 0.0,
                     s_cf_dep[0], s_cf_dep[1],
                     md ? 100.0 * s_cf_mt[1] / md : 0.0, md ? 100.0 * s_cf_mt[2] / md : 0.0, md ? 100.0 * s_cf_mt[3] / md : 0.0,
-                    md ? 100.0 * s_cf_mt[4] / md : 0.0, md ? 100.0 * s_cf_mt[0] / md : 0.0, rw, rh, w, h, uf, 10);
-            memset(s_cf_st, 0, sizeof s_cf_st); memset(s_cf_mt, 0, sizeof s_cf_mt); memset(s_cf_dep, 0, sizeof s_cf_dep);
-            s_cf_cut = s_cf_cand = s_cf_elig = s_cf_tried = s_cf_bad = 0; }
-          s_fsr_st_rec = s_fsr_st_match = s_fsr_st_over = s_fsr_st_wait = s_fsr_st_exact = s_fsr_st_cam = 0; s_fsr_st_tsc = 0; nr = gap = 0;
+                    md ? 100.0 * s_cf_mt[4] / md : 0.0, md ? 100.0 * s_cf_mt[0] / md : 0.0, rw, rh, w, h, uf, ssao_status(), 10);
+            memset(s_cf_st, 0, sizeof s_cf_st); memset(s_cf_mt, 0, sizeof s_cf_mt); memset(s_cf_dep, 0, sizeof s_cf_dep); memset(s_cf_run, 0, sizeof s_cf_run);
+            s_cf_cut = s_cf_cand = s_cf_elig = s_cf_tried = s_cf_bad = s_cf_plur = s_cf_med = s_cf_held = s_cf_loose = 0; }
+          s_fsr_st_rec = s_fsr_st_match = s_fsr_st_over = s_fsr_st_wait = s_fsr_st_exact = s_fsr_st_cam = s_fsr_st_amb = s_fsr_st_zr = 0; s_fsr_st_tsc = 0; nr = gap = 0;
       } }
     s_fsr_last_frame = s_fsr_frame_r;
     s_fsr_disp_frame = s_fsr_frame_r; s_fsr_disp_ms = GetTickCount64();

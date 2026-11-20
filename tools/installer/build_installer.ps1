@@ -27,7 +27,7 @@ if (Test-Path "$Repo\VERSION") { $version = (Get-Content "$Repo\VERSION" -TotalC
 
 # Paths (forward slashes, relative to the repo) that must never be shipped.
 $block = @(
-    '^(game|gamefiles|gamedata|recompiled[^/]*|build[^/]*|dist|logs|shadercache|rsxcap|scratch|cache|lle|fpval)/',
+    '^(game|gamefiles|gamedata|recompiled[^/]*|build[^/]*|dist|logs|shadercache|rsxcap|scratch|cache|tools_cache|lle|fpval)/',
     '^tools/(key_vault\.cpp|ffmpeg_bin/|dlss/|xess/|shaderscan\.exe(\.download)?$)',
     '^project/spu/[^/]+/',
     '(^|/)(EBOOT\.BIN|PARAM\.SFO|PS3_DISC\.SFB)$',

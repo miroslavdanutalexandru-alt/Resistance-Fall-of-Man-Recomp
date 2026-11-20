@@ -243,4 +243,61 @@ static inline int padl_gyro_mode(const char* e)
     return 0;
 }
 
+/* ---------------------------------------------------------------------------
+ * Keyboard -> left stick (movement keys)
+ *
+ * Direction bits: PADK_UP / DOWN / LEFT / RIGHT. A digital key is full
+ * deflection at once (0 / 255, 128 = centre; no ramp), opposite keys cancel.
+ *
+ * Press latch (PAD_KEY_LATCH, default on): cellPad hands the game one report
+ * per host poll, and the host is sampled every ~4-16 ms. A movement key that
+ * was down at any sample -- or tapped between samples -- since the last report
+ * the game actually got is OR'd into the next one, so a short press is seen
+ * for at least one game poll instead of being overwritten by a later sample.
+ * ------------------------------------------------------------------------*/
+#define PADK_UP    1u
+#define PADK_DOWN  2u
+#define PADK_LEFT  4u
+#define PADK_RIGHT 8u
+
+typedef struct { unsigned pend; } PadKeyLatch;
+
+/* One host sample: down = keys held now, tapped = pressed and released since
+ * the previous sample. Returns the keys to report. */
+static inline unsigned padk_latch_sample(PadKeyLatch* l, unsigned down, unsigned tapped)
+{
+    l->pend |= down | tapped;
+    return l->pend;
+}
+/* The game consumed a report: only keys still held carry on. */
+static inline void padk_latch_delivered(PadKeyLatch* l) { l->pend = 0; }
+
+/* neg / pos key held -> stick byte */
+static inline unsigned char padk_axis(int neg, int pos)
+{
+    return (unsigned char)(neg == pos ? 128 : neg ? 0 : 255);
+}
+
+/* GetAsyncKeyState bit 0 ("pressed since the last query") is session-wide:
+ * keys typed in other apps while unfocused set it too. Returns 1 when the
+ * caller must query-and-discard every binding first: at the first focused
+ * poll (startup) and on every focus regain. *was starts at 0. */
+static inline int padk_focus_drain(int* was, int focused)
+{
+    const int edge = focused && !*was;
+    *was = focused;
+    return edge;
+}
+
+/* One key's GetAsyncKeyState value (ks) in the "is the keyboard in use?"
+ * check. Only a held key counts as keyboard activity (switches port 0 to
+ * KBM); a tap alone -- bit 0 with the key up -- is only recorded in *tap
+ * (ls_bit = its PADK_* direction, 0 = not a movement key) for the latch. */
+static inline int padk_kbm_key_activity(unsigned short ks, unsigned ls_bit, unsigned* tap)
+{
+    if (ks & 0x8000u) return 1;
+    if (ks & 1u) *tap |= ls_bit;
+    return 0;
+}
+
 #endif /* PS3RECOMP_PAD_LOGIC_H */

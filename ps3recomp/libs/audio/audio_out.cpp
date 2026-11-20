@@ -98,6 +98,19 @@ extern "C" AudioOut* audio_out_create(const AudioOutConfig* cfg)
     return ao;
 }
 
+extern "C" unsigned audio_out_set_target(AudioOut* ao, unsigned frames)
+{
+    /* keep room in the ring for twice the target (the ring is sized at create) */
+    const unsigned hi = ao->cfg.ring_frames / 2;
+    if (frames > hi) frames = hi;
+    if (frames < 256) frames = 256;
+    ao->cfg.target_frames = frames;
+    unsigned r = frames / 4;
+    if (r < ao->cfg.guard_frames + ao->cfg.fade_frames) r = ao->cfg.guard_frames + ao->cfg.fade_frames;
+    ao->cfg.resume_frames = r;
+    return frames;
+}
+
 extern "C" void audio_out_destroy(AudioOut* ao) { delete ao; }
 extern "C" const AudioOutConfig* audio_out_config(const AudioOut* ao) { return &ao->cfg; }
 extern "C" double audio_out_tempo(const AudioOut* ao) { return ao->tempo; }

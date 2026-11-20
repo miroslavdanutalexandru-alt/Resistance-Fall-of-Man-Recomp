@@ -9,7 +9,14 @@
  *                     generated frames then interpolate the HUD together with the scene.
  *   RFOM_FG_HUDDBG    1: show the HUD-less image the generator gets | 2: show the separated UI layer over grey.
  *                     Works whenever DLSS runs, also with frame generation off or unsupported.
+ *   RFOM_FG_UNSURE_PAUSE 1 (default): with the HUD split on, 3 consecutive frames whose HUD could not be
+ *                     separated pause generation (for at least 15 frames) | 0: generate anyway.
+ *   RFOM_DLSSG_MENU_DETECT unset: DLSS-G menu detection off while the HUD split runs, on otherwise (HDR,
+ *                     HUDSPLIT=0) | 0 / 1: force off / on.
  *   RFOM_FG_SLLOG     1: verbose Streamline log (streamline logs go to stderr / run.log as "[DLSS-G]").
+ *   PORT_FG           dlssg | fsr3 | off (shared by the three ports): overrides RFOM_DLSS_FG / RFOM_FG_BACKEND;
+ *                     unset or auto keeps them. dlssg keeps a 3x / 4x request; fsr3 is 2x.
+ *   PORT_FG_HUDLESS   1 / 0: overrides RFOM_FG_HUDSPLIT. See scratch/framegen_fsr3.md.
  *
  * Wiring (manual hooking, see rfom_dlssg.cpp): the renderer keeps its native device and submits to the
  * native queue; only the swap chain is created through Streamline proxies (factory + queue), so the
@@ -18,6 +25,9 @@
  * frame without DLSS inputs (front-end menus, .bik movies, loading screens, DLSS failure), while the
  * window is in the background or minimised, and around swap-chain resizes; it turns back on after two
  * consecutive frames with inputs. The port's frame limiter (RFOM_FPS) caps the rendered frames. */
+
+#include "port_fg_logic.h"
+#include "rfom_fg_cam.h"
 
 void (*volatile g_pc_fg_marker)(int type, unsigned long long id) = 0;
 void (*volatile g_pc_fg_sleep)(unsigned long long id) = 0;
@@ -36,11 +46,14 @@ static int  (*p_fg_present_tags)(ID3D12GraphicsCommandList*, ID3D12Resource*, ID
                                  unsigned, unsigned, unsigned, unsigned);
 static int  (*p_fg_set_options)(int, int, unsigned, unsigned, unsigned);
 static int  (*p_fg_state)(unsigned*, unsigned*, int*, unsigned*, unsigned long long*);
+static int  (*p_fg_null_tags)(ID3D12GraphicsCommandList*);   /* optional (older rfom_dlssg.dll: none) */
+static void (*p_fg_camera)(const float*, const float*, float, float, float);   /* optional (older rfom_dlssg.dll: none) */
 static void (*p_fg_shutdown)(void);
 
 static int s_fg_req;                 /* frames to generate asked for (1 = 2x .. 3 = 4x), 0 = off */
 static int s_fg_ready;               /* Streamline + DLSS-G usable on this device */
 static int s_fg_on;                  /* DLSS-G enabled at the last present */
+static int s_fg_null_tags;           /* RFOM_DLSSG_NULLTAGS=1: null tags on untagged frames (opt-in) */
 static int s_fg_gen;                 /* frames generated while on (after the GPU clamp) */
 static int s_fg_streak;              /* consecutive presented frames with DLSS inputs */
 static int s_fg_split = 1, s_fg_dbg; /* RFOM_FG_HUDSPLIT, RFOM_FG_HUDDBG */
@@ -127,6 +140,8 @@ static int fg_load_dlss(ID3D12Device* dev)
     FG_FN(p_fg_sleep, "rfom_dlssg_sleep"); FG_FN(p_fg_latency, "rfom_dlssg_latency"); FG_FN(p_fg_tag, "rfom_dlssg_tag");
     FG_FN(p_fg_present_tags, "rfom_dlssg_present_tags"); FG_FN(p_fg_set_options, "rfom_dlssg_set_options");
     FG_FN(p_fg_state, "rfom_dlssg_state"); FG_FN(p_fg_shutdown, "rfom_dlssg_shutdown");
+    FG_FN(p_fg_null_tags, "rfom_dlssg_null_tags");
+    FG_FN(p_fg_camera, "rfom_dlssg_camera");
 #undef FG_FN
     if (!p_fg_init || !p_fg_upgrade || !p_fg_create_queue || !p_fg_marker || !p_fg_sleep || !p_fg_latency || !p_fg_tag ||
         !p_fg_present_tags || !p_fg_set_options || !p_fg_state || !p_fg_shutdown) {
@@ -151,10 +166,17 @@ static int fg_load_dlss(ID3D12Device* dev)
  * the swap chain is made by f3_create_swapchain. */
 static int fg_load(ID3D12Device* dev)
 {
-    { const char* e = getenv("RFOM_FG_HUDSPLIT"); s_fg_split = e ? atoi(e) != 0 : 1;
-      e = getenv("RFOM_FG_HUDDBG"); s_fg_dbg = e ? atoi(e) : 0; if (s_fg_dbg < 0 || s_fg_dbg > 2) s_fg_dbg = 0; }
+    { const char* e = getenv("RFOM_FG_HUDSPLIT"); s_fg_split = pfg_hudless(getenv("PORT_FG_HUDLESS"), e ? atoi(e) != 0 : 1);
+      e = getenv("RFOM_FG_HUDDBG"); s_fg_dbg = e ? atoi(e) : 0; if (s_fg_dbg < 0 || s_fg_dbg > 2) s_fg_dbg = 0;
+      e = getenv("RFOM_DLSSG_NULLTAGS"); s_fg_null_tags = e && *e == '1'; }
     s_fg_req = fg_env_gen();
     const char* e = getenv("RFOM_DLSS_FG");
+    /* PORT_FG=dlssg|fsr3|off overrides RFOM_DLSS_FG / RFOM_FG_BACKEND; unset / auto keeps them (port_fg_logic.h) */
+    const char* sel_s = getenv("PORT_FG");
+    const int sel = pfg_parse_sel(sel_s);
+    if (sel == PFG_SEL_BAD) fprintf(stderr, "[FG] PORT_FG=%s not understood (dlssg, fsr3, off or auto) -- ignored%c", sel_s, 10);
+    if (sel == PFG_SEL_OFF) { fprintf(stderr, "[FG] PORT_FG=%s: frame generation off%c", sel_s, 10); return 0; }
+    if (sel == PFG_SEL_FSR3 || (sel == PFG_SEL_DLSSG && !s_fg_req)) s_fg_req = 1;
     if (!s_fg_req) {
         if (e && *e && strcmp(e, "0") && _stricmp(e, "off")) fprintf(stderr, "[DLSS-G] RFOM_DLSS_FG=%s not understood (0, 2, 3, 4 or fsr3) -- off%c", e, 10);
         return 0;
@@ -166,10 +188,14 @@ static int fg_load(ID3D12Device* dev)
           else if (!_stricmp(b, "fsr3") || !_stricmp(b, "fsr")) be = 2;
           else if (_stricmp(b, "auto")) fprintf(stderr, "[FG] RFOM_FG_BACKEND=%s not understood (auto, dlss or fsr3) -- auto%c", b, 10);
       } }
-    if (!_stricmp(e, "fsr3") || !_stricmp(e, "fsr")) {
+    if (e && (!_stricmp(e, "fsr3") || !_stricmp(e, "fsr"))) {
         if (be == 1) fg_log("RFOM_DLSS_FG=fsr3 overrides RFOM_FG_BACKEND=dlss");
         be = 2;
     }
+    if (sel == PFG_SEL_DLSSG) be = 1;
+    else if (sel == PFG_SEL_FSR3) { be = 2; s_fg_req = 1; }
+    if (sel == PFG_SEL_DLSSG || sel == PFG_SEL_FSR3)
+        fprintf(stderr, "[FG] PORT_FG=%s: %s%c", sel_s, be == 2 ? "AMD FSR 3 frame generation 2x" : "DLSS Frame Generation only", 10);
     { wchar_t exe[MAX_PATH]; DWORD n = GetModuleFileNameW(NULL, exe, MAX_PATH);
       const wchar_t* bs = (n && n < MAX_PATH) ? wcsrchr(exe, L'\\') : NULL;
       if (!bs || _wcsnicmp(bs + 1, L"ResistanceFoMGame", 17) != 0) {
@@ -336,12 +362,27 @@ static int fg_sc_res(void)
 
 /* rsx_fsr.inc, right after the DLSS Super Resolution evaluation on the frame's command list: the same
  * depth and motion vectors (render resolution, UV units, camera + object motion) go to DLSS-G. */
+/* M: the frame's solved camera (rsx_fsr.inc cam_solve, NULL when the camera fill used no camera motion);
+ * cn / cf / cv: near, far, vertical fov. RFOM_DLSS_FG_REAL_CAM=0: DLSS-G is told the camera never moves (old). */
 static void fg_tag_scene(ID3D12GraphicsCommandList* cl, ID3D12Resource* z, unsigned zst, ID3D12Resource* mv, unsigned mst,
-                         unsigned rw, unsigned rh, float jx, float jy, int reset)
+                         unsigned rw, unsigned rh, float jx, float jy, int reset, const double* M, float cn, float cf, float cv)
 {
-    if (!s_fg_ready && !s_fg_dbg) return;
+    if (!s_fg_ready && !s_fg_dbg && !g_pc_photo_nohud) return;
     s_fgh.tagged = 1;
-    if (s_fg_ready) p_fg_tag(cl, z, zst, mv, mst, rw, rh, jx, jy, reset || !s_fg_on);
+    if (!s_fg_ready) return;
+    static int real = -1;
+    if (real < 0) {
+        real = rfom_fgcam_env(getenv("RFOM_DLSS_FG_REAL_CAM"));
+        fg_log(!p_fg_camera ? "frame generation camera: identity (old rfom_dlssg.dll)"
+               : real ? "frame generation camera: the solved game camera (RFOM_DLSS_FG_REAL_CAM=0: identity)"
+                      : "frame generation camera: identity (RFOM_DLSS_FG_REAL_CAM=0)");
+    }
+    if (p_fg_camera && real) {
+        float c2p[16], p2c[16];
+        rfom_fgcam_sl(M, c2p, p2c);
+        p_fg_camera(c2p, p2c, cn, cf, cv);
+    }
+    p_fg_tag(cl, z, zst, mv, mst, rw, rh, jx, jy, reset || !s_fg_on);
 }
 
 /* the UI layer is handed over (and recomposed by DLSS-G) in SDR with the split on */
@@ -376,9 +417,30 @@ static void fg_shutdown(void)
 
 static void fg_hud_reset(void)
 {
-    const int gate = (s_fg_ready || s_f3_ready || s_fg_dbg) && s_fg_split && !g_pc_hdr_active && fg_res_init();
+    const int gate = (s_fg_ready || s_f3_ready || s_fg_dbg || g_pc_photo_nohud) && s_fg_split && !g_pc_hdr_active && fg_res_init();
     memset(&s_fgh, 0, sizeof s_fgh);
     s_fgh.gate = gate;
+}
+
+/* Photo mode (rfom_pcextra.cpp, F7; RFOM_PHOTO_HIDEHUD=0 = off): present_blit, after the frame is drawn into
+ * the back buffer and before the screenshot copy and the OSD: when the HUD split separated this frame's HUD,
+ * the HUD-less image (the display buffer just before the first HUD draw) replaces it, so the screen and the
+ * F12 shot have no HUD. Needs the split: SDR and an upscaler on (it tags the scene); otherwise the HUD stays. */
+static void fg_photo_blit(ID3D12GraphicsCommandList* cl)
+{
+    if (!g_pc_photo_nohud) return;
+    static int miss = 0;
+    if (!(s_fgh.gate && s_fgh.tagged && s_fgh.open && !s_fgh.unsure && s_fgh.ndraw > 0 && s_fg_srv_heap)) {
+        static int n = 0;
+        if (++miss == 30 && !n && ++n) fprintf(stderr, "[photo] HUD hide unavailable (needs SDR, an upscaler on and the HUD split, RFOM_FG_HUDSPLIT)%c", 10);
+        return;
+    }
+    miss = 0;
+    fg_tr(cl, s_fg_hl, &s_fg_hl_st, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    cl->lpVtbl->SetDescriptorHeaps(cl, 1, &s_fg_srv_heap);
+    cl->lpVtbl->SetGraphicsRootDescriptorTable(cl, 1, fg_srv(0));
+    cl->lpVtbl->DrawInstanced(cl, 3, 1, 0, 0);
+    { static int n = 0; if (!n && ++n) fprintf(stderr, "[photo] HUD hidden (HUD-less frame from the HUD split)%c", 10); }
 }
 
 static void fg_late_check(void);   /* rsx_dlssg_hud.inc */
@@ -389,7 +451,10 @@ static void fg_late_check(void);   /* rsx_dlssg_hud.inc */
 static void fg_present(ID3D12GraphicsCommandList* cl, UINT bi, u32 fi, D3D12_CPU_DESCRIPTOR_HANDLE sc_rtv,
                        const D3D12_VIEWPORT* vp, const float* k, int shot, int* vs)
 {
-    if (!s_fg_ready && !s_f3_ready && !s_fg_dbg) return;
+    if (!s_fg_ready && !s_f3_ready && !s_fg_dbg && !g_pc_photo_nohud) {
+        if (s_fgh.gate) fg_hud_reset();   /* photo mode ended: the split stops */
+        return;
+    }
     fg_late_check();
     const int split = s_fgh.gate && s_fgh.tagged && fg_sc_res();
     const int valid = split && s_fgh.open && !s_fgh.unsure && s_fgh.ndraw > 0;
@@ -455,8 +520,25 @@ static void fg_present(ID3D12GraphicsCommandList* cl, UINT bi, u32 fi, D3D12_CPU
         if (s_fgh.tagged)
             p_fg_present_tags(cl, split ? s_fg_hsc : NULL, split ? s_fg_usc : NULL,
                               (unsigned)D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, l, t, w, h);
+        else if (p_fg_null_tags && s_fg_null_tags) p_fg_null_tags(cl);   /* FMV / loading / menus: null tags */
         /* generation on for this present: DLSS inputs this frame and the one before, window in front */
-        const int want = s_fgh.tagged && s_app_active && !IsIconic(s_d3d.hwnd) && (!ui_on || split);
+        /* RFOM_FG_UNSURE_PAUSE (default 1, 0 = off): with the HUD split on, truly unsure frames (classifier
+         * gave up, or a HUD run closed by a later scene draw) bake the UI into the HUD-less image, which would
+         * be warped. A frame without HUD runs is fine (empty UI layer). Pause after 3 consecutive unsure
+         * frames, stay off for 15 after the last (rfom_fg_upause_step), so DLSS-G is not toggled per frame.
+         * Gameplay logs r1_1448 / r1_1510: 0 unsure frames of 6001 split frames. */
+        static int unsure_pause = -1;
+        static rfom_fg_upause_t upause;
+        if (unsure_pause < 0) { const char* e = getenv("RFOM_FG_UNSURE_PAUSE"); unsure_pause = !(e && *e == '0'); }
+        const int truly_unsure = rfom_fg_unsure_frame(s_fgh.unsure, s_fgh.runs, s_fgh.open);
+        const int paused = unsure_pause && ui_on && split && rfom_fg_upause_step(&upause, truly_unsure, 3, 15);
+        if (!(unsure_pause && ui_on && split)) upause.bad_run = upause.off_left = 0;
+        const int ui_ok = !ui_on || (split && !paused);
+        if (paused && s_fg_on) {
+            static unsigned n = 0;
+            if (n < 10) { n++; fprintf(stderr, "[DLSS-G] frame generation paused: HUD not separated for 3 frames (present %u, RFOM_FG_UNSURE_PAUSE=0 keeps it on)%c", s_fg_presents, 10); }
+        }
+        const int want = s_fgh.tagged && s_app_active && !IsIconic(s_d3d.hwnd) && ui_ok;
         s_fg_streak = want ? s_fg_streak + 1 : 0;
         if (s_fg_streak >= 2 && (!s_fg_on || s_fg_opt_w != s_sc_w || s_fg_opt_h != s_sc_h)) {
             if (!s_fg_gen) {
@@ -480,6 +562,13 @@ static void fg_present(ID3D12GraphicsCommandList* cl, UINT bi, u32 fi, D3D12_CPU
                                *vs = 0; }
             else if (*vs > 1) { static int n = 0; if (!n++) fg_log("sync interval > 1 is not supported with frame generation -- using 1");
                                 *vs = 1; }
+        }
+        if (s_fg_on && (s_fg_presents % 30u) == 0) {   /* Streamline switching generation by itself (first 40) */
+            static unsigned last_pr = 0, nlog = 0; unsigned st = 0, mx = 0, pr = 0; int vok = 1; unsigned long long vram = 0;
+            if (nlog < 40 && p_fg_state(&st, &mx, &vok, &pr, &vram) && pr != last_pr) {
+                if (last_pr) { nlog++; fprintf(stderr, "[DLSS-G] frames presented per rendered frame %u -> %u (present %u)%c", last_pr, pr, s_fg_presents, 10); }
+                last_pr = pr;
+            }
         }
         if (s_fg_on && ((++s_fg_presents % 600u) == 0 || s_fg_presents == 120u)) {
             unsigned st = 0, mx = 0, pr = 0; int vok = 1; unsigned long long vram = 0;

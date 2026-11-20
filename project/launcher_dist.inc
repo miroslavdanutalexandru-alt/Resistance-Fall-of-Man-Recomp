@@ -1,9 +1,12 @@
 // ===========================================================================
 // launcher_dist.inc -- distribution extras for Launcher.exe (included by launcher.cpp)
 //
-//  * Update check: asks GitHub for the newest release of DIST_REPO (one unauthenticated request when the
-//    launcher opens) and offers to open the download page when it is newer than the VERSION file next to
-//    Launcher.exe. Option "Check for updates" (On by default). Nothing is downloaded or replaced.
+//  * Updates: asks GitHub for the newest release of DIST_REPO (one unauthenticated request when the launcher
+//    opens) and, when it is newer than the VERSION file next to Launcher.exe, offers "Update now" (runs
+//    tools\update.ps1, which downloads, verifies, installs over this folder keeping the player's files,
+//    rebuilds and starts the launcher again), "Release page" or "Skip version". Option "Updates": Off /
+//    Notify (default) / Auto-install (asks once, then updates). Git checkouts and copies started by
+//    RecompLauncher only get the notice (they update themselves). PORT_NO_UPDATE_CHECK=1 turns the check off.
 //  * Wine / Proton and Steam Deck: adds a 40 fps limit (for the Deck's 40 Hz mode) and a 1280 x 800 window
 //    size; on the Deck the controller's A / Start button presses Play.
 //  * Settings backup (DIST_USER_DIR): see dist_config_restore / dist_config_save below.
@@ -41,16 +44,18 @@ static void dist_add_choice(const char* key, const char* after, const char* labe
     for (size_t i = 0; i < s->choices.size(); i++) if (defv == s->choices[i].value) s->def = (int)i;
 }
 
-// "Check for updates" (PC options). R2 / R3 list it through add_option; R1 appends it after the built-in
-// settings (S_UPDATES) and its layout() places the row.
+// "Updates" (PC options): "1" Notify (the default, and the old "On"), "2" Auto-install, "0" Off. R2 / R3 list
+// it through add_option; R1 appends it after the built-in settings (S_UPDATES) and its layout() places the row.
 static void dist_register_updates_option()
 {
-    const char* help = "When the launcher opens, it asks GitHub whether a newer version of the port has been "
-                       "released and offers to open the download page. Nothing is downloaded on its own.";
+    const char* help = "Notify: when the launcher opens, it asks GitHub whether a newer version of the port has been "
+                       "released and offers to install it (download, update, rebuild - about 10 minutes; your "
+                       "settings, saves and game files are kept). Auto-install: asks once, then updates. "
+                       "Off: never checks.";
 #ifdef DIST_ADD_OPTION
-    add_option(SEC_PC, "updates", "Check for updates", help, nullptr, { {"On", "1"}, {"Off", "0"} }, 0);
+    add_option(SEC_PC, "updates", "Updates", help, nullptr, { {"Notify", "1"}, {"Auto-install", "2"}, {"Off", "0"} }, 0);
 #else
-    g_set.push_back({ "updates", "Check for updates", help, { {"On", "1"}, {"Off", "0"} }, 0 });
+    g_set.push_back({ "updates", "Updates", help, { {"Notify", "1"}, {"Auto-install", "2"}, {"Off", "0"} }, 0 });
 #endif
 }
 #ifndef DIST_ADD_OPTION
@@ -107,11 +112,12 @@ static void dist_init()
     dist_register_updates_option();
 }
 
-static bool dist_updates_on()
+static int dist_updates_mode()   // 0 off, 1 notify, 2 auto-install
 {
     Setting* s = dist_setting("updates");
-    return !s || strcmp(s->choices[s->sel].value, "0") != 0;
+    return s ? atoi(s->choices[s->sel].value) : 1;
 }
+static bool dist_updates_on() { return dist_updates_mode() != 0; }
 
 // SemVer 2.0 precedence on tags like "v0.2.0-beta.1": 0.2.0-beta < 0.2.0-beta.1 < 0.2.0-rc < 0.2.0.
 // Build metadata (+...) is ignored. Returns false when there is no x.y.z core.
@@ -226,6 +232,124 @@ static DWORD WINAPI dist_update_thread(LPVOID)
     return 0;
 }
 
+static bool dist_env(const char* name) { char v[4]; return GetEnvironmentVariableA(name, v, sizeof v) > 0; }
+
+// Why "Update now" is not offered here ("" = it is): a git checkout updates with git, RecompLauncher (it sets
+// RECOMPLAUNCHER=1 for what it starts) updates its own copies, and an old copy may lack the updater.
+static std::string dist_no_auto_reason()
+{
+    if (GetFileAttributesA(path_of(".git").c_str()) != INVALID_FILE_ATTRIBUTES)
+        return "This folder is a git checkout: update it with \"git pull\", then run Setup.bat.";
+    if (dist_env("RECOMPLAUNCHER"))
+        return "This copy is managed by RecompLauncher: update it there.";
+    if (GetFileAttributesA(path_of("tools\\update.ps1").c_str()) == INVALID_FILE_ATTRIBUTES)
+        return "This copy has no updater (tools\\update.ps1): download the new version from the release page.";
+    for (const char* c = g_dist_upd_tag; *c; c++)   // the tag goes on update.ps1's command line
+        if (!isalnum((unsigned char)*c) && !strchr(".-_+", *c)) return "Unusual release name: download the new version from the release page.";
+    return "";
+}
+
+// Starts tools\update.ps1 in its own console window (it waits for this launcher to close) and closes the launcher.
+// `args`: "-Tag <tag>" to update, "-Rollback" to undo an interrupted update.
+static bool dist_run_updater(const std::string& args)
+{
+    char ps[MAX_PATH] = "";
+    const UINT n = GetSystemDirectoryA(ps, MAX_PATH);
+    if (n && n < MAX_PATH - 40) strcat_s(ps, "\\WindowsPowerShell\\v1.0\\powershell.exe");
+    else strcpy_s(ps, "powershell.exe");
+    std::string cmd = std::string("\"") + ps + "\" -NoProfile -ExecutionPolicy Bypass -File \"" + path_of("tools\\update.ps1") +
+                      "\" -Repo " DIST_REPO " " + args + " -WaitPid " + std::to_string(GetCurrentProcessId());
+    STARTUPINFOA si = { sizeof si };
+    PROCESS_INFORMATION pi = {};
+    std::vector<char> cl(cmd.begin(), cmd.end()); cl.push_back(0);
+    if (!CreateProcessA(NULL, cl.data(), NULL, NULL, FALSE, CREATE_NEW_CONSOLE, NULL, g_dir, &si, &pi)) {
+        MessageBoxA(g_dist_hw, ("Could not start the updater (tools\\update.ps1), error " + std::to_string(GetLastError()) +
+                                ".\nDownload the new version from the release page instead.").c_str(),
+                    "Update", MB_OK | MB_ICONWARNING);
+        return false;
+    }
+    CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+    PostMessageA(g_dist_hw, WM_CLOSE, 0, 0);
+    return true;
+}
+
+// MessageBox with Abort / Retry / Ignore renamed to Update now / Release page / Skip version (a CBT hook names
+// the buttons; the launcher has no common-controls v6 manifest, so TaskDialog is not available).
+static HHOOK g_dist_hook = NULL;
+static LRESULT CALLBACK dist_cbt(int code, WPARAM wp, LPARAM lp)
+{
+    if (code == HCBT_ACTIVATE) {
+        HWND d = (HWND)wp;
+        SetDlgItemTextA(d, IDABORT, "&Update now");
+        SetDlgItemTextA(d, IDRETRY, "&Release page");
+        SetDlgItemTextA(d, IDIGNORE, "&Skip version");
+        UnhookWindowsHookEx(g_dist_hook); g_dist_hook = NULL;
+        return 0;
+    }
+    return CallNextHookEx(g_dist_hook, code, wp, lp);
+}
+
+static void dist_open_release()
+{
+    // that release's own page (/releases/latest would skip a pre-release)
+    const std::string url = std::string("https://github.com/" DIST_REPO "/releases/tag/") + g_dist_upd_tag;
+    ShellExecuteA(g_dist_hw, "open", url.c_str(), NULL, NULL, SW_SHOWNORMAL);
+}
+static void dist_skip_version()
+{
+    CreateDirectoryA(path_of("logs").c_str(), NULL);
+    if (FILE* f = fopen(path_of("logs\\update_seen.txt").c_str(), "w")) { fprintf(f, "%s\n", g_dist_upd_tag); fclose(f); }
+}
+
+static void dist_offer_update()
+{
+    char msg[1024];
+    if (dist_env("PORT_UPDATE_NOTIFY_ONLY")) {   // the dialog as before the updater: open the page or skip the version
+        snprintf(msg, sizeof msg,
+                 "A new version of the port is available: %s (this copy is %s).\n\n"
+                 "Open the download page?\n\n"
+                 "(No skips this version. Update checks can be turned off on the Advanced page.)",
+                 g_dist_upd_tag, g_dist_have);
+        if (MessageBoxA(g_dist_hw, msg, "Update available", MB_YESNO | MB_ICONINFORMATION) == IDYES) dist_open_release();
+        else dist_skip_version();
+        return;
+    }
+    const std::string why = dist_no_auto_reason();
+    if (!why.empty()) {
+        snprintf(msg, sizeof msg,
+                 "A new version of the port is available: %s (this copy is %s).\n\n%s\n\n"
+                 "Open the release page?\n\n"
+                 "(No skips this version. Update checks can be turned off on the Advanced page.)",
+                 g_dist_upd_tag, g_dist_have, why.c_str());
+        if (MessageBoxA(g_dist_hw, msg, "Update available", MB_YESNO | MB_ICONINFORMATION) == IDYES) dist_open_release();
+        else dist_skip_version();
+        return;
+    }
+    if (dist_updates_mode() == 2) {
+        snprintf(msg, sizeof msg,
+                 "Version %s is available (this copy is %s). Install it now?\n\n"
+                 "The launcher closes, the update is downloaded and installed, the port is rebuilt "
+                 "(about 10 minutes) and the launcher opens again. Your settings, saves and game files are kept.\n\n"
+                 "(No asks again next time. \"Updates\" is on the Advanced page.)",
+                 g_dist_upd_tag, g_dist_have);
+        if (MessageBoxA(g_dist_hw, msg, "Update available", MB_YESNO | MB_ICONQUESTION) == IDYES) dist_run_updater(std::string("-Tag ") + g_dist_upd_tag);
+        return;
+    }
+    snprintf(msg, sizeof msg,
+             "A new version of the port is available: %s (this copy is %s).\n\n"
+             "Update now: the launcher closes, the update is downloaded and installed, the port is rebuilt "
+             "(about 10 minutes) and the launcher opens again. Your settings, saves and game files are kept.\n\n"
+             "Release page: see what changed.    Skip version: do not ask again for %s.\n"
+             "(\"Updates\" on the Advanced page: Off / Notify / Auto-install.)",
+             g_dist_upd_tag, g_dist_have, g_dist_upd_tag);
+    g_dist_hook = SetWindowsHookExA(WH_CBT, dist_cbt, NULL, GetCurrentThreadId());
+    const int r = MessageBoxA(g_dist_hw, msg, "Update available", MB_ABORTRETRYIGNORE | MB_ICONINFORMATION);
+    if (g_dist_hook) { UnhookWindowsHookEx(g_dist_hook); g_dist_hook = NULL; }
+    if (r == IDABORT) dist_run_updater(std::string("-Tag ") + g_dist_upd_tag);
+    else if (r == IDRETRY) dist_open_release();
+    else if (r == IDIGNORE) dist_skip_version();
+}
+
 static void CALLBACK dist_timer(HWND, UINT, UINT_PTR id, DWORD)
 {
     // Steam Deck: A or Start on the controller presses Play
@@ -249,23 +373,7 @@ static void CALLBACK dist_timer(HWND, UINT, UINT_PTR id, DWORD)
     }
     if (g_dist_upd_done == 1) {
         InterlockedExchange(&g_dist_upd_done, 2);
-        if (g_dist_upd_tag[0] && g_dist_hw && IsWindow(g_dist_hw)) {
-            char msg[512];
-            snprintf(msg, sizeof msg,
-                     "A new version of the port is available: %s (this copy is %s).\n\n"
-                     "Open the download page?\n\n"
-                     "(No skips this version. Update checks can be turned off on the Advanced page.)",
-                     g_dist_upd_tag, g_dist_have);
-            const int r = MessageBoxA(g_dist_hw, msg, "Update available", MB_YESNO | MB_ICONINFORMATION);
-            if (r == IDYES) {
-                // that release's own page (/releases/latest would skip a pre-release)
-                const std::string url = std::string("https://github.com/" DIST_REPO "/releases/tag/") + g_dist_upd_tag;
-                ShellExecuteA(g_dist_hw, "open", url.c_str(), NULL, NULL, SW_SHOWNORMAL);
-            } else {
-                CreateDirectoryA(path_of("logs").c_str(), NULL);
-                if (FILE* f = fopen(path_of("logs\\update_seen.txt").c_str(), "w")) { fprintf(f, "%s\n", g_dist_upd_tag); fclose(f); }
-            }
-        }
+        if (g_dist_upd_tag[0] && g_dist_hw && IsWindow(g_dist_hw)) dist_offer_update();
     }
     if (!g_dist_deck && g_dist_upd_done == 2) KillTimer(NULL, id);
 }
@@ -273,6 +381,14 @@ static void CALLBACK dist_timer(HWND, UINT, UINT_PTR id, DWORD)
 static void dist_start(HWND hw)
 {
     g_dist_hw = hw;
+    // tools\update.ps1 was stopped half way (window closed, power cut): .upd\journal.txt lists what it changed
+    if (GetFileAttributesA(path_of(".upd\\journal.txt").c_str()) != INVALID_FILE_ATTRIBUTES &&
+        GetFileAttributesA(path_of("tools\\update.ps1").c_str()) != INVALID_FILE_ATTRIBUTES &&
+        MessageBoxA(hw, "An update of this folder was interrupted, so some files are new and some old.\n\n"
+                        "Put the previous version back now? (The launcher closes and opens again; details in logs\\update.log.)",
+                    "Update interrupted", MB_YESNO | MB_ICONWARNING) == IDYES &&
+        dist_run_updater("-Rollback"))
+        return;
     const std::string have = dist_read_line(path_of("VERSION"));
     strcpy_s(g_dist_have, have.c_str());
     const bool check = dist_updates_on() && g_dist_have[0] && !getenv("PORT_NO_UPDATE_CHECK");

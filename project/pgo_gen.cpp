@@ -11,6 +11,7 @@
 
 extern "C" int __llvm_profile_write_file(void);
 extern "C" void __llvm_profile_set_filename(const char*);
+extern "C" void ps3_exit_hook_register(void (*fn)(void));   /* ps3emu/milestone.h */
 
 static DWORD WINAPI port_pgo_dumper(LPVOID p)
 {
@@ -29,7 +30,7 @@ static int port_pgo_start(void)
     CreateDirectoryA("pgo", NULL);
     const char* e = getenv("PORT_PGO_DUMP_S");
     const int s = e && atoi(e) > 0 ? atoi(e) : 30;
-    atexit(port_pgo_atexit);
+    ps3_exit_hook_register(port_pgo_atexit);   /* atexit + sys_process_exit's fast exit */
     HANDLE h = CreateThread(NULL, 0, port_pgo_dumper, (LPVOID)(uintptr_t)s, 0, NULL);
     if (h) CloseHandle(h);
     fprintf(stderr, "[pgo] instrumented build: profile -> %s every %d s and at exit\n", getenv("LLVM_PROFILE_FILE"), s);

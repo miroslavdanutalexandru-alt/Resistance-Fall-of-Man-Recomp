@@ -415,6 +415,9 @@ struct Tool { wstring key, status, version, path, label, id; };
 static std::vector<Tool> g_tools;
 static std::mutex g_toolsMx;
 static bool g_toolsChecked = false;
+// the player's answer to the build-tools question in this run, passed on to setup.ps1 (which never installs tools
+// unattended without it): 0 = not asked (nothing was missing), 1 = system-wide, 2 = portable (3 = portable + Microsoft's licence)
+static int g_toolConsent = 0;
 
 static bool CheckTools() {
     wstring out = P(L"logs\\prereqs_check.txt");
@@ -463,8 +466,8 @@ static wstring ToolsText() {
     s += L"\r\n";
     wstring dummy;
     bool any = !MissingIds(&dummy).empty();
-    if (any) s += w && w->status == L"ok" ? L"Missing tools are installed with winget (one administrator prompt)."
-                                         : L"winget is not available: Setup downloads the official installers directly (one administrator prompt).";
+    if (any) s += w && w->status == L"ok" ? L"Setup explains the missing tools and asks first: system-wide with winget (one administrator prompt) or portable in this folder."
+                                         : L"Setup explains the missing tools and asks first: the official installers (no winget; one administrator prompt) or portable in this folder.";
     else s += L"All build tools are installed.";
     if (NeedsRpcs3() && v && v->status != L"ok") s += L"\r\nNo Vulkan driver found (vulkan-1.dll): install your GPU's latest driver before playing.";
     return s;
@@ -551,6 +554,54 @@ static bool InstallTools(const Lines& ids, wstring& err, wstring& todo) {
         return false;
     }
     if (reboot) Say(L"The tool installer asks for a restart. If the build cannot find the tools, restart the PC and click Resume.");
+    return true;
+}
+static wstring IdList(const Lines& ids) {
+    wstring s;
+    for (auto& i : ids) s += (s.empty() ? L"" : L",") + i;
+    return s;
+}
+static bool NeedsMsvc(const Lines& ids) {
+    for (auto& i : ids) if (i == L"Microsoft.VisualStudio.2022.BuildTools" || i == L"VSModify") return true;
+    return false;
+}
+// what the missing tools are for, where they come from and their size (prereqs.ps1 -Explain: the same text as setup.ps1)
+static wstring ExplainTools(const Lines& ids, bool portable) {
+    wstring out = P(L"logs\\prereqs_explain.txt");
+    DeleteFileW(out.c_str());
+    Run(PsFile(P(L"tools\\installer\\prereqs.ps1")) + L" -Explain -Ids " + Arg(IdList(ids)) + (portable ? L" -Portable" : L"") + L" -Out " + Arg(out),
+        [](const wstring& l) { LogRaw(L"  explain: " + l); });
+    wstring s;
+    for (auto& l : ReadLines(out)) s += l + L"\r\n";
+    if (s.empty()) for (auto& i : ids) s += L"  \x2022 " + i + L"\r\n";
+    return s;
+}
+// EXPERIMENTAL: the tools go into tools_cache\ (portable zips; the MSVC libraries + Windows SDK via xwin), not elevated
+static bool InstallPortable(const Lines& ids, bool msLicense, wstring& err, wstring& todo) {
+    wstring result = P(L"logs\\prereqs_result.txt");
+    DeleteFileW(result.c_str());
+    wstring cmd = PsFile(P(L"tools\\installer\\prereqs.ps1")) + L" -Portable -Ids " + Arg(IdList(ids)) + (msLicense ? L" -AcceptMicrosoftLicense" : L"") +
+                  L" -Log " + Arg(P(L"logs\\portable_tools.log")) + L" -Out " + Arg(result);
+    Say(L"Portable build tools (experimental): " + cmd);
+    int rc = Run(cmd, [](const wstring& l) {
+        wstring t = Trim(l);
+        if (t.empty()) return;
+        Say(L"   " + t);
+        if (Contains(t, L"== ")) SetDetail(L"Downloading " + t.substr(t.find(L"== ") + 3) + L" ...");
+    });
+    wstring failed;
+    Lines res = ReadLines(result);
+    for (auto& l : res) {
+        Lines f = Split(l, L'|');
+        if (f.size() >= 2 && f[1] == L"fail") failed += L"  \x2022 " + f[0] + (f.size() >= 4 && !f[3].empty() ? L": " + f[3] : L"") + L"\r\n";
+    }
+    if (rc != 0 || res.empty() || res.back() != L"done") failed += L"  (it stopped early; see logs\\portable_tools.log)\r\n";
+    if (!failed.empty()) {
+        err = L"Some portable build tools could not be set up:\r\n" + failed;
+        todo = L"Check the internet connection and click Resume (finished tools are kept). If it keeps failing, click Resume and answer Yes "
+               L"to install the tools system-wide instead. Details: logs\\portable_tools.log.";
+        return false;
+    }
     return true;
 }
 
@@ -816,9 +867,64 @@ static bool DeleteTree(const wstring& p) {
 }
 static const wchar_t* kKeep = L"Kept: your saves (gamedata\\), settings (settings.ini, settings.bat, controls.txt, mouselook.cfg, "
                               L"%USERPROFILE%\\Saved Games\\...), screenshots and logs\\.";
+// what Setup installed or changed on this PC (tools_cache\\installed_by_setup.txt; tools that were already there are never listed)
+static Lines SetupToolLines() {
+    Lines r;
+    for (auto& l : ReadLines(P(L"tools_cache\\installed_by_setup.txt"))) if (!l.empty() && l[0] != L'#') r.push_back(l);
+    return r;
+}
+// earlier choices kept in the manifest (buildtools.ps1): the portable build tools (a "portable|" line), and Microsoft's licence
+// for the portable MSVC libraries ("#accepted|microsoft-msvc-license", or the libraries themselves: "portable|vs")
+static bool PortableChosenBefore(bool* msAccepted = nullptr) {
+    bool portable = false, ms = false;
+    for (auto& l : ReadLines(P(L"tools_cache\\installed_by_setup.txt"))) {
+        if (l.rfind(L"portable|", 0) == 0) portable = true;
+        if (l == L"portable|vs" || l == L"#accepted|microsoft-msvc-license") ms = true;
+    }
+    if (msAccepted) *msAccepted = ms;
+    return portable;
+}
+static wstring SetupToolText(const Lines& lines) {
+    wstring s;
+    for (auto& l : lines) {
+        Lines f = Split(l, L'|');
+        wstring k = f.empty() ? L"" : f[0], v = f.size() > 1 ? f[1] : L"";
+        s += L"  \x2022 " + (k == L"winget" ? v + L" (installed with winget)" : k == L"direct" ? v + L" (official installer)" :
+                            k == L"pip" && f.size() > 2 ? L"Python package " + f[2] : k == L"gitconfig" && f.size() > 2 ? L"Git setting safe.directory " + f[2] :
+                            k == L"portable" ? L"portable " + v + L" in tools_cache\\" : l) + L"\r\n";
+    }
+    return s;
+}
+// prereqs.ps1 -Uninstall; elevated (one UAC prompt) when Setup installed tools for all users. Returns the lines left.
+static Lines RemoveSetupTools() {
+    Lines lines = SetupToolLines();
+    bool admin = false;
+    for (auto& l : lines) if (StartsWith(l, L"winget|") || StartsWith(l, L"direct|")) admin = true;
+    wstring logp = P(L"logs\\prereqs_uninstall.log"), out = P(L"logs\\prereqs_uninstall_result.txt");
+    wstring args = L"-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File " + Arg(P(L"tools\\installer\\prereqs.ps1")) +
+                   L" -Uninstall -Log " + Arg(logp) + L" -Out " + Arg(out);
+    LogRaw(L"Uninstall: removing the build tools Setup installed: " + args);
+    if (admin) {
+        SHELLEXECUTEINFOW se{sizeof se};
+        se.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC;
+        se.hwnd = g_hwnd;
+        se.lpVerb = L"runas";
+        wstring ps = PowerShell();
+        se.lpFile = ps.c_str();
+        se.lpParameters = args.c_str();
+        se.lpDirectory = g_port.c_str();
+        se.nShow = SW_HIDE;
+        if (ShellExecuteExW(&se) && se.hProcess) { WaitForSingleObject(se.hProcess, INFINITE); CloseHandle(se.hProcess); }
+        else LogRaw(Fmt(L"Uninstall: the administrator prompt was declined or failed (error %lu)", GetLastError()));
+    } else {
+        Run(Arg(PowerShell()) + L" " + args, [](const wstring& l) { LogRaw(L"  prereqs: " + l); });
+    }
+    return SetupToolLines();
+}
 static int Uninstall() {
     auto items = UninstallList();
     bool gf = IsDir(P(L"gamefiles"));
+    Lines tools = SetupToolLines();
     ULONGLONG total = 0;
     wstring list;
     for (auto& i : items) {
@@ -829,13 +935,33 @@ static int Uninstall() {
     if (g_opt.dryRun) {
         ConsoleWrite(L"Uninstall (dry run): would delete " + GB((double)total) + L":\r\n" + list);
         if (gf) ConsoleWrite(L"  and would ask before deleting your game copy " + P(L"gamefiles") + L" (default: keep it)\r\n");
+        if (!tools.empty()) {
+            ConsoleWrite(L"  and would ask before removing the build tools Setup installed (default: keep them):\r\n" + SetupToolText(tools) + L"  its dry run:\r\n");
+            Run(PsFile(P(L"tools\\installer\\prereqs.ps1")) + L" -Uninstall -DryRun", [](const wstring& l) { ConsoleWrite(L"     " + l + L"\r\n"); });
+        }
         ConsoleWrite(wstring(kKeep) + L"\r\n");
         return 0;
     }
-    if (items.empty() && !gf) { Ask(L"There is nothing to remove.", MB_OK | MB_ICONINFORMATION); return 0; }
-    if (Ask(L"Remove the build of " + g_prof.name + L" (" + GB((double)total) + L") and its shortcuts?\r\n\r\n" + kKeep +
-            L"\r\n\r\nThe port's own files stay, so you can run Setup.exe again later.", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES)
-        return 1;
+    if (items.empty() && !gf && tools.empty()) { Ask(L"There is nothing to remove.", MB_OK | MB_ICONINFORMATION); return 0; }
+    bool delBuild = (!items.empty() || gf) &&
+                    Ask(L"Remove the build of " + g_prof.name + L" (" + GB((double)total) + L") and its shortcuts?\r\n\r\n" + kKeep +
+                            L"\r\n\r\nThe port's own files stay, so you can run Setup.exe again later.", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES;
+    bool delTools = !tools.empty() &&
+                    Ask(L"Also remove the build tools Setup installed on this PC?\r\n\r\n" + SetupToolText(tools) +
+                            L"\r\nTools that were on this PC before Setup are not listed and stay. Rebuilding or updating the port needs these "
+                            L"tools again (Setup installs them again then).", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES;
+    if (!delBuild && !delTools) return 1;
+    Lines toolsLeft;
+    if (delTools) toolsLeft = RemoveSetupTools();
+    if (!delBuild) {
+        if (!toolsLeft.empty()) {
+            Ask(L"These could not be removed (remove them in Windows Settings > Apps, or run Setup.exe --uninstall again; details: logs\\prereqs_uninstall.log):\r\n" +
+                    SetupToolText(toolsLeft), MB_OK | MB_ICONWARNING);
+            return 1;
+        }
+        Ask(L"Done: the build tools Setup installed are removed.", MB_OK | MB_ICONINFORMATION);
+        return 0;
+    }
     bool delGame = gf && Ask(L"Also delete your game copy in " + P(L"gamefiles") + L" (" + GB((double)TreeSize(P(L"gamefiles"))) +
                                  L")?\r\n\r\nYou need it again to rebuild the port. Your original ISO or folder is not touched.",
                              MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES;
@@ -845,6 +971,8 @@ static int Uninstall() {
         LogRaw(L"Uninstall: deleting " + i.path);
         if (!DeleteTree(i.path)) failed += L"  " + i.path + L"\r\n";
     }
+    if (!toolsLeft.empty())
+        failed += L"  build tools Setup installed (remove them in Windows Settings > Apps; details: logs\\prereqs_uninstall.log):\r\n" + SetupToolText(toolsLeft);
     if (!failed.empty()) {
         Ask(L"Some files could not be deleted (is the game or the launcher still running?):\r\n" + failed, MB_OK | MB_ICONWARNING);
         return 1;
@@ -865,9 +993,23 @@ static wstring Hint(const wstring& msg) {
         return L"Check the internet connection (and any proxy or firewall), then click Resume.";
     if (Contains(l, L"space") || Contains(l, L"disk"))
         return L"Free up disk space (see docs\\INSTALL.md, \"Disk space\"), then click Resume.";
-    if (Contains(l, L"build failed") || Contains(l, L"configure failed"))
-        return L"Antivirus programs sometimes block the compiler: add the port folder to the antivirus exclusions "
-               L"(docs\\INSTALL.md, \"Antivirus\"), then click Resume. The build continues where it stopped.";
+    if (Contains(l, L"build failed") || Contains(l, L"configure failed")) {
+        // only blame the antivirus when the build logs show a blocked or locked file; a plain compile
+        // error (e.g. a missing header) is a port bug the user can't fix with exclusions
+        bool blocked = false;
+        for (const wchar_t* f : {L"logs\\build.log", L"logs\\build_game.log", L"logs\\build_rpcs3.log"}) {
+            std::string b;
+            if (!ReadBytes(P(f), b)) continue;
+            for (char& ch : b) ch = (char)tolower((unsigned char)ch);
+            for (const char* k : {"access is denied", "permission denied", "lnk1104", "virus", "being used by another process"})
+                if (b.find(k) != std::string::npos) blocked = true;
+        }
+        if (blocked)
+            return L"Antivirus programs sometimes block the compiler: add the port folder to the antivirus exclusions "
+                   L"(docs\\INSTALL.md, \"Antivirus\"), then click Resume. The build continues where it stopped.";
+        return L"This looks like a compile error, not an antivirus problem. Please report it (docs\\REPORTING.md) "
+               L"with logs\\build.log attached. A port folder path without spaces avoids a known build bug.";
+    }
     if (Contains(l, L"not the expected version") || Contains(l, L"game copy"))
         return L"Pick the supported game version (" + g_prof.titleId + L"), then click Resume.";
     return L"Fix the problem above and click Resume: finished steps are skipped.";
@@ -876,6 +1018,14 @@ static wstring Hint(const wstring& msg) {
 // runs setup.ps1 once; returns 0 ok, 1 failed, 2 out of memory, 3 cancelled
 static int RunSetupOnce(const Choice& c, const Jobs& j, wstring& stopMsg) {
     wstring cmd = PsFile(P(L"setup.ps1")) + L" -Unattended";
+    // --prepare: the launcher's question counts as the yes - system-wide, or portable again when that was chosen before
+    int consent = g_toolConsent;
+    if (!consent && g_prepare) {
+        bool ms = false;
+        consent = PortableChosenBefore(&ms) ? (ms ? 3 : 2) : 1;
+    }
+    if (consent == 1) cmd += L" -InstallTools";
+    else if (consent >= 2) cmd += consent == 3 ? L" -PortableTools -AcceptMicrosoftLicense" : L" -PortableTools";
     if (!c.game.empty()) cmd += L" -Game " + Arg(c.game);
     if (!c.copyMode.empty()) cmd += L" -GameCopyMode " + c.copyMode;
     cmd += c.sdks ? L" -AcceptSdkLicenses" : L" -NoOptionalSdks";
@@ -1067,12 +1217,46 @@ static void SetupWorker(Choice c) {
     Lines ids = MissingIds(&names);
     if (!g_toolsChecked) { Fail(L"The build-tool check did not run.", L"Make sure PowerShell is not blocked (docs\\INSTALL.md), then click Resume."); goto out; }
     if (!ids.empty()) {
-        wstring t = L"Setup will install these free build tools:\r\n\r\n" + names +
-                    Fmt(L"\r\nThey need about %.0f GB on drive C: and a download of several GB. Windows asks once for administrator permission.\r\n\r\nContinue?", ToGB(ToolsBytes(ids)) + 0.5);
-        if (Ask(t, MB_OKCANCEL | MB_ICONINFORMATION) != IDOK) { SetStep(L"Cancelled."); goto out; }
-        SetStep(L"Installing the build tools");
+        // say what is installed, why and from where, and ask first (GitHub issue: "setup made my PC install Python and IDLE")
+        wstring why = ExplainTools(ids, false);
+        LogRaw(L"Missing build tools:\r\n" + why);
+        wstring t = L"These free build tools are missing on this PC. " + g_prof.name + L" is compiled here from your own game (compiled game code "
+                    L"cannot be shared), so Setup needs a compiler and its helpers:\r\n\r\n" + why +
+                    L"\r\nNothing else is installed, and tools already on this PC are used as they are. Setup records what it installs; "
+                    L"Setup.exe > Uninstall can remove exactly those again.\r\n\r\n"
+                    L"Yes: install them system-wide with winget or the official installers (recommended). Windows asks once for administrator permission.\r\n"
+                    L"No: EXPERIMENTAL portable mode - download them only into this folder (tools_cache\\): no installers, no administrator rights.\r\n"
+                    L"Cancel: install nothing.";
+        // --prepare (the launcher already asked): system-wide, or portable again when the manifest says it was chosen before
+        bool msBefore = false, portableBefore = g_prepare && PortableChosenBefore(&msBefore);
+        int a = g_console ? (portableBefore ? IDNO : IDYES) : Ask(t, MB_YESNOCANCEL | MB_ICONQUESTION);
+        if (a != IDYES && a != IDNO) { SetStep(L"Cancelled: no build tools were installed."); goto out; }
         wstring err, todo;
-        if (!InstallTools(ids, err, todo)) { Fail(err, todo); goto out; }
+        if (a == IDNO) {
+            bool ms = NeedsMsvc(ids);
+            if (portableBefore) {
+                if (ms && !msBefore) {
+                    Fail(L"The portable build tools were chosen before, and the MSVC libraries + Windows SDK are needed again, "
+                         L"but Microsoft's licence for them has not been accepted on this PC.",
+                         L"Open Setup.exe and click Install/Resume: it shows Microsoft's licence and asks first.");
+                    goto out;
+                }
+                LogRaw(L"--prepare: the portable build tools were chosen before (tools_cache\\installed_by_setup.txt): portable again");
+            } else {
+                wstring q = L"Portable build tools (EXPERIMENTAL), downloaded into " + P(L"tools_cache") + L":\r\n\r\n" + ExplainTools(ids, true) +
+                            (ms ? L"\r\nThe MSVC libraries and the Windows SDK are Microsoft's: xwin downloads them from Microsoft's servers for you, "
+                                  L"under Microsoft's licence (link above).\r\n\r\nDo you accept Microsoft's licence and continue?"
+                                : L"\r\nContinue?");
+                if (Ask(q, MB_YESNO | MB_ICONQUESTION) != IDYES) { SetStep(L"Cancelled: no build tools were installed."); goto out; }
+            }
+            g_toolConsent = (ms || msBefore) ? 3 : 2;
+            SetStep(L"Downloading the portable build tools (experimental)");
+            if (!InstallPortable(ids, ms, err, todo)) { Fail(err, todo); goto out; }
+        } else {
+            g_toolConsent = 1;
+            SetStep(L"Installing the build tools");
+            if (!InstallTools(ids, err, todo)) { Fail(err, todo); goto out; }
+        }
         CheckTools();
         ShowTools();
         names.clear();
@@ -1217,10 +1401,20 @@ static int DryRun() {
     Lines ids = MissingIds(&names);
     if (ids.empty()) ConsoleWrite(L"   nothing to install\r\n");
     else {
-        ConsoleWrite(L"   would install (one UAC prompt):\r\n" + names);
-        ConsoleWrite(L"   elevated command: powershell " + InstallCommandArgs(ids, false) + L"\r\n   its dry run:\r\n");
-        Run(PsFile(P(L"tools\\installer\\prereqs.ps1")) + L" -Install -DryRun -Ids " + Arg([&] { wstring s; for (auto& i : ids) s += (s.empty() ? L"" : L",") + i; return s; }()),
+        ConsoleWrite(L"   would explain them and ask first:\r\n" + names);
+        for (auto& l : Split(ExplainTools(ids, false), L'\n')) if (!Trim(l).empty()) ConsoleWrite(L"     " + Trim(l) + L"\r\n");
+        ConsoleWrite(L"   Yes = system-wide (one UAC prompt), elevated command: powershell " + InstallCommandArgs(ids, false) + L"\r\n   its dry run:\r\n");
+        Run(PsFile(P(L"tools\\installer\\prereqs.ps1")) + L" -Install -DryRun -Ids " + Arg(IdList(ids)),
             [](const wstring& l) { ConsoleWrite(L"     " + l + L"\r\n"); });
+        ConsoleWrite(L"   No = portable in tools_cache\\ (experimental, not elevated):\r\n");
+        for (auto& l : Split(ExplainTools(ids, true), L'\n')) if (!Trim(l).empty()) ConsoleWrite(L"     " + Trim(l) + L"\r\n");
+        ConsoleWrite(L"   its dry run:\r\n");
+        Run(PsFile(P(L"tools\\installer\\prereqs.ps1")) + L" -Portable -DryRun -Ids " + Arg(IdList(ids)),
+            [](const wstring& l) { ConsoleWrite(L"     " + l + L"\r\n"); });
+    }
+    {
+        Lines mine = SetupToolLines();
+        if (!mine.empty()) ConsoleWrite(L"   installed by Setup earlier (Setup.exe --uninstall offers to remove them):\r\n" + SetupToolText(mine));
     }
 
     ConsoleWrite(L"\r\n== Game copy\r\n");
@@ -1277,6 +1471,10 @@ static int DryRun() {
     wstring cmd = PsFile(P(L"setup.ps1")) + L" -Unattended";
     if (!have && !game.empty()) cmd += L" -Game " + Arg(game) + L" -GameCopyMode Copy";
     ConsoleWrite(L"   " + cmd + L" -NoOptionalSdks  (or -AcceptSdkLicenses when the SDK box is ticked)\r\n");
+    ConsoleWrite(L"   + -InstallTools after Yes to the build-tools question (with --prepare always, unless the portable tools were\r\n"
+                 L"     chosen before: then -PortableTools, + -AcceptMicrosoftLicense only if it was accepted before), -PortableTools\r\n"
+                 L"     [-AcceptMicrosoftLicense] after No; without either (nothing was missing) setup.ps1 installs no build tools and\r\n"
+                 L"     stops if one is missing\r\n");
 
     ConsoleWrite(L"\r\n== Shortcuts at the end\r\n   " + StartMenuDir() + L"\\" + g_prof.saveFolder + L".lnk  -> Launcher.exe\r\n   " +
                  StartMenuDir() + L"\\Setup (repair, rebuild, uninstall).lnk  -> Setup.exe\r\n   " + DesktopLink() + L"  -> Launcher.exe (optional)\r\n");
@@ -1558,7 +1756,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
         ConsoleWrite(L"Setup.exe: one-click setup of this PC port (window). Options:\r\n"
                      L"  --dry-run            check this PC and print what Setup would do; changes nothing\r\n"
                      L"  --game <iso|folder>  fill in the game copy (the installer passes it); with --dry-run: also check it\r\n"
-                     L"  --uninstall          remove what Setup made (with --dry-run: only list it)\r\n"
+                     L"  --uninstall          remove what Setup made, and (asks first) the build tools it installed (with --dry-run: only list it)\r\n"
                      L"  --prepare            no window (RecompLauncher): install tools, copy the game (--game) and build;\r\n"
                      L"                       prints \"progress <0..1> <text>\" lines; exit code 0 = ready to play\r\n"
                      L"  --ram-gb N, --free-gb N, --cores N, --ppu-gb N, --reduce N\r\n"
@@ -1567,6 +1765,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
                      L"  --parse-log <log>    dry run of the build-progress and out-of-memory parser on a build log\r\n"
                      L"  --port <folder>      act on another port folder (testing)\r\n"
                      L"Unattended setup without the window: setup.ps1 -Unattended -Game <iso|folder> [-AcceptSdkLicenses | -NoOptionalSdks]\r\n"
+                     L"  [-PortableTools -AcceptMicrosoftLicense]   (experimental: the build tools inside this folder, see docs\\INSTALL.md)\r\n"
                      L"(set PORT_PPU_JOBS, PORT_JOBS, RFOM_JOBS and RPCS3_JOBS to limit the build; see docs\\INSTALL.md).\r\n");
         return 0;
     }

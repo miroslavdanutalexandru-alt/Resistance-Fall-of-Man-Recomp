@@ -12,6 +12,8 @@
 #ifdef _WIN32
 extern "C" void* g_kbm_hwnd;                 /* cellPad.c: the game window */
 extern "C" unsigned cellGcm_flip_request_count(void);
+extern "C" volatile long rsx_focus_paused;   /* rsx_d3d12_backend.c: focus pause / quit prompt */
+#include "ps3emu/port_pc_extras2.h"       /* pcx_cover_release_due */
 
 static bool rfom_under_wine()
 {
@@ -110,7 +112,10 @@ static DWORD WINAPI rfom_cover_release(LPVOID)
             SetWindowPos(h, NULL, (int)x, (int)y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
     }
     const unsigned f0 = cellGcm_flip_request_count();
-    while (cellGcm_flip_request_count() < f0 + 2 && GetTickCount64() - start < 90000) Sleep(10);
+    /* a paused game (focus pause, quit prompt) never flips: let the cover go so it hands the foreground back */
+    while (!pcx_cover_release_due(cellGcm_flip_request_count() - f0, (int)rsx_focus_paused,
+                                  GetTickCount64() - start, 90000))
+        Sleep(10);
     Sleep(100);
     if (HANDLE ev = CreateEventA(NULL, TRUE, FALSE, ev_name)) {   /* opens the helper's event */
         SetEvent(ev);

@@ -18,6 +18,7 @@
 #include "spu_context.h"
 #include "../../include/ps3emu/log_first.h"
 #include "spu_coherency.h"
+#include "spu_put_order.h"   /* GCM_PUT_ORDER: park-head PUTs written head-last */
 #include "ps3emu/ps3_ftrace.h"
 #include <stdint.h>
 #include <string.h>
@@ -39,7 +40,43 @@ extern uint8_t* vm_base;
  * Queries the page state and demand-commits on first touch; the whole
  * [ea, ea+size) range must be committed and accessible.
  * Returns 1 if the range is safe to memcpy. */
+/* Resistance port: SPU_DMA_FAST (default 1; SPU_DMA_FAST=0 = the old paths;
+ * from the Resistance 3 port). Here: the steady state of this check is an
+ * inline test of the two page bits with the VirtualQuery path out of line, and
+ * the cache bit is set with an atomic OR so two lanes first-touching
+ * neighbouring 64K pages (same bitmap byte) cannot drop each other's bit. In
+ * mfc_do_transfer: the reserved-line scan of a PUT is inlined, and the
+ * diagnostic-only POISON payload scan of every PUT is skipped. Same results. */
+static inline int spu_dma_fast_on(void)
+{
+    static int s_on = -1;
+    if (__builtin_expect(s_on < 0, 0)) {
+        const char* e = getenv("SPU_DMA_FAST");
+        s_on = !(e && *e == '0');
+    }
+    return s_on;
+}
+static int mfc_ea_range_committed_slow(uint64_t ea, uint32_t size);
 static inline int mfc_ea_range_committed(uint64_t ea, uint32_t size)
+{
+    if (__builtin_expect(spu_dma_fast_on(), 1)) {
+        extern uint8_t g_vm_page_bitmap[65536 / 8];
+        const uint32_t e = (uint32_t)ea;
+        if (size != 0 && (uint64_t)e + (uint64_t)size <= 0x100000000ull && vm_base) {
+            const uint32_t p0 = e >> 16, p1 = (e + size - 1) >> 16;
+            if (((g_vm_page_bitmap[p0 >> 3] >> (p0 & 7)) & 1) &&
+                ((g_vm_page_bitmap[p1 >> 3] >> (p1 & 7)) & 1))
+                return 1;
+        }
+    }
+    return mfc_ea_range_committed_slow(ea, size);
+}
+#if defined(_MSC_VER)
+__declspec(noinline)
+#else
+__attribute__((noinline))
+#endif
+static int mfc_ea_range_committed_slow(uint64_t ea, uint32_t size)
 {
     /* The VM reserves the full 32-bit guest space but only commits specific
      * regions (main mem, stack, RSX). A DMA to an uncommitted page must
@@ -70,7 +107,10 @@ static inline int mfc_ea_range_committed(uint64_t ea, uint32_t size)
           } else if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) {
               return 0;
           }
-          g_vm_page_bitmap[pg[i] >> 3] |= (uint8_t)(1u << (pg[i] & 7));
+          if (spu_dma_fast_on())
+              __atomic_fetch_or(&g_vm_page_bitmap[pg[i] >> 3], (uint8_t)(1u << (pg[i] & 7)), __ATOMIC_RELAXED);
+          else
+              g_vm_page_bitmap[pg[i] >> 3] |= (uint8_t)(1u << (pg[i] & 7));
       }
     }
     return 1;
@@ -204,6 +244,26 @@ void spu_phys_trace_dump(const char* path);
 #ifdef __cplusplus
 }
 #endif
+#ifdef __cplusplus
+extern "C" {
+#endif
+extern unsigned char* g_spu_coh_bitmap_p;   /* spu_coherency.c: one bit per reserved 128-byte line */
+int spu_coh_is_reserved(uint32_t addr);
+#ifdef __cplusplus
+}
+#endif
+/* SPU_DMA_FAST: the same bit spu_coh_is_reserved tests, read inline (a PUT
+ * scans one bit per 128 bytes it covers). The bitmap is written before the
+ * armed flag the out-of-line version checks first, so this never reports a
+ * line clear that the call would report reserved. */
+static inline int mfc_line_reserved(uint32_t a)
+{
+    if (__builtin_expect(spu_dma_fast_on(), 1)) {
+        const uint32_t line = a >> 7;
+        return (g_spu_coh_bitmap_p[line >> 3] >> (line & 7)) & 1u;
+    }
+    return spu_coh_is_reserved(a);
+}
 static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                                    uint32_t size, uint32_t cmd)
 {
@@ -723,21 +783,21 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
             uint32_t a1 = ((uint32_t)ea + size - 1u) & ~127u;
             int span_reserved = 0;
             for (uint32_t a = a0; ; a += 128u) {
-                if (spu_coh_is_reserved(a)) { span_reserved = 1; break; }
+                if (mfc_line_reserved(a)) { span_reserved = 1; break; }
                 if (a == a1) break;
             }
             if (span_reserved) {
                 spu_lockline_lock();
-                memcpy(ea_ptr, ls_ptr, size);
+                spu_put_copy(ea_ptr, ls_ptr, size, (uint32_t)ea);
                 for (uint32_t a = a0; ; a += 128u) {
-                    if (spu_coh_is_reserved(a)) spu_coh_notify_write_except(a, spu);
+                    if (mfc_line_reserved(a)) spu_coh_notify_write_except(a, spu);
                     if (a == a1) break;
                 }
                 spu_lockline_unlock();
             } else {
-                memcpy(ea_ptr, ls_ptr, size);
+                spu_put_copy(ea_ptr, ls_ptr, size, (uint32_t)ea);
                 for (uint32_t a = a0; ; a += 128u) {
-                    if (spu_coh_is_reserved(a)) {
+                    if (mfc_line_reserved(a)) {
                         spu_lockline_lock();
                         spu_coh_notify_write_except(a, spu);
                         spu_lockline_unlock();
@@ -779,7 +839,8 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
         { uint32_t e = (uint32_t)ea;
           int hitregion = (e < 0x40005000u && e + size > 0x40003000u);
           int haspoison = 0;
-          for (uint32_t o = 0; o + 4 <= size; o += 4) {
+          /* SPU_DMA_FAST: diagnostic only -- skip reading every PUT a second time */
+          for (uint32_t o = 0; !spu_dma_fast_on() && o + 4 <= size; o += 4) {
               uint32_t w; memcpy(&w, (const char*)ls_ptr + o, 4);
               if (w == 0x08C708C7u) { haspoison = 1; break; } /* 0xC708C708 BE in LS bytes */
           }

@@ -48,6 +48,7 @@
  * so a relative path into the toolkit only works while the file sits in this
  * directory. */
 #include "win32_compat.h"
+#include "ps3emu/milestone.h"
 
 #include <stdatomic.h>
 #include <stdint.h>
@@ -611,8 +612,10 @@ void func_00010000(ppu_context* ctx)
 
     /* Installed last so it runs first: exit() calls handlers in reverse order
      * of registration, and this one must get its verdict out while the rest of
-     * the process is still standing. */
-    atexit(smoke_verify);
+     * the process is still standing. ps3_exit_hook_register also passes it
+     * to atexit() and has sys_process_exit's fast exit (ExitProcess/_exit,
+     * PS3_EXIT_CRT unset) run it the same way. */
+    ps3_exit_hook_register(smoke_verify);
 
     ctx->gpr[3] = SMOKE_EXIT_STATUS;
     func_00010700(ctx); DRAIN_TRAMPOLINE(ctx);

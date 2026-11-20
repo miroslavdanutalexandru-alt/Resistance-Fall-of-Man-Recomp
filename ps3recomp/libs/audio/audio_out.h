@@ -54,6 +54,9 @@ void audio_out_env_config(AudioOutConfig* cfg, unsigned device_period_frames);
 AudioOut* audio_out_create(const AudioOutConfig* cfg);
 void      audio_out_destroy(AudioOut* ao);
 const AudioOutConfig* audio_out_config(const AudioOut* ao);
+/* Change the target buffer at run time (PORT_AUDIO_ADAPTIVE); clamped to half the ring.
+ * Returns the target applied, frames. Size ring_frames for the largest target at create. */
+unsigned  audio_out_set_target(AudioOut* ao, unsigned target_frames);
 
 /* Producer side: append mixed stereo frames. Returns frames stored. */
 unsigned audio_out_push(AudioOut* ao, const float* stereo, unsigned frames);

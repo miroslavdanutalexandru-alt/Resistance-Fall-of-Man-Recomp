@@ -6,12 +6,16 @@
  * threads, audio streamers) issue them on one fd at once. The fixture writes
  * a file whose every 4-byte word holds its own offset, then checks both:
  * a cellFsRead after an AIO read continues from the fd's position, and
- * reads racing from four threads each get the words they asked for.
+ * reads racing from four threads each get the words they asked for. Then a
+ * stress run: eight threads opening, reading, seeking, fstat-ing, AIO-reading
+ * and closing shared files for two seconds, once on their own fds and once
+ * with threads closing random fds under them (ops answer OK or EBADF only).
  *
  *   tools/test_ppu_fs_aio.py
  *   test_fs_aio [DIR]     (DIR: where the file goes; default the temp dir)
  */
 #include "ppu_fs.cpp"
+#include <chrono>
 #include <thread>
 #include <vector>
 
@@ -56,6 +60,129 @@ static bool holds(uint32_t buf, uint64_t off, uint32_t len)
 {
     for (uint32_t i = 0; i < len; i += 4) if (rd32(buf + i) != (uint32_t)(off + i)) return false;
     return true;
+}
+
+/* ---- 3. open / read / seek / fstat / AIO / close racing on shared fds ----
+ *
+ * The fd table was unlocked: two concurrent opens could get the same fd, and a
+ * close could fclose a stream another thread was reading (UCRT invalid
+ * parameter 0xC0000417 -- Resistance 3's FIOS media thread). Phase A: owner
+ * threads open/read/seek/close their own fds on shared files; no fd may be
+ * handed to two threads at once and every read returns its own file's bytes.
+ * Phase B: the same plus threads closing random fds under the readers; every
+ * call must answer CELL_OK or CELL_FS_EBADF and nothing may crash. */
+static const uint32_t EBADF_RC = 0x8001002Au;
+static const int SFILES = 4;
+static const uint32_t SWORDS = 1u << 14;   /* 64 KiB per file; word at offset o = (id << 24) | o */
+
+static bool holds_id(uint32_t buf, int id, uint32_t off, uint32_t len)
+{
+    for (uint32_t i = 0; i < len; i += 4) if (rd32(buf + i) != (((uint32_t)id << 24) | (off + i))) return false;
+    return true;
+}
+
+static uint32_t s_call(void (*fn)(ppu_context*), uint64_t a, uint64_t b = 0, uint64_t c = 0, uint64_t d = 0)
+{
+    ppu_context x; memset(&x, 0, sizeof x);
+    x.gpr[3] = a; x.gpr[4] = b; x.gpr[5] = c; x.gpr[6] = d;
+    fn(&x);
+    return (uint32_t)x.gpr[3];
+}
+
+static void stress(const char* dir)
+{
+    char host[SFILES][1100];
+    for (int id = 0; id < SFILES; id++) {
+        snprintf(host[id], sizeof host[id], "%s/ps3recomp_fs_race_%d.bin", dir, id);
+        FILE* f = fopen(host[id], "wb");
+        if (!f) { CHECK(false, "could not create %s", host[id]); return; }
+        for (uint32_t i = 0; i < SWORDS; i++) { uint32_t be = __builtin_bswap32(((uint32_t)id << 24) | (i * 4)); fwrite(&be, 4, 1, f); }
+        fclose(f);
+        snprintf((char*)vm_base + 0xA00 + 0x40 * id, 0x40, "/dev_hdd1/ps3recomp_fs_race_%d.bin", id);
+    }
+    /* thousands of "[fs] open" lines would drown the result */
+    fflush(stderr);
+#ifdef _WIN32
+    freopen("NUL", "w", stderr);
+#else
+    freopen("/dev/null", "w", stderr);
+#endif
+
+    const int THREADS = 8;
+    for (int phase = 0; phase < 2; phase++) {
+        static std::atomic<int> owner[FS_MAX];
+        for (auto& o : owner) o = 0;
+        std::atomic<bool> stop{false};
+        std::atomic<long> ops{0}, badrc{0}, dup{0}, wrong{0}, ebadf{0};
+        std::vector<std::thread> ts;
+        for (int t = 0; t < THREADS; t++)
+            ts.emplace_back([&, t] {
+                const uint32_t scratch = 0x800 + 0x40 * t, aio = 0xC00 + 0x40 * t, buf = 0x20000 + 0x8000 * t;
+                uint32_t seed = 0x9E3779B9u * (t + 1) + phase;
+                auto rnd = [&] { seed = seed * 1664525u + 1013904223u; return seed >> 8; };
+                auto rc_ok = [&](uint32_t rc) {
+                    ops++;
+                    if (rc == EBADF_RC) ebadf++;
+                    else if (rc != 0) badrc++;
+                    return rc == 0;
+                };
+                const bool closer = phase == 1 && t >= THREADS - 2;
+                while (!stop.load(std::memory_order_relaxed)) {
+                    if (closer) {   /* close somebody else's fd, or a dead one */
+                        rc_ok(s_call(cellFsClose, 3 + rnd() % 24));
+                        std::this_thread::yield();
+                        continue;
+                    }
+                    const int id = (int)(rnd() % SFILES);
+                    if (!rc_ok(s_call(cellFsOpen, 0xA00 + 0x40 * id, 0, scratch))) continue;
+                    const uint32_t fd = rd32(scratch);
+                    if (phase == 0) {
+                        int z = 0;
+                        if (fd >= FS_MAX || !owner[fd].compare_exchange_strong(z, t + 1)) dup++;
+                    }
+                    for (int k = 0, n = 1 + (int)(rnd() % 6); k < n; k++) {
+                        const uint32_t len = 4 * (1 + rnd() % 0x400);
+                        const uint32_t off = (rnd() % (SWORDS * 4 - len)) & ~3u;
+                        switch (rnd() % 4) {
+                        case 0: case 1:
+                            if (rc_ok(s_call(cellFsLseek, fd, off, 0, scratch + 8)) &&
+                                rc_ok(s_call(cellFsRead, fd, buf, len, scratch + 16)) && phase == 0) {
+                                const uint64_t got = rd64(scratch + 16);
+                                for (uint32_t i = 0; i < got; i += 4)
+                                    if (rd32(buf + i) != (((uint32_t)id << 24) | (off + i))) { wrong++; break; }
+                                if (got != len) wrong++;
+                            }
+                            break;
+                        case 2: {
+                            const uint32_t sb = 0x7F000 + 0x40 * t;
+                            if (rc_ok(s_call(cellFsFstat, fd, sb)) && phase == 0 && rd64(sb + 0x24) != SWORDS * 4) wrong++;
+                            break;
+                        }
+                        default:
+                            wr32(aio + 0x00, fd); wr64(aio + 0x08, off); wr32(aio + 0x10, buf); wr64(aio + 0x18, len);
+                            rc_ok(s_call(cellFsAioRead, aio));
+                            if (phase == 0 && !holds_id(buf, id, off, len)) wrong++;
+                            break;
+                        }
+                    }
+                    if (phase == 0) owner[fd < FS_MAX ? fd : 0] = 0;
+                    rc_ok(s_call(cellFsClose, fd));
+                }
+            });
+        std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+        stop = true;
+        for (auto& th : ts) th.join();
+        const char* name = phase == 0 ? "A (own fds)" : "B (+ random closers)";
+        CHECK(badrc == 0 && dup == 0 && wrong == 0 && ops > 1000,
+              "stress %s: %ld calls over %d threads, %ld EBADF, %ld other errors, %ld fds handed out twice, %ld wrong reads",
+              name, ops.load(), THREADS, ebadf.load(), badrc.load(), dup.load(), wrong.load());
+        if (phase == 0) CHECK(ebadf == 0, "stress A: no EBADF on a thread's own fds (%ld)", ebadf.load());
+    }
+    /* everything closed: the table is empty again */
+    int left = 0;
+    for (int i = 0; i < FS_MAX; i++) if (g_fds[i]) { left++; s_call(cellFsClose, i); }
+    CHECK(left == 0, "no fd leaked after the stress (%d left open)", left);
+    for (int id = 0; id < SFILES; id++) remove(host[id]);
 }
 
 int main(int argc, char** argv)
@@ -117,7 +244,16 @@ int main(int argc, char** argv)
 
     memset(&ctx, 0, sizeof ctx); ctx.gpr[3] = fd;
     cellFsClose(&ctx);
+    CHECK((uint32_t)ctx.gpr[3] == 0, "cellFsClose returns CELL_OK");
+    memset(&ctx, 0, sizeof ctx); ctx.gpr[3] = fd;
+    cellFsClose(&ctx);
+    CHECK((uint32_t)ctx.gpr[3] == EBADF_RC, "closing it again is CELL_FS_EBADF (0x%08X)", (uint32_t)ctx.gpr[3]);
+    memset(&ctx, 0, sizeof ctx); ctx.gpr[3] = fd; ctx.gpr[4] = 0x2000; ctx.gpr[5] = 16; ctx.gpr[6] = 0x210;
+    cellFsRead(&ctx);
+    CHECK((uint32_t)ctx.gpr[3] == EBADF_RC, "reading a closed fd is CELL_FS_EBADF (0x%08X)", (uint32_t)ctx.gpr[3]);
     remove(host);
+
+    stress(dir);
     printf("%s (%d failed)\n", fails ? "FAIL" : "PASS", fails);
     return fails ? 1 : 0;
 }

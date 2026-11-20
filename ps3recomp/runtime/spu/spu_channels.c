@@ -25,6 +25,7 @@ extern volatile int g_ps3_host_paused; /* sys_ppu_thread.c: port pause */
 #include "spu_coherency.h" /* lock-line lock + PPU-write coherence bitmap */
 #include "spu_helpers.h"   /* spu_splat_u32 / spu_ls_read128 (SMC microstep) */
 #include "spu_lockstep.h"
+#include "spu_sched.h"     /* PORT_SPU_SCHED: CV re-poll interval of blocked reads */
 #include "spu_interp.h"    /* spu_lifted_fn / spu_lifted_lookup -- defined below */
 #include "ps3emu/ps3_ftrace.h"
 #include <stdint.h>
@@ -545,8 +546,11 @@ static DWORD WINAPI spu_phys_watch_thread(LPVOID p)
     static const uint32_t W[3] = { 0x400FB000u, 0x10328E00u, 0x10328E20u };
     uint32_t last[3][8] = {{0}};
     for (;;) {
-        if (!vm_base || !s_phys_ring) { Sleep(10); continue; }
-        for (int w = 0; w < 3; w++) {
+        /* PHYS_TRACE off: no ring, but keep serving the logs\\ftrace.now
+         * trigger (F7/F11 debug keys) at a 10 ms poll. */
+        const int watch = vm_base && s_phys_ring;
+        if (!watch) Sleep(10);
+        for (int w = 0; watch && w < 3; w++) {
             const volatile uint8_t* q = vm_base + W[w];
             uint32_t cur[8]; int diff = 0;
             for (int i = 0; i < 8; i++) {
@@ -567,32 +571,20 @@ static DWORD WINAPI spu_phys_watch_thread(LPVOID p)
          * exactly by spu_phys_atomic. PHYS_WATCH=spin restores the spin. */
         { static int spin_mode = -1;
           if (spin_mode < 0) { const char* w = getenv("PHYS_WATCH"); spin_mode = (w && !strcmp(w, "spin")) ? 1 : 0; }
-          if (spin_mode) { for (int i = 0; i < 32; i++) YieldProcessor(); } else Sleep(1); }
+          if (!watch) {} else if (spin_mode) { for (int i = 0; i < 32; i++) YieldProcessor(); } else Sleep(1); }
         /* logs\\ftrace.now -> record the frame timeline (ps3_ftrace) for the
          * next N seconds (file content, default 6) into logs/ftrace_reqK.txt.
-         * Needs PS3_FTRACE set (any far start, e.g. 99999:6:<path>) so the
-         * buffer exists; this only moves the window to "now". */
+         * Needs PS3_FTRACE set (a far start, e.g. 99999:6:<path>, keeps the
+         * recorder disarmed until this; ps3_ft_trigger allocates and arms;
+         * a trigger while a capture records or is written is logged, ignored). */
         { static unsigned fspin = 0;
-          if ((++fspin & 0x7Fu) == 0 && GetFileAttributesA("logs\\ftrace.now") != INVALID_FILE_ATTRIBUTES) {
+          if ((++fspin & (watch ? 0x7Fu : 0x0Fu)) == 0 && GetFileAttributesA("logs\\ftrace.now") != INVALID_FILE_ATTRIBUTES) {
               double secs = 6.0;
               { FILE* ff = fopen("logs\\ftrace.now", "r"); if (ff) { double v; if (fscanf(ff, "%lf", &v) == 1 && v > 0 && v < 120) secs = v; fclose(ff); } }
               MoveFileExA("logs\\ftrace.now", "logs\\ftrace.done", MOVEFILE_REPLACE_EXISTING);
-              ps3_ft_state* fs = &g_ps3_ft;
-              (void)ps3_ft_on();
-              if (!fs->buf) fprintf(stderr, "[ftrace] not armed -- set PS3_FTRACE=99999:6:<path>\n");
-              else {
-                  static int nreq = 0;
-                  if (__atomic_load_n(&fs->dumped, __ATOMIC_ACQUIRE)) {
-                      __atomic_store_n(&fs->n, 0u, __ATOMIC_RELEASE); fs->dropped = 0;
-                      memset(fs->us, 0, sizeof fs->us);
-                      __atomic_store_n(&fs->dumped, 0, __ATOMIC_RELEASE);
-                  }
-                  snprintf(fs->path, sizeof fs->path, "logs/ftrace_req%d.txt", ++nreq);
-                  const uint64_t now = ps3_ft_now();
-                  fs->start = now; fs->end = now + (uint64_t)(secs * 1e9);
-                  __atomic_store_n(&fs->on, 2, __ATOMIC_RELEASE);
-                  fprintf(stderr, "[ftrace] recording %.1f s now -> %s\n", secs, fs->path);
-              }
+              static int nreq = 0;
+              char fp[64]; snprintf(fp, sizeof fp, "logs/ftrace_req%d.txt", nreq + 1);
+              if (ps3_ft_trigger(secs, fp)) ++nreq;
           } }
         /* logs\\phys.now -> dump the trace now (renamed to phys.done) */
         { static unsigned spin = 0;
@@ -610,11 +602,16 @@ void spu_phys_trace(const spu_context* spu, uint32_t cmd, uint32_t lsa, uint32_t
 {
     static volatile int en = -1; static volatile LONG once = 0;
     if (en < 0 && InterlockedCompareExchange(&once, 1, 0) != 0) { while (en < 0) YieldProcessor(); }
-    if (en < 0) { const char* e = getenv("PHYS_TRACE"); int v = e ? atoi(e) : 1;
+    /* SPU_DMA_FAST (default on) turns the always-on trace off: every traced
+     * DMA paid a global InterlockedIncrement + QPC + a 64 MB ring write.
+     * PHYS_TRACE=1 restores it (ring dump on PHYS_ABANDON / logs\\phys.now). */
+    if (en < 0) { const char* e = getenv("PHYS_TRACE");
+                  const char* fe = getenv("SPU_DMA_FAST");
+                  int v = e ? atoi(e) : ((fe && fe[0] == '0') ? 1 : 0);
                   if (v) s_phys_ring = (spu_phys_ent*)calloc(SPU_PHYS_RING, sizeof(spu_phys_ent));
                   if (!s_phys_ring) v = 0;
                   const char* w = getenv("PHYS_WATCH");
-                  if (v && !(w && w[0] == '0')) CreateThread(NULL, 0, spu_phys_watch_thread, NULL, 0, NULL);
+                  if (!(w && w[0] == '0')) CreateThread(NULL, 0, spu_phys_watch_thread, NULL, 0, NULL);
                   en = v; }
     if (!en) return;
     LONG k = InterlockedIncrement(&s_phys_n) - 1;
@@ -1311,8 +1308,9 @@ static int yz_ch_block(void)
  *
  * Losing a reservation means the reserved line changed, and GETLLAR already
  * snapshots it, so compare against that snapshot rather than hooking every store.
- * ponytail: polled, not store-hooked -- one 128-byte memcmp per 10 ms poll on an
- * already-blocked SPU, and nothing at all on the PPU store path. The ceiling is
+ * ponytail: polled, not store-hooked -- one 128-byte memcmp per CV poll on an
+ * already-blocked SPU (every PORT_SPU_SCHED_MS, default 1 ms; 10 ms with
+ * PORT_SPU_SCHED=0), and nothing at all on the PPU store path. The ceiling is
  * one poll of wake latency, and an A-B-A write that restores the same bytes
  * between polls is missed; hook the writers if either ever matters.
  */
@@ -1381,6 +1379,74 @@ static void spu_ft_wait_span(spu_context* ctx, uint32_t channel, uint64_t t0)
     t_ft_busy0 = t1;
 }
 
+/* PORT_SPU_SCHED (spu_sched.h): re-poll lost-reservation waits every
+ * PORT_SPU_SCHED_MS instead of every 10 ms. s_sched_missed counts sleeps that
+ * timed out with the line already changed -- wakes no producer delivered. */
+static int s_sched_on = -1, s_sched_ms = 1;
+static volatile long long g_sched_lr_sleeps, g_sched_missed;
+static void spu_sched_init(void)
+{
+    s_sched_ms = spu_sched_parse_ms(getenv("PORT_SPU_SCHED_MS"));
+    const int on = spu_sched_parse_bool(getenv("PORT_SPU_SCHED"), 1);
+    fprintf(stderr, "[spu-sched] PORT_SPU_SCHED=%d (lost-reservation waits re-poll every %d ms, others %d ms)\n",
+            on, on ? s_sched_ms : SPU_SCHED_SLOW_MS, SPU_SCHED_SLOW_MS);
+    s_sched_on = on;
+}
+/* Effective state for the [native] line (project/main.cpp). */
+int spu_sched_effective(void)
+{
+    if (s_sched_on < 0) spu_sched_init();
+    return s_sched_on;
+}
+/* Every ~10 s (R2/R3 print it beside their [spuwait] line). */
+static void spu_sched_report(void)
+{
+    static volatile long long s_next;
+    const long long now = (long long)GetTickCount64();
+    if (now < s_next) return;
+    const long long prev = s_next;
+    if (_InterlockedCompareExchange64((volatile long long*)&s_next, now + 10000, prev) != prev) return;
+    if (!prev) return;   /* first call only arms the timer */
+    static long long l_ls, l_ms;
+    const long long ls = g_sched_lr_sleeps, ms = g_sched_missed;
+    if (ls != l_ls)
+        fprintf(stderr, "[spu-sched] 10s: lost-reservation sleeps=%lld missed wakes=%lld (caught by the %d ms re-poll)\n",
+                ls - l_ls, ms - l_ms, s_sched_on > 0 ? s_sched_ms : SPU_SCHED_SLOW_MS);
+    l_ls = ls; l_ms = ms;
+}
+
+/* PORT_SPU_SPIN_ADAPT=<pct> (default 25; 0 = spin on every wait as before):
+ * adaptive pre-sleep spin, adapted from the inFAMOUS 2 PC port
+ * (PS3_SPU_SPIN_ADAPT, spu_channels.c, MIT -- THIRD_PARTY_NOTICES.md). Each SPU
+ * host thread keeps a running estimate (of 1024) of how often its spins end
+ * with the channel ready, and skips the spin while that is below <pct> percent:
+ * an SPU that mostly sits idle (menus, a paused game, a sleeping sound engine)
+ * stops burning its spin window on every wait -- on a 4-core CPU that window
+ * is a core the main thread needs. Every 8th skipped wait spins anyway to
+ * re-measure, so a thread whose waits turn short again gets its spin back. */
+static int s_spin_adapt = -1;                 /* threshold of 1024; 0 = off */
+static SPU_THREAD_LOCAL int t_spin_p = 1024;  /* starts optimistic */
+static SPU_THREAD_LOCAL unsigned t_spin_skip;
+static int spu_spin_adapt_init(void)
+{
+    const char* e = getenv("PORT_SPU_SPIN_ADAPT");
+    int pct = (e && *e) ? atoi(e) : 25;
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    s_spin_adapt = pct * 1024 / 100;
+    fprintf(stderr, "[spuwait] adaptive spin %s (PORT_SPU_SPIN_ADAPT=%d%%)\n",
+            pct ? "on: skip the spin while fewer waits end in it" : "off", pct);
+    return s_spin_adapt;
+}
+/* 1 = skip this wait's spin. */
+static inline int spu_spin_gate(void)
+{
+    const int thr = s_spin_adapt < 0 ? spu_spin_adapt_init() : s_spin_adapt;
+    if (!thr || t_spin_p >= thr) return 0;
+    return (++t_spin_skip & 7u) != 0;
+}
+static inline void spu_spin_note(int hit) { t_spin_p += ((hit ? 1024 : 0) - t_spin_p) / 8; }
+
 /* Block the calling SPU host thread until `channel` is readable. */
 static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
 {
@@ -1409,7 +1475,15 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
         static int s_spin_us = -1, s_spin_all = -1, s_low = 0, s_fw = 1;
         static LARGE_INTEGER s_qf;
         if (s_spin_us < 0) {
+            /* Low-core no-spin profile (ps3_host_nospin, sys_ppu_thread.c;
+             * PORT_NOSPIN, default on; auto = below 12 logical CPUs): with
+             * SPU_WAIT_SPIN_US / SPU_WAIT_YIELD unset, spin 20 us
+             * (PORT_SPU_SPINWAIT_US) with pauses only, then park on the CV
+             * below -- the R2/R3 PORT_SPU_SPINWAIT=wait behaviour. */
+            extern int ps3_host_nospin(void);
+            const int ns = ps3_host_nospin();
             const char* e = getenv("SPU_WAIT_SPIN_US"); int v = e ? atoi(e) : 100;
+            if (!e && ns) { const char* u = getenv("PORT_SPU_SPINWAIT_US"); v = u && *u ? atoi(u) : 20; }
             const char* a = getenv("SPU_WAIT_SPIN_ALL"); s_spin_all = a ? atoi(a) : 0;
             const char* f = getenv("SPU_FAST_WAIT"); s_fw = f ? atoi(f) != 0 : 1;
             /* Low-core CPUs (< 8 logical): the producer this SPU waits on may
@@ -1418,11 +1492,12 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
              * SPU_WAIT_YIELD=0/1 forces it off/on. */
             SYSTEM_INFO si; GetSystemInfo(&si);
             const char* y = getenv("SPU_WAIT_YIELD");
-            s_low = y ? atoi(y) != 0 : si.dwNumberOfProcessors < 8;
+            s_low = y ? atoi(y) != 0 : (!ns && si.dwNumberOfProcessors < 8);
             QueryPerformanceFrequency(&s_qf);
             s_spin_us = v < 0 ? 0 : v;
+            if (ns) fprintf(stderr, "[spuwait] nospin: spin %d us (pauses%s), then park\n", s_spin_us, s_low ? " + yields" : " only");
         }
-        if (s_spin_us > 0 && (s_spin_all || ctx->spu_id < 8u)) {
+        if (s_spin_us > 0 && (s_spin_all || ctx->spu_id < 8u) && !spu_spin_gate()) {
             /* SPU_FAST_WAIT (default on, from the Resistance 2 port): poll the
              * predicate every 4 pauses instead of 24 (wake latency) and read
              * the clock every 16th poll instead of every one --
@@ -1432,24 +1507,39 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
             const unsigned clk_mask = s_fw ? 15u : 0u;
             LARGE_INTEGER q0, q; QueryPerformanceCounter(&q0);
             const LONGLONG lim = s_qf.QuadPart * s_spin_us / 1000000;
+            int ok = 0;
             for (unsigned it = 1;; it++) {
                 MemoryBarrier();
-                if (spu_ch_ready(ctx, channel)) break;
+                if (spu_ch_ready(ctx, channel)) { ok = 1; break; }
                 for (int k = 0; k < pauses; k++) YieldProcessor();
                 if (s_low) SwitchToThread();
                 if (it & clk_mask) continue;
                 QueryPerformanceCounter(&q);
                 if (q.QuadPart - q0.QuadPart >= lim) break;
             }
+            spu_spin_note(ok);
         }
     }
     {
         unsigned long long start = GetTickCount64(), next_hb = 2000;
+        spu_sched_report();
         while (!spu_ch_ready(ctx, channel)) {
             AcquireSRWLockExclusive((SRWLOCK*)&ctx->ch_wait_lock);
-            if (!spu_ch_ready(ctx, channel))
-                SleepConditionVariableSRW((CONDITION_VARIABLE*)&ctx->ch_wait_cv,
-                                          (SRWLOCK*)&ctx->ch_wait_lock, 10, 0);
+            if (!spu_ch_ready(ctx, channel)) {
+                if (s_sched_on < 0) spu_sched_init();
+                const int lr = channel == SPU_RdEventStat && (ctx->event_mask & SPU_SCHED_LR_EVENT) && ctx->resv_valid;
+                const DWORD ms = spu_sched_wait_ms(s_sched_on, s_sched_ms, channel == SPU_RdEventStat,
+                                                   ctx->event_mask, ctx->resv_valid);
+                if (lr) _InterlockedIncrement64((volatile long long*)&g_sched_lr_sleeps);
+                if (!SleepConditionVariableSRW((CONDITION_VARIABLE*)&ctx->ch_wait_cv,
+                                               (SRWLOCK*)&ctx->ch_wait_lock, ms, 0) &&
+                    lr && ctx->resv_valid) {
+                    /* timed out with the reservation still armed: a changed
+                     * line now is a write that never called spu_ch_wake */
+                    spu_resv_lost_poll(ctx);
+                    if (!ctx->resv_valid) _InterlockedIncrement64((volatile long long*)&g_sched_missed);
+                }
+            }
             ReleaseSRWLockExclusive((SRWLOCK*)&ctx->ch_wait_lock);
             /* Resistance port: the PPU stopped this raw SPU (spu_raw.c). */
             { extern int spu_raw_stop_requested(const spu_context*);

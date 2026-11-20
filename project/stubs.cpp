@@ -10,6 +10,7 @@
  * no lifted PRX and no overrides needs.
  */
 
+#include "../ps3recomp/libs/video/rsx_featcov.h"   /* rsx_featcov_dump at exit */
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -20,6 +21,7 @@
 
 #include "ps3emu/ps3types.h"
 #include "ps3emu/error_codes.h"
+#include "ps3emu/port_pc_extras.h"   /* Nintendo prompt names */
 
 /* ---------------------------------------------------------------------------
  * PRX loading
@@ -48,6 +50,7 @@
 #include <string>
 
 extern "C" uint8_t* vm_base;
+extern "C" int rsx_pso_cache_save(void);   /* ps3recomp/libs/video/rsx_pso_cache.c */
 extern "C" void ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context*));
 
 static std::string guest_str(uint32_t ea)
@@ -107,6 +110,8 @@ static void hle_game_process_exitspawn(ppu_context* ctx)
         target_elf = root + "\\game\\EBOOT.elf";
     } else {
         fprintf(stderr, "[exitspawn] no executable for \"%s\" -- exiting\n", path.c_str());
+        rsx_featcov_dump("exit");   /* [featcov] ExitProcess skips atexit */
+        rsx_pso_cache_save();
         fflush(stderr); ExitProcess(0);
     }
     {   /* both programs in one folder (a side-by-side test build such as build_feat\): use the sibling */
@@ -149,6 +154,9 @@ static void hle_game_process_exitspawn(ppu_context* ctx)
           SetEnvironmentVariableA(p.first.c_str(), p.second.c_str());
           fprintf(stderr, "[exitspawn] child env %s=%s\n", p.first.c_str(), p.second.c_str());
       } }
+    /* this program's pipeline library (RSX_PSO_LIBRARY, rsx_pso_cache.c), before the child starts: the same
+     * program spawned again would open the file and the rename over it would fail */
+    rsx_pso_cache_save();
     std::string cmd = "\"" + target_exe + "\" \"" + target_elf + "\"";
     STARTUPINFOA si; PROCESS_INFORMATION pi;
     ZeroMemory(&si, sizeof si); si.cb = sizeof si;
@@ -169,6 +177,7 @@ static void hle_game_process_exitspawn(ppu_context* ctx)
         fprintf(stderr, "[exitspawn] FAILED to start %s (error %lu)\n", target_exe.c_str(), GetLastError());
         fflush(stderr);
     }
+    rsx_featcov_dump("exit");
     ExitProcess(0);
 #else
     exit(0);
@@ -399,6 +408,13 @@ static void rfom_fps_init(void)
     if (m < 0) fprintf(stderr, "[fps] RFOM_FPS=orig: the game's own pacing (33 fps, 1/30 steps)\n");
     else fprintf(stderr, "[fps] target %d fps: min step %.5f s, max step %s%s\n", m, (double)s_rf_min,
                  mx > 0.0f ? "raised to " : "the game's", mx > 0.0f ? x : "");
+    /* Default stays 60. R2/R3 show stick / jump-to-move faults above ~75 fps
+     * (fixed-step code fed variable steps); R1 has had frame-count-timed code
+     * misbehave at high rates too (v170 scripted walks, v174 menu dimming). */
+    if (m > 75) {
+        fprintf(stderr, "[fps] WARNING: frame cap %d fps is above 75 -- the game simulates in steps designed for 30 fps; "
+                        "movement, scripted sequences or menus may misbehave. RFOM_FPS=60 is the tested default.\n", m);
+    }
 }
 /* v170: scripted player sequences (a chapter's opening walk: input locked,
  * the game walks and turns the player) are timed in frames, and at high frame
@@ -442,6 +458,7 @@ extern "C" void rfx_frame_tick(void);    /* rfom_pcextra.cpp: benchmark frame ti
 extern "C" void rfom_reflex_sim_end(void);     /* rfom_reflex.cpp: NVIDIA Reflex markers + sleep */
 extern "C" void rfom_reflex_sim_start(void);
 static int rfom_frame_wait_impl(uint64_t target, uint32_t last_ea);
+#include "port_hitchcatch.h"   /* PORT_HITCHCATCH=<ms>: stacks of the key threads on a hitch */
 /* NVIDIA Reflex (RFOM_REFLEX): SIMULATION_END on entry; after the limiter's
  * wait, NvAPI_D3D_Sleep and SIMULATION_START of the next frame. Reflex never
  * paces the game by itself -- its sleep follows this limiter. */
@@ -449,6 +466,7 @@ extern "C" int rfom_frame_wait(uint64_t target, uint32_t last_ea)
 {
     rfom_reflex_sim_end();
     const int r = rfom_frame_wait_impl(target, last_ea);
+    port_hitchcatch_frame(-1, 0);   /* frame numbers / pauses: hitchcatch counts and watches g_ps3_host_paused */
     rfom_reflex_sim_start();
     return r;
 }
@@ -504,6 +522,25 @@ static int rfom_frame_wait_impl(uint64_t target, uint32_t last_ea)
         const double rem_us = (double)(target - el) / 79.8;
         ppu_gcm_pump();                       /* the usleep loop pumped vblank/flip work */
 #ifdef _WIN32
+        /* RFOM_LIMITER_TIMER (default 1): sleep on a high-resolution waitable
+         * timer to ~0.5 ms before the deadline, then spin the rest. The old
+         * ladder (Sleep(ms-1) above 2.6 ms, SwitchToThread below) burned up
+         * to ~2.6 ms of a core per frame and woke late when Sleep's 1 ms
+         * granularity rounded up. 0 = the old ladder. */
+        static int tmode = -1; static HANDLE tmr = NULL;
+        if (tmode < 0) {
+            const char* e = getenv("RFOM_LIMITER_TIMER");
+            tmode = (e && e[0] == '0') ? 0 : 1;
+            if (tmode) {
+                tmr = CreateWaitableTimerExW(NULL, NULL, 0x00000002u /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */,
+                                             TIMER_ALL_ACCESS);
+                if (!tmr) tmode = 0;
+            }
+        }
+        if (tmode && rem_us > 700.0) {
+            LARGE_INTEGER due; due.QuadPart = -(LONGLONG)((rem_us - 500.0) * 10.0);   /* 100 ns units, relative */
+            if (SetWaitableTimer(tmr, &due, 0, NULL, NULL, FALSE)) { WaitForSingleObject(tmr, INFINITE); continue; }
+        }
         if (rem_us > 2600.0) Sleep((DWORD)(rem_us / 1000.0) - 1u);
         else if (rem_us > 150.0) SwitchToThread();
         else YieldProcessor();
@@ -540,6 +577,7 @@ static int rfom_frame_wait_impl(uint64_t target, uint32_t last_ea)
  * the widening tapers off below 82 so zoomed views keep their zoom and the
  * zoom-in animation stays smooth. 0 / unset = the original. */
 #include <cmath>
+#include "rfom_aspect.h"
 static volatile double g_rfom_game_fov = 82.0;   /* last FOV the game set (degrees, before widening) */
 extern "C" volatile double g_rfom_view_fov;   /* v190e: cellPad.c scope mode reads the player's FOV */
 static volatile double s_rfom_fov_live = -1.0;   /* the PC menu's FOV (degrees); -1 = RFOM_FOV */
@@ -551,8 +589,15 @@ extern "C" void rfom_fov_set_live(double deg) { s_rfom_fov_live = deg > 0.0 ? de
  * FOV stays and the sides open up (narrower targets, e.g. 16:10, keep the
  * horizontal FOV and gain height). The game's own culling follows the frustum.
  * The guest frame stays 16:9 in pixels; the D3D12 present stretches it to the
- * target aspect (g_rsx_aspect_mul) while such a camera was set in the last
- * 500 ms, so movies and 2D screens keep their 16:9 letterbox.
+ * target aspect (g_rsx_aspect_mul), the same for every 16:9 camera: aiming down
+ * sights uses its own (plain 16:9) camera, and deciding per camera flipped the
+ * picture to 16:9 (GitHub issue #2); it is widened like the gameplay one and
+ * refreshes the stretch too (rfom_aspect.h). The stretch is shown while such a
+ * camera was set within RFOM_ASPECT_HOLD ms (default 2000; 0 = no timeout), so
+ * loading screens, 2D briefing / stats screens and menus, which set no 3D camera,
+ * go back to their 16:9 letterbox; it ends at once when the target aspect has been
+ * 16:9 for RFOM_ASPECT_OFF_MS (default 1000), and pauses while a movie plays
+ * (flip mode 2), so movies keep their 16:9 letterbox.
  *   RFOM_ASPECT=auto (default): the game window's aspect | off | 21:9 | 32:9 | 2.39 ...
  * The hook passes the aspect as a NEGATIVE argument to rfom_fov_adjust (the
  * only per-call port function the lifted code declares there): it returns the
@@ -562,6 +607,7 @@ extern "C" volatile unsigned long long g_rsx_aspect_ms;
 static double rfom_fov_adjust_base(double f);
 static thread_local double tl_hp = 1.0;
 static thread_local int tl_hp_lod = 0;
+static thread_local double tl_hp_aspect = 0.0;   /* the 16:9 aspect a Hor+ camera stood for (LOD fix) */
 static double rfom_target_aspect(void)
 {
     static int mode = -1;          /* 0 off, 1 auto, 2 fixed */
@@ -604,15 +650,32 @@ extern "C" double rfom_fov_adjust(double f)
     if (f < 0.0) {                 /* aspect query from the camera setter hook (see above) */
         const double a = -f, t = rfom_target_aspect();
         tl_hp = 1.0; tl_hp_lod = 0;
-        if (t > 0.0 && a > 1.70 && a < 1.86 && fabs(t / a - 1.0) > 0.01) {
-            tl_hp = t / a; tl_hp_lod = 1;
-            g_rsx_aspect_mul = (float)(t / a);
+        /* rfom_aspect.h: every 16:9 camera (gameplay, ADS, scopes) is widened alike, and the present
+         * stretch follows the target aspect, not the camera asked about (ADS flipped it, issue #2).
+         * It ends only once the target has been 16:9 for RFOM_ASPECT_OFF_MS (default 1000) and 3 calls. */
+        static rfom_aspect_state st = { 0, 1.0f, 0, 0 };
+        static int off_ms = -1;
+        if (off_ms < 0) { const char* e = getenv("RFOM_ASPECT_OFF_MS"); off_ms = e ? atoi(e) : 1000; if (off_ms < 0) off_ms = 0; }
+        static SRWLOCK lk = SRWLOCK_INIT;   /* camera setters run on more than one thread */
+        AcquireSRWLockExclusive(&lk);
+        const int was = st.on;
+        double base = 0.0;
+        const double w = rfom_aspect_note(&st, a, t, GetTickCount64(), (unsigned)off_ms, 3, &base);
+        const int on = st.on; const float mul = st.mul;
+        ReleaseSRWLockExclusive(&lk);
+        if (w != 1.0) {
+            tl_hp = w; tl_hp_lod = 1; tl_hp_aspect = base;
+            g_rsx_aspect_mul = mul;
             g_rsx_aspect_ms = GetTickCount64();
-            { static ULONGLONG t0 = 0; static unsigned n = 0; static int said = 0;   /* once: how often (should be every frame) */
+            { static ULONGLONG t0 = 0; static unsigned n = 0; static int said = 0;   /* once: how often */
               if (said < 2) { if (!t0) t0 = g_rsx_aspect_ms; n++;
-                  if (!said) { said = 1; fprintf(stderr, "[aspect] Hor+: 16:9 camera (aspect %.3f) -> %.3f, horizontal FOV tan x%.3f%c", a, t, t / a, 10); }
+                  if (!said) { said = 1; fprintf(stderr, "[aspect] Hor+: 16:9 camera (aspect %.3f) -> %.3f, horizontal FOV tan x%.3f%c", a, t, w, 10); }
                   else if (g_rsx_aspect_ms - t0 >= 5000) { said = 2; fprintf(stderr, "[aspect] Hor+ camera set %.1f times/s%c", n * 1000.0 / (double)(g_rsx_aspect_ms - t0), 10); } } }
             return -t;
+        }
+        if (was && !on) {   /* the target is back at 16:9: the present stops stretching */
+            g_rsx_aspect_ms = 0; g_rsx_aspect_mul = 1.0f;
+            fprintf(stderr, "[aspect] Hor+ off (target aspect %.3f for %d ms)%c", t, off_ms, 10);
         }
         return f;
     }
@@ -677,10 +740,30 @@ extern "C" void rfom_fov_note(uint32_t cam, double f)
  * looked smaller and switched to far LODs (York's hex windows turned into a
  * glowing blue proxy). After the setter runs, put them back to the values the
  * UNwidened FOV gives; the projection and frustum keep the wide view. */
+/* The view camera's real near / far / vertical FOV (the projection actually
+ * used, read back right after the setter func_000B674C wrote them: +0x0 near,
+ * +0x4 far, +0x14 vertical FOV in radians) for the FSR upscaler / frame
+ * generation, which otherwise ran on placeholder 0.1 / 1000 / 1.0. 0 = none yet. */
+extern "C" volatile float g_rfom_cam_near, g_rfom_cam_far, g_rfom_cam_vfov;   /* rsx_d3d12_backend.c (rsx_fsr.inc) */
+static void rfom_cam_capture(uint32_t cam)
+{
+    if (s_rfom_view_cam && cam != s_rfom_view_cam) return;
+    const uint32_t nb = vm_read32(cam + 0x0), fb = vm_read32(cam + 0x4), vb = vm_read32(cam + 0x14);
+    float n, fr, v; memcpy(&n, &nb, 4); memcpy(&fr, &fb, 4); memcpy(&v, &vb, 4);
+    if (!(n > 1e-4f && fr > n * 1.01f && fr < 1e7f && v > 0.05f && v < 3.0f)) return;
+    if (n != g_rfom_cam_near || fr != g_rfom_cam_far) {
+        static int said = 0;
+        if (said < 4) { said++; fprintf(stderr, "[camera] view camera near %.3f far %.1f vfov %.1f deg (FSR camera)%c",
+                                        (double)n, (double)fr, (double)v * 57.29578, 10); }
+    }
+    g_rfom_cam_near = n; g_rfom_cam_far = fr; g_rfom_cam_vfov = v;
+}
 extern "C" void rfom_fov_lod_fix(uint32_t cam, double f, double aspect)
 {
+    if (cam) rfom_cam_capture(cam);   /* before +0x14 is put back to the unwidened value below */
     if (!cam || !(aspect > 0.1)) return;
     const int hp = tl_hp_lod; tl_hp_lod = 0;
+    if (hp && tl_hp_aspect > 0.1) aspect = tl_hp_aspect;
     if (!hp && fabs(rfom_fov_adjust(f) - f) < 1e-9) return;   /* not widened */
     const double d2r = 3.14159265358979323846 / 180.0;
     const double t = tan(f * 0.5 * d2r);
@@ -804,6 +887,36 @@ extern "C" jmp_buf* rfom_jb_arm(ppu_context* ctx)
     e->depth = *ps3_ppu_dispatch_depth_slot(); e->vsp = *ps3_ppu_vcall_sp_slot();
     return &e->env;
 }
+/* The Lua error the longjmp carries. The only setjmp site is luaD_rawrunprotected (both ELFs: L
+ * stored at sp+0x2E0 as a doubleword); the error object is at L->top - 1 (Lua 5.0, 32-bit: L->top at
+ * +8, TObject {int tt; Value} = 8 bytes, TString len at +12, data at +16). Read under SEH: a guess
+ * that is wrong must not take the game down. */
+static uint32_t jb_be32(uint32_t ea)
+{
+    const uint8_t* q = vm_base + ea;
+    return (uint32_t)q[0] << 24 | (uint32_t)q[1] << 16 | (uint32_t)q[2] << 8 | q[3];
+}
+static int jb_lua_error(uint32_t sp, char* out, int cap)
+{
+    out[0] = 0;
+    if (!vm_base) return 0;
+    __try {
+        const uint32_t L = jb_be32(sp + 0x2E4), top = L ? jb_be32(L + 8) : 0;
+        if (!L || top < 8 || jb_be32(top - 8) != 4 /* LUA_TSTRING */) return 0;
+        const uint32_t ts = jb_be32(top - 4), len = ts ? jb_be32(ts + 12) : 0;
+        if (!ts || !len || len > 4096) return 0;
+        int n = 0;
+        for (uint32_t i = 0; i < len && n < cap - 1; i++) {
+            const uint8_t c = vm_base[ts + 16 + i];
+            out[n++] = (c >= 32 && c < 127) ? (char)c : ' ';
+        }
+        out[n] = 0;
+        return n;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        out[0] = 0;
+        return 0;
+    }
+}
 extern "C" void rfom_jb_landed(ppu_context* ctx)
 {
     if (t_jb_land >= 0 && t_jb_land < t_jb_n) {
@@ -812,9 +925,15 @@ extern "C" void rfom_jb_landed(ppu_context* ctx)
     }
     t_jb_land = -1;
     static volatile LONG n = 0;
-    if (InterlockedIncrement(&n) <= 8)
-        fprintf(stderr, "[setjmp] guest longjmp landed (r3=%llu lr=0x%08llX sp=0x%08llX) -- script error handled%c",
-                (unsigned long long)ctx->gpr[3], (unsigned long long)ctx->lr, (unsigned long long)ctx->gpr[1], 10);
+    const LONG k = InterlockedIncrement(&n);
+    if (k <= 48) {
+        char msg[200];
+        jb_lua_error((uint32_t)ctx->gpr[1], msg, sizeof msg);
+        fprintf(stderr, "[setjmp] guest longjmp landed (r3=%llu lr=0x%08llX sp=0x%08llX) -- script error handled%s%s%s%c",
+                (unsigned long long)ctx->gpr[3], (unsigned long long)ctx->lr, (unsigned long long)ctx->gpr[1],
+                msg[0] ? ": \"" : "", msg, msg[0] ? "\"" : "", 10);
+        if (k == 48) fprintf(stderr, "[setjmp] (no more script error lines)%c", 10);
+    }
 }
 extern "C" void rfom_jb_jump(ppu_context* ctx, uint32_t buf_ea)
 {
@@ -906,6 +1025,148 @@ static void ml_opts_watch(uint32_t player)
 extern "C" volatile unsigned long long g_rfom_play_ms;
 extern "C" volatile int g_rfom_pause_ui;
 extern "C" volatile int g_rfom_space_start;
+/* Issue #14: hooked into three vehicle input functions (game.json), at the
+ * point each reads the driver's pad slot. Identified by what they read:
+ *   kind 0  func_00438600 @0x438918  LU-P Lynx: throttle / brake from buttons
+ *           (R2 / L2), steering from the sticks -- the only one used.
+ *   kind 1  func_0043E4D0 @0x43E528  drives from the left stick only.
+ *   kind 2  func_0044CCD8 @0x44CF7C  tank type: left stick drive + right stick
+ *           turret (the mouse slews it, #9) -- W/S/A/D must stay as they are.
+ * While kind 0 keeps firing for the keyboard player, cellPad.c lets W/S/A/D
+ * drive (kbm_drive.h). In split screen only the mouse player's controller
+ * counts (g_rfom_opts_ea, as in rfom_use_begin). */
+extern "C" volatile unsigned long long g_rfom_drive_ms;
+extern "C" volatile uint32_t g_rfom_opts_ea;
+extern "C" void rfom_drive_note(uint32_t hero, int kind)
+{
+    if (!hero || hero >= 0xF0000000u) return;
+    static int logged[3];
+    if (kind >= 0 && kind < 3 && !logged[kind]) { logged[kind] = 1;
+        fprintf(stderr, "[drive] vehicle input kind %d running (hero 0x%08X)%s\n", kind, hero, kind ? "" : ": W/S/A/D drive"); }
+    if (kind != 0) return;
+    const uint32_t ctrl = vm_read32(hero + 0x3E90);
+    if (!ctrl || ctrl >= 0xF0000000u) return;
+    if (g_rfom_opts_ea && vm_read32(ctrl + 0x1AC0) != g_rfom_opts_ea) return;
+    g_rfom_drive_ms = GetTickCount64();
+}
+/* R1 tank turret with the mouse. The tank input code (kind 2, func_0044CCD8)
+ * turns the turret through a slew rate at [tank+0x4EC] (rad/s): right stick X
+ * accelerates it at 1.8 rad/s^2 up to 0.9 rad/s x deflection, and it brakes at
+ * 4 rad/s^2 when let go. Then func_0044A3C4 stops it on a collision and
+ * 0x44E428 integrates it (rate x frame time) into the turret angles. A mouse
+ * flick was a short stick deflection, so it barely turned the turret.
+ *  rfom_tank_mouse_pre (0x44D2D8, before the rate code): for the keyboard/mouse
+ *    driver, hides the stick X from the rate code, and takes back the rate set
+ *    on the previous frame.
+ *  rfom_tank_mouse_apply (0x44D3A8, after it): sets the rate to this frame's
+ *    mouse angle / frame time, so the game's own collision check and
+ *    integration turn the turret by exactly that angle.
+ * The angle is the on-foot look's (mouse_degrees_per_count x mouse_sensitivity
+ * x the game's sensitivity) x mouse_tank_sensitivity (controls.txt). Its
+ * direction follows the stick's: until a mouse move shows how the game reads
+ * the stick the mouse feeds, the stick turns the turret as before.
+ * RFOM_TANK_MOUSE=0: the old stick behaviour. */
+static int s_tank_en = -1, s_tank_dir = 0, s_tank_dir_ok = 0, s_tank_dir_bad = 0;
+static uint32_t s_tank_obj = 0, s_tank_act = 0, s_tank_inj_obj = 0, s_tank_inj = 0;
+static ULONGLONG s_tank_ms = 0, s_tank_apply_ms = 0;
+static double s_tank_sens = 1.0, s_tank_carry = 0.0;
+static int ml_coop_recent(void);
+static double tank_sens_load(void)
+{
+    double s = 1.0;
+    FILE* f = fopen("controls.txt", "r");
+    if (f) { char l[256];
+        while (fgets(l, sizeof l, f)) {
+            if (char* h = strchr(l, '#')) *h = 0;
+            char* eq = strchr(l, '='); if (!eq) continue;
+            *eq = 0; char k[64]; double v;
+            if (sscanf(l, " %63s", k) == 1 && !_stricmp(k, "mouse_tank_sensitivity") &&
+                sscanf(eq + 1, " %lf", &v) == 1 && v >= 0.05 && v <= 10.0) s = v;
+        }
+        fclose(f); }
+    return s;
+}
+/* the mouse turns the turret of this tank this frame (and the frame just before) */
+static int tank_mouse_owns(uint32_t tank) { return tank && tank == s_tank_obj && GetTickCount64() - s_tank_ms < 200; }
+extern "C" int rfom_tank_mouse_pre(uint32_t tank, uint32_t hero, double rx)
+{
+    if (s_tank_inj_obj == tank && s_tank_inj) {
+        const uint32_t cur = vm_read32(tank + 0x4EC);
+        if (cur == s_tank_inj) vm_write32(tank + 0x4EC, 0);
+        else if (!cur) s_tank_carry = 0.0;   /* stopped by a collision: drop what is left */
+        s_tank_inj = 0; s_tank_inj_obj = 0;
+    }
+    if (s_tank_act == tank) s_tank_act = 0;
+    if (s_tank_en < 0) { const char* e = getenv("RFOM_TANK_MOUSE"); s_tank_en = (e && atoi(e) == 0) ? 0 : 1;
+        if (!s_tank_en) fprintf(stderr, "[tank] mouse turret mode off (RFOM_TANK_MOUSE=0): the mouse slews it like the stick\n"); }
+    if (!s_tank_en || !g_ml_mode || !hero || hero >= 0xF0000000u || !g_kbm_capture || !ml_stick_is_mouse()) return 0;
+    const uint32_t ctrl = vm_read32(hero + 0x3E90);
+    if (!ctrl || ctrl >= 0xF0000000u) return 0;
+    if (g_rfom_opts_ea && vm_read32(ctrl + 0x1AC0) != g_rfom_opts_ea) return 0;   /* split screen: not the mouse player */
+    /* split screen before the mouse player is known (g_rfom_opts_ea not set yet): leave it to the stick */
+    { static struct { uint32_t h; ULONGLONG ms; } th[4]; static int coop = 0;
+      const ULONGLONG t = GetTickCount64(); int me = -1, old = 0, other = 0;
+      for (int i = 0; i < 4; i++) {
+          if (th[i].h == hero) me = i;
+          else if (th[i].h && t - th[i].ms < 1000) other = 1;
+          if (th[i].ms < th[old].ms) old = i;
+      }
+      if (me < 0) { me = old; th[me].h = hero; }
+      th[me].ms = t;
+      if (g_rfom_opts_ea) coop = 0;
+      else if (other || ml_coop_recent()) coop = 1;   /* stays on until the mouse player is known */
+      if (coop) return 0; }
+    /* stick direction: the deflection the mouse fed vs what the game read */
+    const int fed = g_ml_fed_rx;
+    if ((fed >= 48 || fed <= -48) && (rx > 0.01 || rx < -0.01)) {
+        const int s = ((fed > 0) == (rx > 0)) ? 1 : -1;
+        if (!s_tank_dir) { if (s_tank_dir_ok * s >= 0) s_tank_dir_ok += s; else s_tank_dir_ok = s;
+                           if (s_tank_dir_ok >= 2 || s_tank_dir_ok <= -2) s_tank_dir = s; }
+        else if (s == s_tank_dir) s_tank_dir_bad = 0;
+        else if (++s_tank_dir_bad >= 15) { s_tank_dir = s; s_tank_dir_bad = 0;
+            fprintf(stderr, "[tank] mouse turret direction now %d (following the stick)\n", s); }
+    }
+    if (!s_tank_dir) return 0;
+    const ULONGLONG now = GetTickCount64();
+    if (tank != s_tank_obj || now - s_tank_ms > 1000) {
+        s_tank_sens = tank_sens_load(); s_tank_carry = 0.0;
+        static int n = 0;
+        if (n++ < 20) fprintf(stderr, "[tank] mouse turret mode on (tank 0x%08X): %.4f deg/count x game sensitivity x %.2f (mouse_tank_sensitivity), direction %d\n",
+                              tank, (double)g_ml_deg_per_count, s_tank_sens, s_tank_dir);
+    }
+    s_tank_obj = tank; s_tank_ms = now; s_tank_act = tank;
+    return 1;
+}
+extern "C" void rfom_tank_mouse_apply(uint32_t tank, uint32_t hero, uint32_t toc)
+{
+    if (!tank || s_tank_act != tank || !hero) return;
+    const ULONGLONG now = GetTickCount64();
+    long dx = InterlockedExchange(&g_kbm_ml_dx, 0);
+    /* counts from while the tank code was not running (pause, menus, cutscenes) are dropped */
+    if (now - s_tank_apply_ms > 150) { dx = 0; s_tank_carry = 0.0; }
+    s_tank_apply_ms = now;
+    /* frame time as the game integrates the rate (func_001EAE48): [timer+4] x [[tank+0x24]+0xD0] */
+    const uint32_t timer = vm_read32(toc - 0x7F3Cu), body = vm_read32(tank + 0x24);
+    const double ft = (timer && body) ? (double)ml_rdf(timer + 4) * (double)ml_rdf(body + 0xD0) : 0.0;
+    if (!(ft > 1e-5 && ft < 0.5)) { s_tank_carry = 0.0; return; }
+    double gs = 1.0;   /* the game's controller sensitivity, as in rfom_mouselook */
+    { const uint32_t ctrl = vm_read32(hero + 0x3E90);
+      const uint32_t o = ctrl ? vm_read32(ctrl + 0x1AC0) : 0;
+      if (o) { float sv = ml_rdf(o + 68); if (sv == sv) { if (sv < 0) sv = 0; if (sv > 1) sv = 1; gs = 0.5 + sv; } } }
+    const float acc = ml_rdf(toc - 0x7DB8u);   /* the stick's acceleration (1.8): its sign is the turn direction per + deflection */
+    const double sgn = (double)s_tank_dir * (acc < 0.0f ? -1.0 : 1.0);
+    double a = s_tank_carry + sgn * (double)dx * g_ml_deg_per_count * gs * s_tank_sens * (3.14159265358979323846 / 180.0);
+    if (!(a == a)) a = 0.0;
+    const double lim = 0.6;   /* rad per frame at most; the rest follows on the next frames */
+    const double step = a > lim ? lim : a < -lim ? -lim : a;
+    s_tank_carry = a - step;
+    if (s_tank_carry > 3.2) s_tank_carry = 3.2; else if (s_tank_carry < -3.2) s_tank_carry = -3.2;
+    if (step == 0.0) return;
+    const float rate = (float)(step / ft);
+    uint32_t w; memcpy(&w, &rate, 4);
+    vm_write32(tank + 0x4EC, w);
+    s_tank_inj = w; s_tank_inj_obj = tank;
+}
 /* ---------------------------------------------------------------------------
  * Resistance port (v168): falling-through-the-floor detector + rescue key.
  * Player object (the pointer rfom_mouselook gets), found from a 30 s trace:
@@ -914,7 +1175,8 @@ extern "C" volatile int g_rfom_space_start;
  * The detector keeps the last 3 s of the player object; when the player drops
  * more than RFOM_FALL_M (default 6) below the last ground they stood on within
  * 3 s of leaving it, it writes logs\fall_<ms>.bin (same format as
- * player_trace.bin) and a line in the log. F4 puts the player back on the
+ * player_trace.bin; only the newest RFOM_FALL_DUMPS, default 5, are kept;
+ * 0 = no dump) and a line in the log. F4 puts the player back on the
  * last ground they stood on for at least half a second (about 1.5 s before
  * leaving it) -- usable any time, not only after a detected fall.
  * -------------------------------------------------------------------------*/
@@ -924,6 +1186,25 @@ static uint64_t s_fall_ring_t[FALL_RING];
 static unsigned s_fall_ring_n;
 typedef struct { float x, z, y; ULONGLONG t; } SafePos;
 static SafePos s_safe[32]; static unsigned s_safe_n;
+/* Each fall dump is ~4.4 MB: delete the oldest logs\fall_*.bin until at most
+ * `keep` remain (RFOM_FALL_DUMPS=<n>, default 5; 0 = log line only, no dump). */
+static void fall_dumps_prune(int keep)
+{
+    struct Dump { FILETIME t; char name[MAX_PATH]; };
+    std::vector<Dump> v;
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA("logs\\fall_*.bin", &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        Dump d; d.t = fd.ftLastWriteTime; snprintf(d.name, sizeof d.name, "logs\\%s", fd.cFileName);
+        v.push_back(d);
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+    if ((int)v.size() <= keep) return;
+    std::sort(v.begin(), v.end(), [](const Dump& a, const Dump& b) { return CompareFileTime(&a.t, &b.t) < 0; });
+    for (size_t i = 0; i + (size_t)keep < v.size(); i++) DeleteFileA(v[i].name);
+}
 static void fall_watch(uint32_t player)
 {
     if (!player) return;
@@ -979,8 +1260,12 @@ static void fall_watch(uint32_t player)
     }
     if (on && !ground && left_ground && now - left_ground < 3000 && fz < last_ground_z - lim && now - fired_at > 10000) {
         fired_at = now;
+        static int keep = -1;
+        if (keep < 0) { const char* e = getenv("RFOM_FALL_DUMPS"); keep = (e && *e) ? atoi(e) : 5; if (keep < 0) keep = 0; }
         char fn[64]; snprintf(fn, sizeof fn, "logs\\fall_%llu.bin", (unsigned long long)now);
-        FILE* f = fopen(fn, "wb");
+        if (keep) fall_dumps_prune(keep - 1);
+        else snprintf(fn, sizeof fn, "no dump (RFOM_FALL_DUMPS=0)");
+        FILE* f = keep ? fopen(fn, "wb") : nullptr;
         if (f) {
             const unsigned cnt = s_fall_ring_n < FALL_RING ? s_fall_ring_n : FALL_RING;
             for (unsigned k = s_fall_ring_n - cnt; k < s_fall_ring_n; k++) {
@@ -1014,14 +1299,64 @@ static void fall_watch(uint32_t player)
     }
     f4was = f4;
 }
-static volatile LONG s_ptrace_armed;   /* v169c: Shift+F10 seen by the key thread */
+static volatile LONG s_ptrace_armed;   /* v169c: Shift+F10 seen by the key thread (PORT_DEBUG_KEYS=1 only) */
 static DWORD WINAPI ptrace_key_thread(LPVOID) {
     int kw = 0;
     for (;;) { const int k = (GetAsyncKeyState(VK_F10) & 0x8000) && (GetAsyncKeyState(VK_SHIFT) & 0x8000);
                if (k && !kw) InterlockedExchange(&s_ptrace_armed, 1); kw = k; Sleep(20); }
 }
-static int s_ptrace_key_init = (CloseHandle(CreateThread(NULL, 0, ptrace_key_thread, NULL, 0, NULL)), 0);
+static int ptrace_key_start() {
+    const char* e = getenv("PORT_DEBUG_KEYS");
+    if (e && atoi(e) > 0) { HANDLE h = CreateThread(NULL, 0, ptrace_key_thread, NULL, 0, NULL); if (h) CloseHandle(h); }
+    return 0;
+}
+static int s_ptrace_key_init = ptrace_key_start();
 static ULONGLONG s_ml_script_until;   /* v169: scripted camera active until (ms) */
+/* Split-screen co-op (GitHub #13): the look hooks run once per local player
+ * object, and all the mouse state was global -- the mouse counts went to
+ * whichever player's hook ran first, player 2's stick looked like a scripted
+ * camera (pausing the mouse), and player 2's look rates were zeroed. With two
+ * or more player objects in play, the direct mouse look only drives the one
+ * whose look rates follow the stick the mouse feeds on port 0 (the keyboard /
+ * mouse player); the others are left to the game. Until that is known the
+ * mouse turns the view through the stick. RFOM_COOP_ML=0: the old behaviour. */
+static struct { uint32_t obj; ULONGLONG seen; int score; } s_mlp[4];
+static uint32_t s_ml_owner;
+/* two or more player objects ran the look code in the last 5 s (split screen) */
+static int ml_coop_recent(void)
+{
+    const ULONGLONG now = GetTickCount64(); int n = 0;
+    for (int i = 0; i < 4; i++) if (s_mlp[i].obj && now - s_mlp[i].seen < 5000) n++;
+    return n > 1;
+}
+static int ml_coop_owner(uint32_t player, float rp, float ry)
+{
+    static int en = -1; if (en < 0) { const char* e = getenv("RFOM_COOP_ML"); en = (e && atoi(e) == 0) ? 0 : 1; }
+    if (!en || !player) { s_ml_owner = player; return 1; }
+    const ULONGLONG now = GetTickCount64();
+    int me = -1, old = 0, active = 0;
+    for (int i = 0; i < 4; i++) {
+        if (s_mlp[i].obj == player) me = i;
+        if (s_mlp[i].seen < s_mlp[old].seen) old = i;
+    }
+    if (me < 0) { me = old; s_mlp[me].obj = player; s_mlp[me].score = 0; }
+    s_mlp[me].seen = now;
+    for (int i = 0; i < 4; i++) if (s_mlp[i].obj && now - s_mlp[i].seen < 1000) active++;
+    if (active <= 1) { s_ml_owner = player; return 1; }
+    const int fed = g_ml_fed_rx || g_ml_fed_ry;
+    const int mv = fabsf(rp) > 0.02f || fabsf(ry) > 0.02f;
+    int sc = s_mlp[me].score;
+    if (fed && mv) sc += 1; else if (!fed && mv) sc -= 2;
+    s_mlp[me].score = sc > 60 ? 60 : sc < -60 ? -60 : sc;
+    int best = -1;
+    for (int i = 0; i < 4; i++)
+        if (s_mlp[i].obj && now - s_mlp[i].seen < 1000 && s_mlp[i].score >= 3 && (best < 0 || s_mlp[i].score > s_mlp[best].score)) best = i;
+    const uint32_t ow = best >= 0 ? s_mlp[best].obj : 0u;
+    if (ow != s_ml_owner) { static int n = 0;
+        if (n++ < 20) fprintf(stderr, "[mouselook] split screen: %d players, mouse look %s 0x%08X%c", active, ow ? "drives" : "off (stick) until it follows", ow ? ow : player, 10); }
+    s_ml_owner = ow;
+    return player == ow;
+}
 extern "C" void rfom_mouselook_pre(uint32_t player)
 {
     fall_watch(player);   /* v168 */
@@ -1117,9 +1452,11 @@ extern "C" void rfom_mouselook_pre(uint32_t player)
               if (n++ < 50) { FILE* f = fopen("logs\\dyndiff.txt", n == 1 ? "w" : "a");
                   if (f) { fprintf(f, "t=%llu diff=%u d %.3f -> %.3f\n", GetTickCount64(), diff, d, base); fclose(f); } }
           } } }
+    const int ml_own = ml_coop_owner(player, ml_rdf(player + 976), ml_rdf(player + 980));
     if (!g_ml_mode || !player) return;
     ml_load();
     if (!ml_stick_is_mouse()) return;   /* controller / look keys: the stick turns the view as on PS3 */
+    if (!ml_own) return;   /* split screen: another player's view, or the mouse player not known yet */
     ml_check(g_ml_fed_rx, ml_rdf(player + 980), &s_ml_sx, &s_ml_bad_x, "yaw");
     ml_check(g_ml_fed_ry, ml_rdf(player + 976), &s_ml_sy, &s_ml_bad_y, "pitch");
     /* v169: scripted sequences (a chapter's opening walk) turn the camera by
@@ -1145,11 +1482,13 @@ extern "C" int cellpad_gyro_take(double* yaw_deg, double* pitch_deg);
 extern "C" void rfom_mouselook(uint32_t player)
 {
     if (!g_ml_mode || !player) return;
+    if (player != s_ml_owner) return;   /* split screen: not the mouse player's view (ml_coop_owner) */
     ml_load();
     { const uint32_t c = vm_read32(player + 16016);
       g_rfom_opts_ea = c ? vm_read32(c + 6848) : 0; }
     const ULONGLONG now = GetTickCount64();
-    long dx = InterlockedExchange(&g_kbm_ml_dx, 0), dy = InterlockedExchange(&g_kbm_ml_dy, 0);
+    long dx = tank_mouse_owns(s_tank_obj) ? 0 : InterlockedExchange(&g_kbm_ml_dx, 0);   /* the tank turret takes X (rfom_tank_mouse_apply) */
+    long dy = InterlockedExchange(&g_kbm_ml_dy, 0);
     /* counts gathered while the look code was not running (menus, pause,
      * cutscenes, a vehicle) are dropped, not applied in one jump */
     if (now - s_ml_last > 150 || !g_kbm_capture || !ml_stick_is_mouse()) dx = dy = 0;
@@ -1319,11 +1658,44 @@ static void prompts_init_xbox(void)
         memcpy(s_xrep3[i], s3, 4); snprintf(s_xrepf[i], 24, "%s", full); s_xhave[i] = 1;
     }
 }
+/* Nintendo names (ps3emu/port_pc_extras.h pcx_nx_label): by position, or by
+ * label with PAD_NINTENDO_SWAP (cellpad_nintendo_swap); rebuilt when that changes. */
+extern "C" int cellpad_nintendo_swap(void);   /* cellPad.c */
+static char s_nrep3[0x30][4], s_nrepf[0x30][24]; static int s_nhave[0x30]; static int s_nswap_built = -1;
+static void prompts_init_nintendo(void)
+{
+    const int sw = cellpad_nintendo_swap();
+    if (sw == s_nswap_built) return;
+    s_nswap_built = sw;
+    static const struct { const char* ps; int idx; } x[] = {
+        {"CIRCLE",0},{"SQUARE",1},{"CROSS",2},{"TRIANGLE",3},{"SELECT",4},{"START",5},
+        {"L1",6},{"L2",7},{"L3",8},{"R1",10},{"R2",11},{"R3",12},
+    };
+    for (auto& g : s_glyph_map) {
+        const int i = g.cp - 0x0A00 - 0x09; if (i < 0 || i >= 0x30) continue;
+        const char* lab = nullptr;
+        if (g.cp == 0x0A12) lab = "LS";
+        else if (g.cp == 0x0A16) lab = "RS";
+        else if (g.pad) {
+            for (auto& e : x) if (!strcmp(g.pad, e.ps)) { lab = pcx_nx_label(e.idx, sw); break; }
+            if (!lab && s_xhave[i]) { memcpy(s_nrep3[i], s_xrep3[i], 4); memcpy(s_nrepf[i], s_xrepf[i], 24); s_nhave[i] = 1; continue; }
+        }
+        if (!lab) continue;
+        const int face = strlen(lab) == 1 && isalpha((unsigned char)lab[0]);
+        if (face) snprintf(s_nrep3[i], 4, "(%s)", lab); else snprintf(s_nrep3[i], 4, "%-3.3s", lab);
+        if (g.cp == 0x0A12) snprintf(s_nrepf[i], 24, "Left Stick");
+        else if (g.cp == 0x0A16) snprintf(s_nrepf[i], 24, "Right Stick");
+        else snprintf(s_nrepf[i], 24, "[%s]", lab);
+        s_nhave[i] = 1;
+    }
+}
 static void prompts_init(void)
 {
     static int init = 0;
+    prompts_init_nintendo();
     if (!init) { init = 1;
         prompts_init_xbox();
+        s_nswap_built = -1; prompts_init_nintendo();
         for (auto& g : s_glyph_map) { const int i = g.cp - 0x0A00 - 0x09; if (i < 0 || i >= 0x30) continue;
             if (g.fixed) { memcpy(s_rep3[i], g.fixed, 4); snprintf(s_repf[i], 24, "%s", g.full); s_have[i] = 1; }
             else if (g.cp == 0x0A1B) {
@@ -1345,7 +1717,7 @@ static void prompts_init(void)
 }
 /* One text file as loaded (its original bytes) and as last patched, so the
  * prompts can be redone for another device while it stays loaded. */
-struct PromptFile { uint32_t base, end, hash; int mode; std::vector<uint8_t> orig; uint32_t blk[3], blksz[3]; };
+struct PromptFile { uint32_t base, end, hash; int mode; std::vector<uint8_t> orig; uint32_t blk[4], blksz[4]; };
 static std::vector<PromptFile> s_pfiles;
 static std::mutex s_pfiles_mu;
 static uint32_t prompt_hash(const uint8_t* q, uint32_t n)
@@ -1354,15 +1726,16 @@ static uint32_t prompt_hash(const uint8_t* q, uint32_t n)
     for (uint32_t i = 0; i < n; i++) { h ^= q[i]; h *= 16777619u; }
     return h;
 }
-/* mode: 0 keyboard names, 1 Xbox names, 2 PlayStation (the game's own glyphs) */
+/* mode: 0 keyboard names, 1 Xbox names, 2 PlayStation (the game's own glyphs), 3 Nintendo names */
 static void prompts_apply(uint32_t base, uint32_t end, int mode, uint32_t* blkp, uint32_t* blkszp, bool first)
 {
     const uint32_t n = vm_read32(base + 8);
     const int keep = mode == 2;   /* PlayStation pad: the game's own button glyphs */
-    char (*rep3)[4] = mode == 1 ? s_xrep3 : s_rep3;
-    char (*repf)[24] = mode == 1 ? s_xrepf : s_repf;
-    const char* meleef = mode == 1 ? s_xrepf[0x0A1B - 0x0A09] : s_meleef;
-    s_havep = mode == 1 ? s_xhave : s_have;
+    if (mode == 3) prompts_init_nintendo();
+    char (*rep3)[4] = mode == 1 ? s_xrep3 : mode == 3 ? s_nrep3 : s_rep3;
+    char (*repf)[24] = mode == 1 ? s_xrepf : mode == 3 ? s_nrepf : s_repf;
+    const char* meleef = mode == 1 ? s_xrepf[0x0A1B - 0x0A09] : mode == 3 ? s_nrepf[0x0A1B - 0x0A09] : s_meleef;
+    s_havep = mode == 1 ? s_xhave : mode == 3 ? s_nhave : s_have;
     extern uint8_t* vm_base;
     uint8_t* p = vm_base + base;
     int moved = 0;
@@ -1396,14 +1769,14 @@ static void prompts_apply(uint32_t base, uint32_t end, int mode, uint32_t* blkp,
         const char* b = strrchr(mp, '\\'); b = b ? b + 1 : mp; const char* e = getenv("RSX_FE_KEYCAPS");
         fe_menu = (!_stricmp(b, "ResistanceFoM.exe") && e && atoi(e) == 3) ? 1 : 0; }   /* v160p: off -- menus use Anark scene strings */
     /* v160v: "Press the START button" (level intro card): on keyboard it's Space,
-     * on an Xbox pad the Menu button */
+     * on an Xbox pad the Menu button, on a Nintendo pad + */
     for (uint32_t i = 1; mode != 2 && i < end; i++) {
         if (p[i - 1] != 0 || p[i] == 0) continue;
         uint32_t m = 0; while (i + m < end && p[i + m] && m < 64) m++;
         const char* r = nullptr;
-        if (m == 22 && !memcmp(p + i, "Press the START button", 22)) r = mode ? "Press the MENU button" : "Press the SPACE bar";
-        else if (m == 34 && !memcmp(p + i, "Press the START button to continue", 34)) r = mode ? "Press the MENU button to continue" : "Press the SPACE bar to continue";
-        else if (m == 35 && !memcmp(p + i, " Press the START button to continue", 35)) r = mode ? " Press the MENU button to continue" : " Press the SPACE bar to continue";
+        if (m == 22 && !memcmp(p + i, "Press the START button", 22)) r = mode == 3 ? "Press the + button" : mode ? "Press the MENU button" : "Press the SPACE bar";
+        else if (m == 34 && !memcmp(p + i, "Press the START button to continue", 34)) r = mode == 3 ? "Press the + button to continue" : mode ? "Press the MENU button to continue" : "Press the SPACE bar to continue";
+        else if (m == 35 && !memcmp(p + i, " Press the START button to continue", 35)) r = mode == 3 ? " Press the + button to continue" : mode ? " Press the MENU button to continue" : " Press the SPACE bar to continue";
         if (r) { size_t si = 0; while (si < starts.size() && starts[si] != i) si++;
                  if (si == starts.size()) { starts.push_back(i); isgrab.push_back(r); } else isgrab[si] = r; }
         i += m;
@@ -1538,7 +1911,7 @@ static void prompts_apply(uint32_t base, uint32_t end, int mode, uint32_t* blkp,
     static int logged = 0;
     if ((done || moved) && logged++ < 8)
         fprintf(stderr, "[prompts] text file 0x%08X (%s): %d string(s) with full names (%u reference(s)), %d icon(s) as short names%c",
-                base, mode == 0 ? "keyboard" : "Xbox", moved, nrefs, done, 10);
+                base, mode == 0 ? "keyboard" : mode == 3 ? "Nintendo" : "Xbox", moved, nrefs, done, 10);
 }
 extern "C" volatile int g_rfom_prompt_dev;
 extern "C" volatile long g_rfom_prompt_gen;
@@ -1570,7 +1943,7 @@ static void rfom_prompts_tick(void)
         i++;
     }
     if (redone) fprintf(stderr, "[prompts] %d loaded text file(s) switched to %s prompts%c", redone,
-                        mode == 0 ? "keyboard" : mode == 1 ? "Xbox" : "PlayStation", 10);
+                        mode == 0 ? "keyboard" : mode == 1 ? "Xbox" : mode == 3 ? "Nintendo" : "PlayStation", 10);
 }
 /* cellPadGetData (port 0) tick: the NVIDIA Reflex INPUT_SAMPLE marker and,
  * once a text file was patched, the prompt hot-swap above. */
@@ -2085,6 +2458,7 @@ extern "C" void ps3_load_prx_modules(void)
       s_dbg_main_tid = GetCurrentThreadId();
       { const char* mc = getenv("RFOM_MAIN_CORE");
         if (!mc || atoi(mc)) CreateThread(NULL, 0, main_core_keeper, NULL, 0, NULL); }
+      pcore_hot_start();
       if (dp && *dp) { snprintf(dbgpath, sizeof dbgpath, "%s", dp);
                        CreateThread(NULL, 0, debug_console, dbgpath, 0, NULL); } }
     if (getenv("WATCHDOG_AT")) CreateThread(NULL, 0, hang_watchdog, NULL, 0, NULL);

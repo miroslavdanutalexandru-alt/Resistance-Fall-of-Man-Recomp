@@ -43,6 +43,7 @@ void spu_coh_notify_write(uint32_t a) { (void)a; }
 void spu_lockline_lock(void) {}
 void spu_lockline_unlock(void) {}
 unsigned long long ps3_ms_now(void) { return 0; }
+volatile long g_ps3_host_pause_gen;
 volatile int g_rfom_trace_left;
 
 #define CHECK(c) do { if (!(c)) { printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); exit(1); } } while (0)
@@ -280,6 +281,11 @@ static int mode_stub(int argc, char** argv)
     CHECK(cellVdecEndSeq(h) == CELL_OK);
     CHECK(s_nmsg == m0 + 1 && s_msgs[m0] == CELL_VDEC_MSG_TYPE_SEQDONE);
     CHECK(cellVdecClose(h) == CELL_OK);
+    /* the movie-stall log line: a long gap inside a sequence, but not one that spans a host pause */
+    CHECK(!vdec_is_stall(0, 100000, 0, 0));                  /* first AU since StartSeq */
+    CHECK(!vdec_is_stall(1000, 1000 + VDEC_STALL_MS, 4, 4)); /* normal cadence */
+    CHECK(vdec_is_stall(1000, 1001 + VDEC_STALL_MS, 4, 4));  /* stalled */
+    CHECK(!vdec_is_stall(1000, 60000, 4, 6));                /* alt-tab / F10 pause in between */
     printf("stub: callback-only behaviour unchanged (%d AUs)\n", s_nau < 3 ? s_nau : 3);
     return 0;
 }

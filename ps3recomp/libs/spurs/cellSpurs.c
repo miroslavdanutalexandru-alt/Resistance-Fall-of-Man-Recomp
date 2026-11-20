@@ -48,6 +48,7 @@ uint32_t g_ydkj_real_spurs_ea   = 0;   /* real CellSpurs instance EA (for the ta
 #ifdef _WIN32
 #include <wchar.h>      /* swprintf: lane thread names */
 #endif
+#include "../../runtime/platform/port_hires_sleep.h"   /* port_sleep_1ms (perf pass 9) */
 
 /* ---------------------------------------------------------------------------
  * Internal workload tracking
@@ -826,6 +827,22 @@ s32 cellSpursSetPriorities(CellSpurs* spurs, CellSpursWorkloadId wid,
     if (!spurs || !priorities) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
     const u8* priorities_h = GUEST_PTR(priorities, const u8*);
     if (wid >= CELL_SPURS_MAX_WORKLOAD) return CELL_SPURS_CORE_ERROR_INVAL;
+    /* SPURS_PRIO_SKIP_SAME (default 1; =0: always the full path below). From
+     * GoW-Ascension-Recomp (MIT): a call asking for the priorities the workload
+     * already has -- in the host copy AND in the instance bytes -- returns CELL_OK
+     * at once, without the instance and registry locks. Same result as the full
+     * path. GoW's EDGE watchdog made ~2,700 such calls a second. */
+    { static int s_skip = -1;
+      if (s_skip < 0) { const char* e = getenv("SPURS_PRIO_SKIP_SAME"); s_skip = !(e && e[0] == '0'); }
+      if (s_skip) {
+          const u32 ea = (u32)(uintptr_t)spurs;
+          struct SpursInst* q = spurs_inst_find(ea);
+          if (q && q->kernel_live && !q->stopping && !q->starting &&
+              s_workloads[wid].in_use && s_workloads[wid].spurs_ea == ea &&
+              !memcmp(s_workloads[wid].priority, priorities_h, CELL_SPURS_MAX_SPU) &&
+              !memcmp(vm_base + ea + SPURS_WKL_INFO1 + wid * SPURS_WKL_INFO_SZ + 0x18, priorities_h, CELL_SPURS_MAX_SPU))
+              return CELL_OK;
+      } }
     struct SpursInst* si;
     s32 rc = spurs_api_lock((u32)(uintptr_t)spurs, &si);
     if (rc) return rc;
@@ -3253,7 +3270,7 @@ static int jg_wait(u32 ea)
             return 1;
         }
 #ifdef _WIN32
-        Sleep(1);
+        port_sleep_1ms();
 #else
         usleep(1000);
 #endif

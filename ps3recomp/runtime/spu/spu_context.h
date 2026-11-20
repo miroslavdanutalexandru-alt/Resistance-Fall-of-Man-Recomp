@@ -562,12 +562,22 @@ static __attribute__((noinline, cold)) void spu_ls_read_probe(const spu_context*
  * fused multiply-add give the SPU's bits exactly for every ordinary operand.
  * Round-to-nearest broke guest code that relies on truncation (York: a raw-SPU
  * grid walk computed a cell count of 0 and looped ~4 billion times). */
+/* SPU_XF_RZ_TRUST (CMake PORT_SPU_XF_RZ_TRUST, set for the runtime and the
+ * lifted SPU code): the lifted float ops skip their +-FLT_MAX output clamp and
+ * rely on RZ to saturate overflow, so RZ is forced here; SPU_XFLOAT_EXACT is
+ * ignored (SPU_XF_NO_EXACT ops never honour it) and SPU_NO_FTZ only drops
+ * FTZ|DAZ. */
 static inline void spu_thread_fp_init(void) {
+#ifdef SPU_XF_RZ_TRUST
+    const unsigned m = getenv("SPU_NO_FTZ") ? 0x6000u : 0x6000u | 0x8040u;
+    _mm_setcsr((_mm_getcsr() & ~0x6000u & ~0x8040u) | m);
+#else
     if (getenv("SPU_NO_FTZ")) return;
     const char* ex = getenv("SPU_XFLOAT_EXACT");
     unsigned m = 0x8040u;                               /* FTZ | DAZ */
     if (!(ex && ex[0] == '1')) m |= 0x6000u;            /* RC = toward zero */
     _mm_setcsr((_mm_getcsr() & ~0x6000u) | m);
+#endif
 }
 #else
 static inline void spu_thread_fp_init(void) {}

@@ -18,6 +18,9 @@ Makefile
 *.obj
 *.a
 *.lib
+# Prebuilt SDL3 (zlib licence): the SDL3 pad backend (DualSense / DualShock 4 /
+# Switch pads without Steam Input) is only compiled in when this file exists.
+!third_party/SDL3/lib/SDL3-static.lib
 *.so
 *.dylib
 *.dll

@@ -932,6 +932,102 @@
 "        rfom_jb_jump(ctx, _jb_ea);   /* v145: back to the setjmp frame (does not return if found) */"
 ]
 }
+],
+"func_00270064": [
+{
+"at": 1,
+"ctx": "void func_00270064(ppu_context* ctx) {",
+"rm": [],
+"add": [
+"        int rfom_menu_rows_getkey(ppu_context*); if (rfom_menu_rows_getkey(ctx)) return;   /* PC rows in the A/V options (rfom_menurows.cpp) */"
+]
+}
+],
+"func_00270098": [
+{
+"at": 1,
+"ctx": "void func_00270098(ppu_context* ctx) {",
+"rm": [],
+"add": [
+"        int rfom_menu_rows_getnum(ppu_context*); if (rfom_menu_rows_getnum(ctx)) return;   /* PC rows in the A/V options (rfom_menurows.cpp) */"
+]
+}
+],
+"func_002700CC": [
+{
+"at": 1,
+"ctx": "void func_002700CC(ppu_context* ctx) {",
+"rm": [],
+"add": [
+"        int rfom_menu_rows_getstr(ppu_context*); if (rfom_menu_rows_getstr(ctx)) return;   /* PC rows in the A/V options (rfom_menurows.cpp) */"
+]
+}
+],
+"func_0054E0F4": [
+{
+"at": 1,
+"ctx": "void func_0054E0F4(ppu_context* ctx) {",
+"rm": [],
+"add": [
+"        int rfom_menu_rows_loadbuf(ppu_context*, void (*)(ppu_context*)); if (rfom_menu_rows_loadbuf(ctx, func_0054E0F4)) return;   /* OptionHandler chunk -> PC rows source, falls back to the chunk (rfom_menurows.cpp) */"
+]
+}
+],
+"func_00438600": [
+{
+"at": 259,
+"ctx": "        if (((R_cr >> 1) & 1)) goto loc_0043A650;",
+"rm": [],
+"add": [
+"        rfom_drive_note((uint32_t)R_24, 0);   /* #14: 0x438918 LU-P Lynx driver input (button throttle) ran -> player is driving */"
+]
+}
+],
+"func_0043E4D0": [
+{
+"at": 47,
+"ctx": "        ctx->gpr[28] = R_28 = R_3 | R_3;",
+"rm": [],
+"add": [
+"        rfom_drive_note((uint32_t)R_28, 1);   /* #14: 0x43E528 left-stick vehicle input (not used for the KBM drive map) */"
+]
+}
+],
+"func_0044CCD8": [
+{
+"at": 231,
+"ctx": "        if (((R_cr >> 17) & 1)) goto loc_0044ED3C;",
+"rm": [],
+"add": [
+"        rfom_drive_note((uint32_t)R_22, 2);   /* #14: 0x44CF7C tank-type input, stick drive + turret (not used for the KBM drive map) */"
+]
+},
+{
+"at": 456,
+"ctx": "loc_0044D2D8:",
+"rm": [],
+"add": [
+"        if (rfom_tank_mouse_pre((uint32_t)R_31, (uint32_t)R_22, ctx->fpr[28])) ctx->fpr[28] = 0.0;   /* 0x44D2D8: tank turret with the mouse -- no stick slew (stubs.cpp) */"
+]
+},
+{
+"at": 515,
+"ctx": "loc_0044D3A8:",
+"rm": [],
+"add": [
+"        rfom_tank_mouse_apply((uint32_t)R_31, (uint32_t)R_22, (uint32_t)R_30);   /* 0x44D3A8: tank turret with the mouse -- this frame's angle as the slew rate */"
+]
+}
+],
+"func_0002FDB8": [
+{
+"at": 58,
+"ctx": "loc_0002FE50:",
+"rm": [],
+"add": [
+"        ctx->gpr[3] = R_3 = rfom_movie_skip_unseen((uint32_t)R_3, (uint32_t)vm_read32(R_31 + 0x38));   /* unwatched-movie skip */"
+]
+}
 ]
 },
 "preamble": [
@@ -979,7 +1075,11 @@
 "#define _RCX_RL do { R_0 = ctx->gpr[0]; R_1 = ctx->gpr[1]; R_2 = ctx->gpr[2]; R_3 = ctx->gpr[3]; R_4 = ctx->gpr[4]; R_5 = ctx->gpr[5]; R_6 = ctx->gpr[6]; R_7 = ctx->gpr[7]; R_8 = ctx->gpr[8]; R_9 = ctx->gpr[9]; R_10 = ctx->gpr[10]; R_11 = ctx->gpr[11]; R_12 = ctx->gpr[12]; R_21 = ctx->gpr[21]; R_22 = ctx->gpr[22]; R_23 = ctx->gpr[23]; R_24 = ctx->gpr[24]; R_25 = ctx->gpr[25]; R_26 = ctx->gpr[26]; R_27 = ctx->gpr[27]; R_28 = ctx->gpr[28]; R_29 = ctx->gpr[29]; R_30 = ctx->gpr[30]; R_31 = ctx->gpr[31]; R_cr = ctx->cr; R_lr = ctx->lr; R_xer = ctx->xer; } while (0)",
 "extern \"C\" uint64_t rfom_movie_evwait_us(void);   /* v130 */",
 "#define _RCX_RL do { R_0 = ctx->gpr[0]; R_1 = ctx->gpr[1]; R_2 = ctx->gpr[2]; R_3 = ctx->gpr[3]; R_4 = ctx->gpr[4]; R_5 = ctx->gpr[5]; R_6 = ctx->gpr[6]; R_7 = ctx->gpr[7]; R_8 = ctx->gpr[8]; R_9 = ctx->gpr[9]; R_10 = ctx->gpr[10]; R_11 = ctx->gpr[11]; R_23 = ctx->gpr[23]; R_24 = ctx->gpr[24]; R_25 = ctx->gpr[25]; R_26 = ctx->gpr[26]; R_27 = ctx->gpr[27]; R_28 = ctx->gpr[28]; R_29 = ctx->gpr[29]; R_30 = ctx->gpr[30]; R_31 = ctx->gpr[31]; R_cr = ctx->cr; R_lr = ctx->lr; R_xer = ctx->xer; } while (0)",
-"#define _RCX_RL do { R_0 = ctx->gpr[0]; R_1 = ctx->gpr[1]; R_2 = ctx->gpr[2]; R_3 = ctx->gpr[3]; R_4 = ctx->gpr[4]; R_5 = ctx->gpr[5]; R_6 = ctx->gpr[6]; R_7 = ctx->gpr[7]; R_8 = ctx->gpr[8]; R_9 = ctx->gpr[9]; R_10 = ctx->gpr[10]; R_11 = ctx->gpr[11]; R_12 = ctx->gpr[12]; R_19 = ctx->gpr[19]; R_20 = ctx->gpr[20]; R_21 = ctx->gpr[21]; R_22 = ctx->gpr[22]; R_23 = ctx->gpr[23]; R_24 = ctx->gpr[24]; R_25 = ctx->gpr[25]; R_26 = ctx->gpr[26]; R_27 = ctx->gpr[27]; R_28 = ctx->gpr[28]; R_29 = ctx->gpr[29]; R_30 = ctx->gpr[30]; R_31 = ctx->gpr[31]; R_cr = ctx->cr; R_lr = ctx->lr; R_xer = ctx->xer; } while (0)"
+"#define _RCX_RL do { R_0 = ctx->gpr[0]; R_1 = ctx->gpr[1]; R_2 = ctx->gpr[2]; R_3 = ctx->gpr[3]; R_4 = ctx->gpr[4]; R_5 = ctx->gpr[5]; R_6 = ctx->gpr[6]; R_7 = ctx->gpr[7]; R_8 = ctx->gpr[8]; R_9 = ctx->gpr[9]; R_10 = ctx->gpr[10]; R_11 = ctx->gpr[11]; R_12 = ctx->gpr[12]; R_19 = ctx->gpr[19]; R_20 = ctx->gpr[20]; R_21 = ctx->gpr[21]; R_22 = ctx->gpr[22]; R_23 = ctx->gpr[23]; R_24 = ctx->gpr[24]; R_25 = ctx->gpr[25]; R_26 = ctx->gpr[26]; R_27 = ctx->gpr[27]; R_28 = ctx->gpr[28]; R_29 = ctx->gpr[29]; R_30 = ctx->gpr[30]; R_31 = ctx->gpr[31]; R_cr = ctx->cr; R_lr = ctx->lr; R_xer = ctx->xer; } while (0)",
+"extern \"C\" void rfom_drive_note(uint32_t hero, int kind);",
+"extern \"C\" int rfom_tank_mouse_pre(uint32_t tank, uint32_t hero, double rx);",
+"extern \"C\" void rfom_tank_mouse_apply(uint32_t tank, uint32_t hero, uint32_t toc);",
+"extern \"C\" uint32_t rfom_movie_skip_unseen(uint32_t seen, uint32_t id);   /* RFOM_CUTSCENE_SKIP_ALL (project/rfom_pcextra.cpp) */"
 ],
 "header": [
 {

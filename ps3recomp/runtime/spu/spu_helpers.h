@@ -1100,9 +1100,19 @@ SPU__X8_INLINE __m128 spu__xf_in(u128 a) {
 SPU__X8_INLINE u128 spu__xf_out(__m128 r) {
     /* +0.0: the SPU never produces -0 (x + 0 turns -0 into +0 under RZ). The
      * clamp only matters if the thread is not in RZ (RZ overflows to FLT_MAX). */
+#ifdef SPU_XF_RZ_TRUST
+    /* SPU_XF_RZ_TRUST (compile-time, lifted SPU sources): the SPU threads are
+     * always in RZ (spu_thread_fp_init forces it in this build), the inputs are
+     * finite (spu__xf_in), and under RZ a finite overflow rounds to +-FLT_MAX
+     * and no NaN can arise, so the clamp is the identity. Saves the max/min
+     * pair (~8 cycles of latency) on every fa/fs/fm/fma/fms/fnms. */
+    return spu__x8_st(_mm_castps_si128(_mm_add_ps(r, _mm_setzero_ps())));
+#else
     const __m128 mx = _mm_set1_ps(3.40282347e+38f);
     r = _mm_min_ps(_mm_max_ps(_mm_add_ps(r, _mm_setzero_ps()), _mm_sub_ps(_mm_setzero_ps(), mx)), mx);
     return spu__x8_st(_mm_castps_si128(r));
+#endif
+
 }
 SPU__X8_INLINE u128 spu_fa(u128 a, u128 b) {
     if (SPU__XF_EXACT()) return spu__x8_fa_ex(a, b, 0);

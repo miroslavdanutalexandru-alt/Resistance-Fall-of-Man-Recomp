@@ -11,6 +11,10 @@
 // alphabetical order of their folder names; when two replace the same file the later one wins.
 // A folder whose name starts with '_' or '-' is skipped (disabled). Only whole files can be
 // replaced (no texture replacement). The overrides are listed in the log at start-up.
+//
+// mods\order.txt (written by the launcher's Mods list, optional): one folder name per line, applied
+// in that order (a later line wins); "-Name" disables a mod, '#' starts a comment. Mods it does not
+// list follow, alphabetically (ps3emu/port_pc_extras.h pcx_mod_rank).
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <cstdio>
@@ -21,6 +25,7 @@
 #include <vector>
 #include <algorithm>
 #include <mutex>
+#include "ps3emu/port_pc_extras.h"   // pcx_mod_rank (order.txt)
 
 extern "C" void (*volatile g_vfs_override_hook)(char* path, size_t cap);   // runtime/syscalls/sys_fs.c
 
@@ -62,7 +67,20 @@ void build_index(const std::string& root)
         } while (FindNextFileA(h, &fd));
         FindClose(h);
     }
-    std::sort(mods.begin(), mods.end(), [](const std::string& a, const std::string& b) { return _stricmp(a.c_str(), b.c_str()) < 0; });
+    std::string order;
+    if (FILE* f = fopen((root + "\\order.txt").c_str(), "rb")) {
+        char b[4096]; size_t n;
+        while ((n = fread(b, 1, sizeof b, f)) > 0) order.append(b, n);
+        fclose(f);
+    }
+    const auto rank = [&](const std::string& m) { const int r = pcx_mod_rank(order.c_str(), m.c_str()); return r == -2 ? 1 << 20 : r; };
+    mods.erase(std::remove_if(mods.begin(), mods.end(), [&](const std::string& m) {
+        if (rank(m) != -1) return false;
+        fprintf(stderr, "[mods] %s: disabled in order.txt\n", m.c_str());
+        return true; }), mods.end());
+    std::sort(mods.begin(), mods.end(), [&](const std::string& a, const std::string& b) {
+        const int ra = rank(a), rb = rank(b);
+        return ra != rb ? ra < rb : _stricmp(a.c_str(), b.c_str()) < 0; });
     for (const auto& m : mods) {
         std::map<std::string, std::string> files;
         scan(root + "\\" + m, "", files);

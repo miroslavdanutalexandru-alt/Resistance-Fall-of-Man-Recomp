@@ -1,0 +1,2 @@
+# build.ps1's default work folder (ncnn checkout and CMake builds)
+/_build/

@@ -292,7 +292,8 @@ static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
         }
     }
     #undef _LB
-    if (taskset_ctx && getenv("SPURS_TASKSET_TRACE")) {
+    static volatile int s_tstrace = -1;   /* perf pass 9: read once, not per job run */
+    if (taskset_ctx && ((s_tstrace < 0 ? (s_tstrace = getenv("SPURS_TASKSET_TRACE") ? 1 : 0) : s_tstrace))) {
         fprintf(stderr, "[taskset] run image=%d r3=%08X %08X %08X %08X "
                 "r4=%08X %08X %08X %08X\n", image_id,
                 ctx.gpr[3]._u32[0], ctx.gpr[3]._u32[1], ctx.gpr[3]._u32[2], ctx.gpr[3]._u32[3],
@@ -306,7 +307,8 @@ static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
      * outbound word leaves the PPU blocked in sys_event_queue_receive forever,
      * and the difference between "parked at its idle poll" and "fell over after
      * three instructions" is invisible without this. */
-    if (opts && getenv("SPU_WORKER_TRACE")) {
+    static volatile int s_wktrace = -1;
+    if (opts && ((s_wktrace < 0 ? (s_wktrace = getenv("SPU_WORKER_TRACE") ? 1 : 0) : s_wktrace))) {
         fprintf(stderr, "[worker] spu=0x%X halted=%d steps=%llu status=0x%X pc=0x%05X "
                 "inmbox(n=%u) outmbox(n=%u v=0x%08X) outintr(n=%u v=0x%08X)\n",
                 ctx.spu_id, _halted, (unsigned long long)ctx.steps, (unsigned)ctx.status,

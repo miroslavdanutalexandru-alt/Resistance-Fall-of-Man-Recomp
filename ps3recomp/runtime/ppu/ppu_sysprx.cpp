@@ -23,6 +23,7 @@
 #include "../platform/win32_compat.h"
 #include "../memory/vm.h"   /* VM_HLE_INJECT_BASE -- not platform-specific */
 #include "ps3emu/log_first.h"
+#include "../platform/port_hires_sleep.h"   /* port_sleep_1ms (perf pass 9) */
 
 extern "C" uint8_t* vm_base;
 extern "C" void ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context*));
@@ -362,25 +363,75 @@ static void sys_lwcond_create(ppu_context* ctx)
     ctx->gpr[3] = 0;
 }
 static void sys_lwcond_destroy(ppu_context* ctx)    { ctx->gpr[3] = 0; }
-static void sys_lwcond_signal(ppu_context* ctx)     { ctx->gpr[3] = 0; }
-static void sys_lwcond_signal_all(ppu_context* ctx) { ctx->gpr[3] = 0; }
-static void sys_lwcond_signal_to(ppu_context* ctx)  { ctx->gpr[3] = 0; }
+#ifdef _WIN32
+#pragma comment(lib, "Synchronization.lib")   /* WaitOnAddress */
+#endif
+/* PS3_LWCOND_WAKE (default on; =0 = the old Sleep(1) poll, signals no-ops;
+ * ported from R2/R3): the wait below is a bounded park (lwc_wait_ms). A signal
+ * bumps a per-lwcond sequence word and wakes the waiters parked on it
+ * (WaitOnAddress), so a signalled wait returns at once instead of after a
+ * 1 ms+ timer tick. */
+static volatile LONG s_lwc_seq[256];
+static inline volatile LONG* lwc_seq(uint32_t lwcond) { return &s_lwc_seq[(lwcond * 2654435761u) >> 24]; }
+static int lwc_wake_on(void)
+{
+    static volatile int v = -1;
+    if (v < 0) { const char* e = getenv("PS3_LWCOND_WAKE"); v = !(e && *e == '0'); }
+    return v;
+}
+static void lwc_wake(ppu_context* ctx)
+{
+    if (lwc_wake_on()) {
+        volatile LONG* q = lwc_seq((uint32_t)ctx->gpr[3]);
+        InterlockedIncrement(q);
+        WakeByAddressAll((PVOID)q);
+    }
+    ctx->gpr[3] = 0;
+}
+/* How long a wait parks before the guest loop re-checks (PORT_LWCOND_POLL_MS,
+ * default 50; 1 = the old 1 ms poll length). seq0 is read while the waiter
+ * still holds the lwmutex, so a signal sent after the guest's predicate check
+ * (under the same lwmutex) always changes *seq before or during WaitOnAddress.
+ * The cap only covers a signal sent without the lwmutex and hash-slot sharing
+ * (spurious wakes only). The guest timeout (r4, usec, 0 = infinite) is honoured
+ * up to the cap; the return stays CELL_OK as before (a legal spurious wake). */
+static DWORD lwc_wait_ms(uint64_t timeout_us)
+{
+    static volatile long cap = -1;
+    if (cap < 0) {
+        const char* e = getenv("PORT_LWCOND_POLL_MS");
+        long v = (e && *e) ? atol(e) : 50;
+        if (v < 1) v = 1; if (v > 1000) v = 1000;
+        fprintf(stderr, "[lwcond] wait park cap %ld ms, signal wake %s (PORT_LWCOND_POLL_MS=1 / PS3_LWCOND_WAKE=0 = old poll)\n",
+                v, lwc_wake_on() ? "on" : "off");
+        cap = v;
+    }
+    uint64_t ms = timeout_us ? (timeout_us + 999) / 1000 : (uint64_t)cap;
+    if (ms > (uint64_t)cap) ms = (uint64_t)cap;
+    return ms ? (DWORD)ms : 1;
+}
+static void sys_lwcond_signal(ppu_context* ctx)     { lwc_wake(ctx); }
+static void sys_lwcond_signal_all(ppu_context* ctx) { lwc_wake(ctx); }
+static void sys_lwcond_signal_to(ppu_context* ctx)  { lwc_wake(ctx); }
 /* Now that the lwmutex is REAL, a no-op wait that keeps holding it deadlocks the
  * signaler. Release the paired lwmutex, wait briefly, reacquire (poll-style: the
- * guest's while(!predicate) loop re-checks; signalers stay no-ops). Handles the
- * common single (non-recursive) hold. */
+ * guest's while(!predicate) loop re-checks; a signal ends the wait early, see
+ * PS3_LWCOND_WAKE above). Handles the common single (non-recursive) hold. */
 static void sys_lwcond_wait(ppu_context* ctx)
 {
     uint32_t lwcond  = (uint32_t)ctx->gpr[3];
     uint32_t lwmutex = vm_read32(lwcond + 0x00);
     HANDLE s = lwm_sem(lwmutex);
     if (s) {
+        volatile LONG* seq = lwc_seq(lwcond);
+        const LONG seq0 = *seq;   /* before the unlock: a signal after it is seen */
         uint32_t own = vm_read32(lwmutex + LWM_OWNER);
         uint32_t rc  = vm_read32(lwmutex + LWM_RECUR);
         vm_write32(lwmutex + LWM_RECUR, 0);
         vm_write32(lwmutex + LWM_OWNER, 0);
         ReleaseSemaphore(s, 1, NULL);
-        Sleep(1);
+        if (lwc_wake_on()) { LONG cmp = seq0; WaitOnAddress((volatile VOID*)seq, &cmp, sizeof cmp, lwc_wait_ms(ctx->gpr[4])); }
+        else port_sleep_1ms();
         WaitForSingleObject(s, INFINITE);
         vm_write32(lwmutex + LWM_OWNER, own);
         vm_write32(lwmutex + LWM_RECUR, rc ? rc : 1);

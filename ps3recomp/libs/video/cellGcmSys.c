@@ -15,7 +15,9 @@
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_write32 (translate + byte-swap, OOB-safe) */
 #include "../../runtime/memory/vm.h"    /* VM_HLE_INJECT_BASE */
 #include "../../runtime/spu/spu_coherency.h" /* the blit row copy's reservation bookkeeping */
+#include "../../runtime/spu/spu_put_order.h" /* GCM_PUT_ORDER: g_gcm_ea_io_tab */
 #include "rsx_commands.h"                    /* rsx_state, rsx_process_command_buffer */
+#include "rsx_featcov.h"                     /* RSX feature coverage tracer */
 #include "../../include/ps3emu/guest_call.h" /* g_ps3_guest_caller for direct handler dispatch */
 #include "../../include/ps3emu/ps3_ftrace.h"  /* PS3_FTRACE timeline */
 
@@ -38,6 +40,7 @@ char* rsx_getenv(const char* name);
 #else
 #include <time.h>
 #endif
+#include "../../runtime/platform/port_hires_sleep.h"   /* port_sleep_1ms (perf final pass) */
 
 /* ---------------------------------------------------------------------------
  * Timestamp helpers (same pattern as sys_timer)
@@ -558,6 +561,9 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
       void gcm_forget_spu_blocks(void);
       gcm_forget_spu_blocks();
       g_spu_put_hook = gcm_note_spu_put; }
+    /* GCM_PUT_ORDER (runtime/spu/spu_put_order.h): SPU PUTs over a park at
+     * their head write it last; they find the park through this table. */
+    g_gcm_ea_io_tab = s_io_address_table;
 
     s_gcm_initialized = 1;
     return CELL_OK;
@@ -955,6 +961,16 @@ static int s_park_pass = 0;           /* this drain stopped on a self-JUMP park 
 /* How long a self-JUMP park may stand with `put` somewhere else before the
  * drain gives up on it being patched and follows `put` instead. */
 #define GCM_PARK_GRACE_MS 50ull
+/* GCM_PARK_WAIT_MS=<ms> overrides it (GoW-Ascension-Recomp, MIT: a title whose
+ * SPU jobs patch the park after moving put needs far longer once recompiled;
+ * following put early skips the frame and the label it releases). Unset = 50. */
+static unsigned long long gcm_park_grace_ms(void)
+{
+    static unsigned long long ms = ~0ull;
+    if (ms == ~0ull) { const char* e = getenv("GCM_PARK_WAIT_MS");
+                       ms = e ? strtoull(e, NULL, 0) : GCM_PARK_GRACE_MS; }
+    return ms;
+}
 /* The park being timed. Cleared as soon as `get` leaves it (the title patched
  * the word): a later park at the same offset with the same `put` -- a title
  * reusing the same side-buffer slot frame after frame -- is a new park, not
@@ -1363,6 +1379,7 @@ static void nv3089_blit(void)
 
 static void gcm_2d_method(u32 subch, u32 method, u32 data)
 {
+    rsx_featcov_method(RSX_FC_PORT_R1, ((subch == 2 ? 3u : subch) << 13) | method, data);  /* NV3062 -> its RPCS3 subchannel */
     /* GCM2D_TRACE=1: histogram of (subchannel, method) actually seen. The
      * subchannel a title binds each 2D object to is libgcm-version-specific and
      * SET_OBJECT binds are not tracked, so state landing on an unexpected
@@ -1910,6 +1927,50 @@ static int gcm_get_eq_put(void)
     return eq;
 }
 
+/* RSX_FIFO_GET_DEDUP (default 1, 0 = always store; as in R2/R3): publish `get`
+ * only when the guest-visible value differs. Guest memory ends up identical;
+ * this drops the redundant stores (and cache-line steals) on the control line
+ * the title spins on: every pass publishes, mostly an unchanged value. */
+static unsigned long long s_get_stores, s_get_skipped;
+static void gcm_store_get(u32 v)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("RSX_FIFO_GET_DEDUP"); on = !(e && *e == '0'); }
+    if (on && vm_read32(GCM_CONTROL_GUEST_ADDR + 4) == v) { s_get_skipped++; return; }
+    s_get_stores++;
+    vm_write32(GCM_CONTROL_GUEST_ADDR + 4, v);
+}
+
+/* The NV4097 back-end / texture-read RELEASEs (0x1D70 / 0x1D74) need the same
+ * `get` publication as the NV406E one below: the frame fence of the
+ * Resistance games waits for such a label, reads `get` once and spins until
+ * `put` equals it. Resistance 3 hung that way (2026-11-16, label 0x41, its
+ * snapshot one packet short of an idle put). GCM_GET_AT_LABEL=0 turns it off. */
+static void gcm_get_for_label(u32 m, u32 i, u32 put)
+{
+    static int on = -1;
+    if (m != 0x1D70u && m != 0x1D74u) return;
+    if (on < 0) { const char* e = getenv("GCM_GET_AT_LABEL"); on = !(e && *e == '0'); }
+    if (!on || gcm_get_eq_put()) return;
+    /* Past this word (index i of the packet) only: the walker still reads the
+     * packet's later words from guest memory, which the guest may recycle
+     * once `get` is past them. */
+    const u32 next = s_fifo_getoff + 4 + (i + 1) * 4;
+    gcm_store_get(next);
+    atomic_thread_fence(memory_order_release);
+    if (next == put) {
+        static unsigned long long n = 0, last = 0; static int logged = 0;
+        const unsigned long long now = ps3_ms_now();
+        n++;
+        if (logged < 3 || now - last >= 60000) {
+            logged++; last = now;
+            fprintf(stderr, "[fifo] back-end label release 0x%X at get 0x%X is the last command before put: get published "
+                    "as 0x%X first (a guest waiting for the label then put == get would hang; %llu so far, GCM_GET_AT_LABEL=0 off)\n",
+                    m, s_fifo_getoff, next, n);
+        }
+    }
+}
+
 /* v140: FIFO method histogram, armed by F11 for a few seconds after the
  * profile (debugtools.inc): blocks and data words per (subchannel, method),
  * so the next round of decoder work aims at what a frame is made of. */
@@ -2012,15 +2073,19 @@ static void gcm_method_post(u32 m, u32 v_in)
 
 static void gcm_rsx_process_fifo_unlocked(void)
 {
-    { static unsigned _n = 0; static unsigned long long _t0 = 0;
+    { static unsigned _n = 0; static unsigned long long _t0 = 0; static int rate = -1;
       extern unsigned long long ps3_ms_now(void);
       _n++;
-      if (getenv("GCM_RATE")) {
+      /* The walker runs once per tick or kick: read its debug switches once,
+       * not with a getenv (CRT lock + environment scan) on every pass. */
+      if (rate < 0) rate = getenv("GCM_RATE") ? 1 : 0;
+      if (rate) {
           unsigned long long now = ps3_ms_now();
           if (_t0 == 0) _t0 = now;
           if (now - _t0 >= 2000) {
-              fprintf(stderr, "[RATE] drains/sec=%.0f\n", _n * 1000.0 / (now - _t0));
-              _n = 0; _t0 = now;
+              fprintf(stderr, "[RATE] drains/sec=%.0f, get stores %llu, identical skipped %llu (RSX_FIFO_GET_DEDUP)\n",
+                      _n * 1000.0 / (now - _t0), s_get_stores, s_get_skipped);
+              _n = 0; _t0 = now; s_get_stores = s_get_skipped = 0;
           }
       } }
     static rsx_state s_state;
@@ -2056,7 +2121,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * once at init; if the title repoints gCellGcmCurrentContext at a buffer of
      * its own, every field below moves with it and the FIFO the runtime walks
      * stops being the one the title fills. Reported on change, not per tick. */
-    if (getenv("GCM_CTXDBG") && s_gcm_ctx_out_ea) {
+    static int s_ctxdbg = -1;
+    if (s_ctxdbg < 0) s_ctxdbg = getenv("GCM_CTXDBG") ? 1 : 0;
+    if (s_ctxdbg && s_gcm_ctx_out_ea) {
         static u32 last_ptr = 0xFFFFFFFFu, last_cur = 0xFFFFFFFFu;
         u32 ptr = vm_read32(s_gcm_ctx_out_ea);
         u32 cur = ptr ? vm_read32(ptr + 0x8) : 0;
@@ -2073,10 +2140,11 @@ static void gcm_rsx_process_fifo_unlocked(void)
 
     u32 start_off = s_fifo_getoff;
     /* GCM_DRAINDBG: log one drain pass in GCM_DRAINDBG_EVERY (default 60). */
-    static int s_drain_every = -1;
+    static int s_drain_every = -1, s_draindbg = 0;
     if (s_drain_every < 0) { const char* e = getenv("GCM_DRAINDBG_EVERY");
-                             s_drain_every = (e && atoi(e) > 0) ? atoi(e) : 60; }
-    if (getenv("GCM_DRAINDBG")) {
+                             s_drain_every = (e && atoi(e) > 0) ? atoi(e) : 60;
+                             s_draindbg = getenv("GCM_DRAINDBG") ? 1 : 0; }
+    if (s_draindbg) {
         static int n = 0;
         if (n++ % s_drain_every == 0)
             printf("[DRAIN] getoff=%08X put=%08X ref=%08X ctx.current=%08X\n",
@@ -2088,8 +2156,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * present in 0..put. "The title waits for a fence we never published" has
      * two very different causes -- we missed the command, or it was never
      * submitted -- and only a direct scan of the ring separates them. */
-    { static int scanned = 0;
-      if (!scanned && getenv("GCM_SCANREF") && put >= 0x19F0) { scanned = 1;
+    { static int scanned = -1;
+      if (scanned < 0) scanned = getenv("GCM_SCANREF") ? 0 : 1;
+      if (!scanned && put >= 0x19F0) { scanned = 1;
         unsigned found = 0;
         for (u32 io = 0; io + 8 <= put; io += 4) {
             u32 ea = gcm_io2ea(io); if (!ea) continue;
@@ -2287,7 +2356,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                       const unsigned long long now = ps3_ms_now();
                       if (s_park_off != s_fifo_getoff || s_park_put != put) {
                           s_park_off = s_fifo_getoff; s_park_put = put; s_park_since = now;
-                      } else if (now - s_park_since >= GCM_PARK_GRACE_MS) {
+                      } else if (now - s_park_since >= gcm_park_grace_ms()) {
                           s_park_off = 0;
                           gcm_fifo_dump_around(s_fifo_getoff);
                           gcm_fifo_resync_why("jump-park", &s_fifo_getoff, put);
@@ -2304,7 +2373,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                * The end of the pass, where get is otherwise published, can
                * come tens of milliseconds later. GCM_GET_EQ_PUT keeps its
                * own value. */
-              if (!gcm_get_eq_put()) vm_write32(GCM_CONTROL_GUEST_ADDR + 4, tgt); }
+              if (!gcm_get_eq_put()) gcm_store_get(tgt); }
             continue;
         }
         if ((w & 3) == 2) {                    /* CALL: offset | 2 */
@@ -2361,8 +2430,10 @@ static void gcm_rsx_process_fifo_unlocked(void)
                     if (!dea) break;
                     u32 m = (type == 0) ? method + i * 4 : method;
                     u32 v = vm_read32(dea);
+                    rsx_featcov_method(RSX_FC_PORT_R1, m, v);
                     u32 la = GCM_LABEL_GUEST_BASE + (s_sema_offset & 0xFFFFu);
-                    { static int sn = 0; if (getenv("GCM_RECDBG") && PS3_LOG_FIRST(sn, 12))
+                    { static int sn = 0, rd = -1; if (rd < 0) rd = getenv("GCM_RECDBG") ? 1 : 0;
+                      if (rd && PS3_LOG_FIRST(sn, 12))
                         fprintf(stderr, "[SEMA] m=0x%02X v=0x%08X off=0x%X\n", m, v, s_sema_offset); }
                     /* PS3_FTRACE: an acquire this walker sat on is satisfied now. */
                     if (m == 0x68u && s_ft_sema_t0 && vm_read32(la) == v) {
@@ -2389,9 +2460,11 @@ static void gcm_rsx_process_fifo_unlocked(void)
                          * for a label, then reads `get` once and spins until
                          * its own `put` equals it, which a snapshot from
                          * before the RELEASE never does. GCM_GET_EQ_PUT keeps
-                         * publishing put at the end of the pass instead. */
+                         * publishing put at the end of the pass instead.
+                         * Only past this word: the walker still reads the
+                         * packet's later words from guest memory. */
                         if (!gcm_get_eq_put())
-                            vm_write32(GCM_CONTROL_GUEST_ADDR + 4, s_fifo_getoff + 4 + count * 4);
+                            gcm_store_get(s_fifo_getoff + 4 + (i + 1) * 4);
                         atomic_thread_fence(memory_order_release);
                         vm_write32(la, v);
                         { static int rn = 0; if (s_sema_offset != 0x400u && PS3_LOG_FIRST(rn, 40))   /* TEMP */
@@ -2487,6 +2560,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                                   const u32 mi = (m & 0x1FFCu) >> 2;
                                   if (!qseen[mi]) { qseen[mi] = 1;
                                       printf("[mfirst] subch=%u m=0x%04X = 0x%08X%c", subch, m & 0x1FFCu, v, 10); }
+                                  gcm_get_for_label(m, i, put);
                                   rsx_process_method(&s_state, m, v);
                                   if (m == 0x50u || m == 0x1A8u || m == 0x1800u) gcm_method_post(m, v);
                               }
@@ -2659,6 +2733,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 } else if (mfull == 0xE920u || mfull == 0xE924u) {
                     cellGcmSetFlipCommand(vm_read32(dea) & 7u);
                 } else if (subch == 0 || (subch == 1 && !s1_2d)) {
+                    gcm_get_for_label(m, i, put);
                     rsx_process_method(&s_state, m, vm_read32(dea));
                     if (m == 0x50u || m == 0x1A8u || m == 0x1800u) gcm_method_post(m, vm_read32(dea));
                 } else
@@ -2747,7 +2822,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * per tick (gcm_ref_push/gcm_ref_publish_one above) so every SET_REFERENCE
      * value stays observable to equality-waiters. The wrap recycle path polls
      * the drained EA. */
-    if (getenv("GCM_DRAINDBG")) {
+    if (s_draindbg) {
         static int n2 = 0;
         if (n2++ % s_drain_every == 0)
             fprintf(stderr, "[DRAINEND] %s: %08X -> %08X (%u bytes), put=%08X\n",
@@ -2846,7 +2921,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * to answer one question for a title that reports its ring full while the
      * walker says it is drained: is the title reading `get`, or something else?
      * If the overflow survives this, `get` is not what it consults. */
-    vm_write32(GCM_CONTROL_GUEST_ADDR + 4, gcm_get_eq_put() ? put : s_fifo_getoff);
+    gcm_store_get(gcm_get_eq_put() ? put : s_fifo_getoff);
 
     AcquireSRWLockExclusive(&s_ref_pub_lock);                           /* ref */
     gcm_ref_publish_one();
@@ -2923,7 +2998,7 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
     s_fifo_recycle_waiting = 1;
     while (io_begin != 0xFFFFFFFFu && s_fifo_back_jumps == back_jumps0 &&
            idle < 2000 && spins < 60000) {
-        Sleep(1); spins++;
+        port_sleep_1ms(); spins++;   /* hi-res 1 ms nap; PORT_HIRES_SLEEP=0: Sleep(1) */
         if (s_fifo_getoff != last_get) { last_get = s_fifo_getoff; idle = 0; }
         else idle++;
         if (s_recdbg && spins % 1000 == 0)

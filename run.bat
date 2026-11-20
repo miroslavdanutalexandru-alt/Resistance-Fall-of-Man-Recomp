@@ -7,23 +7,28 @@ rem missing files are restored from there before the game starts and saved back 
 set "CFG_USER=%USERPROFILE%\Saved Games\Resistance Fall of Man\config"
 set "CFG_FILES=settings.ini settings.bat controls.txt mouselook.cfg"
 if not exist portable.txt if exist "%CFG_USER%" robocopy "%CFG_USER%" . %CFG_FILES% /XO /XN /XC /R:0 /W:0 /NJH /NJS /NFL /NDL /NP >nul
-rem RFOM_BUILD_DIR: run another build of the programs (a Launcher.exe in that folder sets it)
-if not defined RFOM_BUILD_DIR set "RFOM_BUILD_DIR=build"
-if not exist "%RFOM_BUILD_DIR%\ResistanceFoM.exe" (echo The game is not built yet - run Setup.bat first. & pause & exit /b 1)
+rem RFOM_BUILD_DIR: run another build of the programs (a Launcher.exe in that folder sets it); on a CPU without AVX2
+rem (the launcher sets PORT_CPU_V3=0) the build_baseline ones when they have been built (build_cpu.bat baseline)
+if not defined RFOM_BUILD_DIR (
+  set "RFOM_BUILD_DIR=build"
+  if "%PORT_CPU_V3%"=="0" if exist build_baseline\ResistanceFoM.exe set "RFOM_BUILD_DIR=build_baseline"
+)
+rem missing files: the message goes to the console and logs\run.log; no pause when the launcher started this file hidden
+rem (it sets PORT_NOPAUSE=1 and checks these files itself first)
+if not exist "%RFOM_BUILD_DIR%\ResistanceFoM.exe" (set "RUNERR=The game is not built yet - run Setup.bat first." & goto missing)
+if not exist game\EBOOT.elf (set "RUNERR=The game program game\EBOOT.elf is missing - run Setup.bat again to decrypt it from your copy." & goto missing)
 rem ---- settings the port needs (Launcher.exe's choices come after, from settings.bat) ----
 set "SCREEN_AS_TEX=0"
 set "CHILD_RSX_ACCUM_FRAME=1"
 set "CHILD_RFOM_FPS=60"
 set "CHILD_SPURS_PM_YIELD=0"
-set "CHILD_FP_SAVE=1"
-set "CHILD_VS_SAVE=1"
+rem shader debug dump (logs\fp_*.hlsl / vs_*.hlsl, for bug reports only): set CHILD_FP_SAVE=1 / CHILD_VS_SAVE=1
 set "CHILD_FREEZE_RELAUNCH=900"
 set "CHILD_SPU_JOB_INTERP=0"
 set "CHILD_RSX_MIDFLUSH=1"
-rem F8 / F11: frame trace and profile, written to logs\ (for bug reports)
-set "CHILD_PS3_FTRACE=99999:6:%~dp0logs\ftrace.txt"
-set "CHILD_PS3_FTRACE_CAP=1500000"
-set "PS3_DEBUG=%~dp0logs\dbg.txt"
+rem developer diagnostics are off in normal play. For a bug report only (not needed otherwise):
+rem   set "PS3_DEBUG=%~dp0logs\dbg.txt" + set "CHILD_PS3_FTRACE=99999:6:%~dp0logs\ftrace.txt" = F7 frame trace / F11 profile keys,
+rem   set "PORT_DEBUG_KEYS=1" = the renderer's debug keys. These keys overlap the photo mode / benchmark / extras keys.
 rem your copy of the game (Setup.bat put it here)
 set "PS3_VFS_ROOT=%~dp0gamefiles"
 rem Launcher.exe writes settings.bat (display mode, frame limit, vsync, filtering, keys)
@@ -41,3 +46,9 @@ rem the game can hand over to a new process (level loads, freeze restart): wait 
 for %%E in (ResistanceFoM.exe ResistanceFoMGame.exe) do tasklist /FI "IMAGENAME eq %%E" 2>nul | find /i "%%E" >nul && (ping -n 3 127.0.0.1 >nul & goto waitgame)
 if exist shadercache robocopy shadercache "%SHC_BACKUP%" /E /XO /R:0 /W:0 /NJH /NJS /NFL /NDL /NP >nul
 if not exist portable.txt robocopy . "%CFG_USER%" %CFG_FILES% /R:0 /W:0 /NJH /NJS /NFL /NDL /NP >nul
+exit /b 0
+:missing
+echo %RUNERR%
+>logs\run.log echo %RUNERR%
+if not defined PORT_NOPAUSE pause
+exit /b 1

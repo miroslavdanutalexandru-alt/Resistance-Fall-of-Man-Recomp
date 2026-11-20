@@ -65,6 +65,32 @@ extern unsigned long long ps3_ms_now(void);
 static volatile unsigned long long s_vdec_endseq_ms = 0;
 unsigned long long cellVdec_endseq_pending_ms(void) { return s_vdec_endseq_ms; }
 
+/* Resistance port: ms clock of the last DecodeAu. The present path uses it to
+ * tell a playing movie apart from other flip-mode-2 time (boot, loading). */
+static volatile unsigned long long s_vdec_last_au_ms = 0;
+int cellVdec_movie_active(unsigned window_ms);
+/* Movie-stall evidence for run.log: the last AU of the running sequence per
+ * decoder (0 = none since StartSeq) and the start of a run of BUSY refusals. */
+static unsigned long long s_vdec_seq_au_ms[MAX_VDEC];
+static unsigned long long s_vdec_busy_since[MAX_VDEC];
+static unsigned s_vdec_busy_logged[MAX_VDEC];
+/* sys_ppu_thread.c: bumped on every host pause and resume (focus loss, F10
+ * menu, quit prompt). A gap that spans a pause is the pause, not a stall. */
+extern volatile long g_ps3_host_pause_gen;
+static long s_vdec_seq_gen[MAX_VDEC], s_vdec_busy_gen[MAX_VDEC];
+#define VDEC_STALL_MS 1500u
+/* 1 = log "movie stall": a gap over VDEC_STALL_MS between two AUs of one
+ * sequence (prev_ms 0 = first AU since StartSeq) with no host pause in it. */
+static int vdec_is_stall(unsigned long long prev_ms, unsigned long long now_ms, long gen_prev, long gen_now)
+{
+    return prev_ms != 0 && now_ms - prev_ms > VDEC_STALL_MS && gen_prev == gen_now;
+}
+int cellVdec_movie_active(unsigned window_ms)
+{
+    const unsigned long long t = s_vdec_last_au_ms;
+    return t != 0 && ps3_ms_now() - t < (unsigned long long)window_ms;
+}
+
 /* Deliver a vdec message to the guest callback (handle, msgType, msgData,
  * cbArg). It is a guest OPD, so it goes through g_ps3_guest_caller; this used
  * to call it as a host function pointer, which crashes the first time a
@@ -254,6 +280,9 @@ s32 cellVdecStartSeq(CellVdecHandle handle)
 
     s_vdec[handle].seqStarted = 1;
     s_vdec_endseq_ms = 0;
+    s_vdec_seq_au_ms[handle] = 0;
+    s_vdec_seq_gen[handle] = g_ps3_host_pause_gen;
+    s_vdec_busy_since[handle] = 0;
     if (s_vdec[handle].ff) {
         /* A new sequence: nothing from the last one is shown. */
         vdec_ff_reset(s_vdec[handle].ff);
@@ -311,13 +340,45 @@ s32 cellVdecDecodeAu(CellVdecHandle handle, s32 mode, const CellVdecAuInfo* auIn
     au.dts       = vm_read64(au_ea + (u32)offsetof(CellVdecAuInfo, dts));
     au.userData  = vm_read64(au_ea + (u32)offsetof(CellVdecAuInfo, userData));
 
-    printf("[cellVdec] DecodeAu(handle=%u, addr=0x%X, size=%u, pts=%llu)\n",
-           handle, au.startAddr, au.size,
-           (unsigned long long)au.pts);
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#endif
+    /* Resistance port: one line per AU (30/s in movies) on the decode thread,
+     * into an unbuffered run.log. Logs the first 8; VDEC_LOG=1 logs all. */
+    { static int lg = -1; static unsigned n = 0;
+      const unsigned long long now = ps3_ms_now();
+      s_vdec_last_au_ms = now;
+      /* a long gap between two AUs of one sequence = the movie stalled (and recovered) */
+      const long gen = g_ps3_host_pause_gen;
+      if (vdec_is_stall(s_vdec_seq_au_ms[handle], now, s_vdec_seq_gen[handle], gen))
+          fprintf(stderr, "[cellVdec] movie stall: no AU for %llu ms (handle %u, %u pictures queued)\n",
+                  now - s_vdec_seq_au_ms[handle], handle, v->qCount);
+      s_vdec_seq_au_ms[handle] = now;
+      s_vdec_seq_gen[handle] = gen;
+      if (lg < 0) { const char* e = getenv("VDEC_LOG"); lg = e ? atoi(e) : 0; }
+      if (lg || n < 8) { n++;
+          printf("[cellVdec] DecodeAu(handle=%u, addr=0x%X, size=%u, pts=%llu)\n",
+                 handle, au.startAddr, au.size,
+                 (unsigned long long)au.pts); } }
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
 
     if (v->ff) {
-        if (v->qCount >= VDEC_BUSY_AT)
-            return (s32)CELL_VDEC_ERROR_BUSY;  /* title must take pictures */
+        if (v->qCount >= VDEC_BUSY_AT) {   /* title must take pictures */
+            const unsigned long long now = ps3_ms_now();
+            if (!s_vdec_busy_since[handle] || s_vdec_busy_gen[handle] != g_ps3_host_pause_gen) {   /* (re)start; a pause restarts it */
+                s_vdec_busy_since[handle] = now; s_vdec_busy_logged[handle] = 0; s_vdec_busy_gen[handle] = g_ps3_host_pause_gen;
+            }
+            else if ((now - s_vdec_busy_since[handle]) / 2000 > s_vdec_busy_logged[handle]) {   /* every 2 s while it lasts */
+                s_vdec_busy_logged[handle]++;
+                fprintf(stderr, "[cellVdec] queue full for %llu ms: the title is not taking pictures (handle %u)\n",
+                        now - s_vdec_busy_since[handle], handle);
+            }
+            return (s32)CELL_VDEC_ERROR_BUSY;
+        }
+        s_vdec_busy_since[handle] = 0;
         v->auCount++;
         v->aus[v->auCount % VDEC_AU_RING] = au;
         v->newPics = 0;

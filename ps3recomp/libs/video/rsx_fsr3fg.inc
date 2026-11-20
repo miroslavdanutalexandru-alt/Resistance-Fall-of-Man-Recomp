@@ -373,7 +373,7 @@ static void f3_prepare(ID3D12GraphicsCommandList* cl, ID3D12Resource* z, D3D12_R
     pd.motionVectorScale.x = (float)rw; pd.motionVectorScale.y = (float)rh;
     pd.frameTimeDelta = dt;
     pd.reset = reset != 0;
-    pd.cameraNear = 0.1f; pd.cameraFar = 1000.0f; pd.cameraFovAngleVertical = 1.0f; pd.viewSpaceToMetersFactor = 1.0f;
+    fsr_camera(&pd.cameraNear, &pd.cameraFar, &pd.cameraFovAngleVertical); pd.viewSpaceToMetersFactor = 1.0f;
     pd.depth = fsr_res(z, DXGI_FORMAT_R32_FLOAT, w, h, FFX_API_RESOURCE_USAGE_READ_ONLY, FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
     pd.motionVectors = fsr_res(mv, DXGI_FORMAT_R16G16_FLOAT, w, h, FFX_API_RESOURCE_USAGE_READ_ONLY, FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
     const ffxReturnCode_t rc = p_f3Dispatch(&s_f3_ctx, &pd.header);

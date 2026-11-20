@@ -160,7 +160,9 @@ if(WIN32)
             advapi32 setupapi shell32 hid mincore dinput8 cfgmgr32)
         message(STATUS "  SDL3:         vendored (gamepad backend enabled)")
     else()
-        message(STATUS "  SDL3:         not found (controllers: XInput only)")
+        message(WARNING "SDL3 not found (${PS3RECOMP_SDL3_DIR}/lib/SDL3-static.lib): "
+                        "controllers are XInput only, so a DualSense / DualShock 4 / Switch pad works only "
+                        "through Steam Input or DS4Windows")
     endif()
 else()
     # cellPad and cellAudio select their SDL2 backends unconditionally off
@@ -222,6 +224,13 @@ if(PS3RECOMP_FFMPEG_RUNTIME)
         message(FATAL_ERROR "FFmpeg headers not found. Debian/Ubuntu: "
             "libavcodec-dev, Fedora: ffmpeg-free-devel, MSYS2: mingw-w64-x86_64-ffmpeg "
             "-- or pass -DPS3RECOMP_FFMPEG_INCLUDE_DIR=<dir containing libavcodec/avcodec.h>")
+    endif()
+    # a path cut short at a space (an unquoted -D on the command line) otherwise only fails much later,
+    # at compile time, as "'libavcodec/avcodec.h' file not found"
+    if(NOT EXISTS "${PS3RECOMP_FFMPEG_INCLUDE_DIR}/libavcodec/avcodec.h")
+        message(FATAL_ERROR "PS3RECOMP_FFMPEG_INCLUDE_DIR=\"${PS3RECOMP_FFMPEG_INCLUDE_DIR}\" has no "
+            "libavcodec/avcodec.h. If the folder name has spaces, quote it: "
+            "-DPS3RECOMP_FFMPEG_INCLUDE_DIR=\"<dir>\"")
     endif()
     target_include_directories(ps3recomp_runtime PRIVATE "${PS3RECOMP_FFMPEG_INCLUDE_DIR}")
     target_compile_definitions(ps3recomp_runtime PRIVATE PS3RECOMP_FFMPEG_RUNTIME)
@@ -339,20 +348,26 @@ endif()
 # ---------------------------------------------------------------------------
 if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(ps3recomp_runtime PRIVATE
-        -Wall -Wextra -Wno-unused-parameter
         -fno-strict-aliasing
         # No spontaneous fused multiply-add. MSVC never contracts, and x86-64
         # without -mfma has nothing to contract into, so every validated
         # result came from separate multiplies and adds; arm64 has FMA in
         # the base ISA and Clang fuses by default there. A PPC fmadd is
         # spelt as one where the lifter means one.
-        -ffp-contract=off
+        $<IF:$<STREQUAL:${CMAKE_C_COMPILER_FRONTEND_VARIANT},MSVC>,/clang:-ffp-contract=off,-ffp-contract=off>
         # Explicit, because the per-config defaults cannot be trusted: this
         # tree's caches carry CMAKE_C_FLAGS_RELEASE="" and CMAKE_CXX_FLAGS_RELEASE="",
         # and clang-cl with no /O flag compiles at /Od -- a "Release" runtime
         # was unoptimised without a word. Duplicating a default -O2 is harmless.
         $<$<CONFIG:Release,RelWithDebInfo>:-O2>
     )
+    # clang-cl reads -Wall as /Wall (= -Weverything): hundreds of MB of warnings
+    # on a first build (issue R2#11). /W3 is its usual level.
+    if(CMAKE_C_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+        target_compile_options(ps3recomp_runtime PRIVATE /W3)
+    else()
+        target_compile_options(ps3recomp_runtime PRIVATE -Wall -Wextra -Wno-unused-parameter)
+    endif()
     # SSE4.1 (any x86-64 since ~2008): pshufb/blendv for spu_shufb, the
     # hottest SPU op in lifted audio code. Probed rather than assumed: recent
     # Apple clang rejects the flag outright for arm64 ("unsupported option
@@ -426,18 +441,64 @@ if(PS3RECOMP_BUILD_TESTS)
     if(UNIX)
         add_subdirectory(tests/gcm_reports)
     endif()
+    # Native hot paths (R1 port): SSE2 texture untile/convert and the streaming
+    # upload-heap copy, byte for byte against the code they replace.
+    add_executable(test_native_hot tests/test_native_hot.c
+                   libs/video/rsx_texture_layout.c libs/video/rsx_native_hot.c)
+    target_include_directories(test_native_hot PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include"
+                               "${CMAKE_CURRENT_SOURCE_DIR}/libs/video")
+    add_test(NAME native_hot COMMAND test_native_hot)
     # PS3_LOG_FIRST, the saturating counter behind the "first n times" log lines.
     add_executable(test_log_first tests/test_log_first.c)
     target_include_directories(test_log_first PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
     add_test(NAME log_first COMMAND test_log_first)
+    # ps3_ftrace.h: trigger-only PS3_FTRACE stays disarmed (no hook cost, no buffer) until triggered.
+    add_executable(test_ftrace tests/test_ftrace.c)
+    target_include_directories(test_ftrace PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    add_test(NAME ftrace_trigger COMMAND test_ftrace)
+    # port_pc_extras.h: rumble / stick / hold-toggle / UI scale / SFO / mod order logic (shared with R2/R3).
+    add_executable(test_pc_extras tests/test_pc_extras.c)
+    target_include_directories(test_pc_extras PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    add_test(NAME pc_extras COMMAND test_pc_extras)
+    # port_pc_extras2.h: benchmark statistics / crosshair / Steam Deck / window position (shared with R2/R3).
+    add_executable(test_pc_extras2 tests/test_pc_extras2.c)
+    target_include_directories(test_pc_extras2 PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    add_test(NAME pc_extras2 COMMAND test_pc_extras2)
     # port_hdr.h, the SDR -> HDR curve of the present pass (and its inverse for screenshots).
     add_executable(test_port_hdr tests/test_port_hdr.c)
     target_include_directories(test_port_hdr PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/libs/video")
     add_test(NAME port_hdr COMMAND test_port_hdr)
+    # port_latency.h: PORT_LATENCY (Reflex / Anti-Lag 2) selection, shared with the R2/R3 ports.
+    add_executable(test_port_latency tests/test_port_latency.c)
+    target_include_directories(test_port_latency PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/libs/video")
+    add_test(NAME port_latency COMMAND test_port_latency)
+    # audio_decomb.h: libmixer TYPE2A delayed side copy kept out of the stereo fold (R1 #10 "tin can").
+    add_executable(test_audio_decomb tests/test_audio_decomb.c)
+    target_include_directories(test_audio_decomb PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/libs/audio")
+    add_test(NAME audio_decomb COMMAND test_audio_decomb)
     # rsx_vp_cpu.h: exact DLSS camera motion from a vertex program's matrices.
     add_executable(test_vp_cpu_camera tests/test_vp_cpu_camera.c)
     target_include_directories(test_vp_cpu_camera PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/libs/video")
     add_test(NAME vp_cpu_camera COMMAND test_vp_cpu_camera)
+    # rsx_prim_assembly.h: strip / fan / quad streams continued across DRAW batches.
+    add_executable(test_prim_assembly tests/test_prim_assembly.c)
+    target_include_directories(test_prim_assembly PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/libs/video")
+    add_test(NAME prim_assembly COMMAND test_prim_assembly)
+    # rsx_ext_state.h: alpha-to-coverage, user clip planes, point sprites, guest samplers,
+    # and the VS variant patch on real rsx_vp_decompiler output.
+    add_executable(test_ext_state tests/test_ext_state.c libs/video/rsx_vp_decompiler.c)
+    target_include_directories(test_ext_state PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+                                                      "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    add_test(NAME ext_state COMMAND test_ext_state)
+    # savedata_backup.h: per-slot save backups (stamps, keep-newest-N rotation, identical-skip).
+    add_executable(test_savedata_backup libs/system/tests/test_savedata_backup.c)
+    add_test(NAME savedata_backup COMMAND test_savedata_backup "${CMAKE_CURRENT_BINARY_DIR}/savedata_backup_scratch")
+    # port_frametime.h (the port's stutter recorder): avg / 1% low / 0.1% low, histogram, worst spikes.
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../project/port_frametime.h")
+        add_executable(test_frametime_stats tests/test_frametime_stats.cpp)
+        target_include_directories(test_frametime_stats PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../project")
+        add_test(NAME frametime_stats COMMAND test_frametime_stats)
+    endif()
     # rfom_trophy_data.h (the port's trophy hook): unlocks recorded once, no repeated toasts,
     # platinum award, Saved Games record round trip.
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../project/rfom_trophy_data.h")
@@ -451,6 +512,13 @@ if(PS3RECOMP_BUILD_TESTS)
         target_include_directories(test_rfom_achievements PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../project")
         add_test(NAME rfom_achievements COMMAND test_rfom_achievements)
     endif()
+    # port_ini_migrate.h (launchers + in-game settings loaders): renamed settings.ini keys, old -> new.
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../project/tests/ini_migrate_test.cpp")
+        add_executable(test_ini_migrate ../project/tests/ini_migrate_test.cpp)
+        target_include_directories(test_ini_migrate PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../project")
+        target_compile_features(test_ini_migrate PRIVATE cxx_std_17)
+        add_test(NAME ini_migrate COMMAND test_ini_migrate)
+    endif()
     # spurs_mt.h: SPU lane pool sizing / CPU placement, and a threaded model of
     # the lane scheduler's targeted wakes (dependency order, no lost kicks).
     if(WIN32)
@@ -458,6 +526,95 @@ if(PS3RECOMP_BUILD_TESTS)
         target_link_libraries(test_spurs_mt PRIVATE Synchronization)
         add_test(NAME spurs_mt COMMAND test_spurs_mt)
         set_tests_properties(spurs_mt PROPERTIES TIMEOUT 120)
+        # rsx_texpack.inc's HD UI pack (RSX_HD_UI): lookup by the upload's key, staging of every level, fallbacks on
+        # bad files, folder scan, memory budget, and a D3D12 WARP texture at the replacement's size.
+        add_executable(test_hd_ui tests/test_hd_ui.c
+                       libs/video/rsx_texture_layout.c libs/video/rsx_native_hot.c)
+        target_include_directories(test_hd_ui PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include"
+                                   "${CMAKE_CURRENT_SOURCE_DIR}/libs/video")
+        target_link_libraries(test_hd_ui PRIVATE d3d12 dxgi dxguid)
+        add_test(NAME hd_ui COMMAND test_hd_ui WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
+        # rsx_fp_decompiler.c RSX_FP_EXTOPS: DDX/DDY/TXD/DST/LIT/STR/SFL/BEM/DP2A/RFL/TEXBEM emitted, ps_5_0
+        # compiles, and LIT/DST/RFL/DP2A executed on WARP against reference values.
+        add_executable(test_fp_extops tests/test_fp_extops.c libs/video/rsx_fp_decompiler.c)
+        target_include_directories(test_fp_extops PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include"
+                                   "${CMAKE_CURRENT_SOURCE_DIR}/libs/video")
+        target_link_libraries(test_fp_extops PRIVATE d3d11 dxgi dxguid d3dcompiler)
+        add_test(NAME fp_extops COMMAND test_fp_extops)
+        # rsx_pso_cache.c (RSX_PSO_LIBRARY): the D3D12 pipeline library round trip on WARP, and damaged / truncated /
+        # other GPU / other build / driver-rejected files ignored safely.
+        add_executable(test_pso_cache tests/test_pso_cache.c libs/video/rsx_pso_cache.c)
+        target_include_directories(test_pso_cache PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/libs/video")
+        target_link_libraries(test_pso_cache PRIVATE d3d12 dxgi dxguid d3dcompiler)
+        add_test(NAME pso_cache COMMAND test_pso_cache WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
+        # rsx_mt_record.c (RSX_MT_RECORD): the job queue and checksum memo under stress, and a heavy synthetic frame
+        # stream on WARP rendered pixel-exact with the views created inline and on the worker pool. With an Agility
+        # SDK bin folder (D3D12Core.dll + d3d12SDKLayers.dll) in RSX_D3D12_SDK_LAYERS_DIR it runs under the debug
+        # layer with GPU-based validation. `test_mt_record <dir> timing` also prints the render-thread timings.
+        # The folder's D3D12Core.dll version goes in RSX_D3D12_SDK_LAYERS_VER (the test exports it as D3D12SDKVersion);
+        # the build copies the two DLLs next to the test in mtr_d3d12\.
+        set(RSX_D3D12_SDK_LAYERS_DIR "" CACHE PATH "Agility SDK bin folder for the D3D12 debug layer in test_mt_record")
+        set(RSX_D3D12_SDK_LAYERS_VER "620" CACHE STRING "Agility SDK version of RSX_D3D12_SDK_LAYERS_DIR")
+        set(_mtr_sdk "${RSX_D3D12_SDK_LAYERS_DIR}")
+        if(NOT _mtr_sdk AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../scratch/agility/pkg/build/native/bin/x64/d3d12SDKLayers.dll")
+            set(_mtr_sdk "${CMAKE_CURRENT_SOURCE_DIR}/../scratch/agility/pkg/build/native/bin/x64")
+        endif()
+        add_executable(test_mt_record tests/test_mt_record.c libs/video/rsx_mt_record.c libs/video/rsx_mt_replay.c)
+        target_include_directories(test_mt_record PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/libs/video")
+        target_link_libraries(test_mt_record PRIVATE d3d12 dxgi dxguid d3dcompiler)
+        target_compile_definitions(test_mt_record PRIVATE MTR_AGILITY_VER=${RSX_D3D12_SDK_LAYERS_VER})
+        if(_mtr_sdk)
+            add_custom_command(TARGET test_mt_record POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:test_mt_record>/mtr_d3d12"
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_mtr_sdk}/D3D12Core.dll" "${_mtr_sdk}/d3d12SDKLayers.dll"
+                        "$<TARGET_FILE_DIR:test_mt_record>/mtr_d3d12/")
+            file(TO_NATIVE_PATH "${_mtr_sdk}" _mtr_sdk)
+        else()
+            set(_mtr_sdk "none")
+        endif()
+        add_test(NAME mt_record COMMAND test_mt_record "${_mtr_sdk}" WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
+        set_tests_properties(mt_record PROPERTIES TIMEOUT 600)
+        # HDUIPack.exe (project/hd_ui_pack.cpp + hd_ui_game_r1.h): DDS round trip through the renderer's check and
+        # staging, atomic pack commit / recovery, atomic upscaler install, and every menu / HUD texture of the
+        # installed game keyed as the upload keys it (skipped without the game files).
+        get_filename_component(_hdui_repo "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
+        if(EXISTS "${_hdui_repo}/project/hd_ui_pack.cpp" AND EXISTS "${_hdui_repo}/project/tests/hd_ui/hd_ui_test.cpp")
+            add_executable(test_hd_ui_pack "${_hdui_repo}/project/tests/hd_ui/hd_ui_test.cpp"
+                           libs/video/rsx_texture_layout.c libs/video/rsx_native_hot.c third_party/miniz/miniz.c)
+            target_include_directories(test_hd_ui_pack PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include"
+                                       "${CMAKE_CURRENT_SOURCE_DIR}/libs/video" "${CMAKE_CURRENT_SOURCE_DIR}/third_party/miniz"
+                                       "${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb" "${_hdui_repo}/project")
+            target_compile_features(test_hd_ui_pack PRIVATE cxx_std_17)
+            target_compile_definitions(test_hd_ui_pack PRIVATE _CRT_SECURE_NO_WARNINGS HDUI_REPO="${_hdui_repo}")
+            target_link_libraries(test_hd_ui_pack PRIVATE urlmon bcrypt)
+            set(_hdui_usr "none")
+            if(EXISTS "${_hdui_repo}/gamefiles/PS3_GAME/USRDIR/game.psarc")
+                set(_hdui_usr "${_hdui_repo}/gamefiles/PS3_GAME/USRDIR")
+            endif()
+            add_test(NAME hd_ui_pack_dds COMMAND test_hd_ui_pack dds)
+            add_test(NAME hd_ui_pack_folder COMMAND test_hd_ui_pack folder "${CMAKE_CURRENT_BINARY_DIR}/hd_ui_folder_test")
+            add_test(NAME hd_ui_pack_upscaler COMMAND test_hd_ui_pack upscaler "${CMAKE_CURRENT_BINARY_DIR}/hd_ui_upscaler_test")
+            # GPU safety without the GPU: the upscaler's command line, the watchdog (on a stand-in upscaler) and the
+            # settings after a crashed / failed run
+            add_test(NAME hd_ui_pack_gpu_safety COMMAND test_hd_ui_pack gpu_safety "${CMAKE_CURRENT_BINARY_DIR}/hd_ui_gpu_safety_test")
+            set_tests_properties(hd_ui_pack_gpu_safety PROPERTIES TIMEOUT 120)
+            # The pack and tools\upscaler on different drives (skipped when LOCALAPPDATA is on the repo's drive)
+            set(_xvol "none")
+            if(DEFINED ENV{LOCALAPPDATA})
+                file(TO_CMAKE_PATH "$ENV{LOCALAPPDATA}" _la)
+                string(SUBSTRING "${_la}" 0 2 _la_drive)
+                string(SUBSTRING "${_hdui_repo}" 0 2 _repo_drive)
+                string(TOUPPER "${_la_drive}" _la_drive)
+                string(TOUPPER "${_repo_drive}" _repo_drive)
+                if(NOT _la_drive STREQUAL _repo_drive)
+                    set(_xvol "${_la}/hd_ui_xvolume_test")
+                endif()
+            endif()
+            add_test(NAME hd_ui_pack_xvolume COMMAND test_hd_ui_pack xvolume "${CMAKE_CURRENT_BINARY_DIR}/hd_ui_xvolume_test" "${_xvol}")
+            set_tests_properties(hd_ui_pack_xvolume PROPERTIES SKIP_RETURN_CODE 77)
+            add_test(NAME hd_ui_pack_real COMMAND test_hd_ui_pack real "${_hdui_usr}")
+            set_tests_properties(hd_ui_pack_real PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+        endif()
     endif()
 
     find_package(Python3 3.10 COMPONENTS Interpreter QUIET)

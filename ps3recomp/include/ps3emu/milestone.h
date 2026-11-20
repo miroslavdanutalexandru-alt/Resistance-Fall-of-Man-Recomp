@@ -64,10 +64,19 @@ void ps3_msf(const char* fmt, ...);
  * line for it. */
 void ps3_ms_kv(const char* key, long long value);
 
-/* Write the final counts section and close the log. Registered with atexit() on
+/* Write the final counts section and close the log. Registered with atexit() and
+ * the exit-hook list (ps3_exit_hook_register) on
  * first use; calling it directly is safe and idempotent. Counts are also
  * checkpointed as the run goes, so this is the tidy ending, not the only one. */
 void ps3_ms_dump(void);
+
+/* Exit hooks. sys_process_exit leaves with ExitProcess/_exit (no CRT atexit
+ * handlers or static destructors while the RSX/SPU threads still run), so a
+ * handler that must run on a guest exit registers here instead of atexit():
+ * the function is ALSO passed to atexit(), and the fast exit runs the list
+ * (last registered first) itself. Each hook runs at most once either way. */
+void ps3_exit_hook_register(void (*fn)(void));
+void ps3_exit_hooks_run(void);
 
 #ifdef __cplusplus
 } /* extern "C" */

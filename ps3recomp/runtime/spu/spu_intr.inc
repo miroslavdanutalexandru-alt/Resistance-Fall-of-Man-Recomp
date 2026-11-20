@@ -118,7 +118,7 @@ int ps3_intr_wait(uint64_t thread)
             return 1;
         }
 #ifdef _WIN32
-        Sleep(1);
+        port_sleep_1ms();   /* perf pass 9: HR timer (PORT_HIRES_SLEEP) */
 #else
         { struct timespec ts = {0, 200 * 1000}; nanosleep(&ts, 0); }
 #endif

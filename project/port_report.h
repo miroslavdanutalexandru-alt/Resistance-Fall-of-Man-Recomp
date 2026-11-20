@@ -12,8 +12,9 @@
  *       the launcher is in front (a 3 s timer with its own TIMERPROC).
  *   port_report_ui(main_window)
  *       the "Report a problem" button: description box, "include my save
- *       files" tick box, creates Desktop\<Game>_report_<time>.zip and shows it
- *       in Explorer.
+ *       files" tick box, creates Desktop\<Game>_report_<time>.zip, shows it
+ *       in Explorer and opens GitHub's new-issue page for the port's repo with
+ *       a filled-in template (the player attaches the zip; nothing is uploaded).
  *   port_report::create(options, result)
  *       the bundler itself, no UI (tests, tools).
  */
@@ -35,7 +36,8 @@ struct Options {
     std::string game;            /* zip name prefix; empty = detected (Resistance3, ...) */
     std::string note;            /* the tester's description, saved as note.txt */
     bool include_saves = false;
-    uint64_t cap_bytes = 50ull << 20;   /* total size of everything packed (before compression) */
+    uint64_t cap_bytes = 50ull << 20;   /* total size of everything packed (before compression), dumps aside */
+    uint64_t dump_cap_bytes = 200ull << 20;   /* the newest two crash dumps go in when together at most this; 0 = none */
 };
 
 struct Result {
@@ -53,6 +55,8 @@ std::string find_root(const char* exe_dir);
 std::vector<std::string> save_dirs(const std::string& root, const std::string& game);
 uint64_t dir_size(const std::string& dir, uint64_t stop_after = ~0ull);
 std::string system_info(const std::string& root);
+std::string find_repo(const std::string& root);   /* owner/name: DIST_REPO, else "repo" in recomplauncher.json */
+std::string issue_url(const std::string& root, const std::string& repo, const std::string& note, const std::string& zip_name);
 
 } // namespace port_report
 

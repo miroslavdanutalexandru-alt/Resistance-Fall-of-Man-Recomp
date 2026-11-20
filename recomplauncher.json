@@ -110,7 +110,7 @@
     },
     {
       "id": "fps",
-      "label": "Frame rate limit",
+      "label": "Frame rate",
       "help": "The PS3 game runs at 30. Higher limits play smoother without playing faster.",
       "choices": [
         {
@@ -274,7 +274,7 @@
       "help": "With an anti-aliasing mode on: draws the scene smaller and upscales it. Much faster.",
       "choices": [
         {
-          "label": "Native",
+          "label": "Native (DLAA / anti-aliasing only)",
           "set": {
             "upscale": "1"
           }

@@ -6,6 +6,7 @@
 #define SYS_SEMAPHORE_H
 
 #include "lv2_syscall_table.h"
+#include "../platform/port_cacheline.h"   /* PS3_CACHELINE_ALIGN (perf final pass) */
 #include "../ppu/ppu_context.h"
 #include "../../include/ps3emu/ps3types.h"
 #include "../../include/ps3emu/error_codes.h"
@@ -27,7 +28,7 @@ extern "C" {
 
 #define SYS_SEMAPHORE_MAX  256
 
-typedef struct sys_semaphore_info {
+typedef struct PS3_CACHELINE_ALIGN sys_semaphore_info {
     int      active;
     char     name[8];
     uint32_t protocol;

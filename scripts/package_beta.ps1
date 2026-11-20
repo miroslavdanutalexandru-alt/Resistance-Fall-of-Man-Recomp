@@ -43,6 +43,61 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+# Windows PowerShell started from a PowerShell 7 window (directly or through cmd / a .bat) inherits pwsh's module
+# paths and then cannot load its own modules: Get-FileHash and Get-AuthenticodeSignature are 'not recognized', and
+# Expand-Archive loads pwsh's copy and fails. Keep only Windows PowerShell's own paths. Get-PortFileHash and
+# Expand-PortZip fall back to .NET if the cmdlets still cannot run (same output: upper-case hex / the same files).
+# (Same block in setup.ps1, tools\update.ps1, tools\get_shaderscan.ps1, tools\installer\prereqs.ps1, scripts\*.ps1.)
+if ($PSVersionTable.PSVersion.Major -lt 6) {
+    $pmp = @(($env:PSModulePath -split ';') | Where-Object { $_ -and $_ -notmatch '\\PowerShell\\(7[^\\]*\\)?Modules\\?$' })
+    $pmpSys = Join-Path $PSHOME 'Modules'
+    if (-not @($pmp | Where-Object { $_.TrimEnd('\') -eq $pmpSys }).Count) { $pmp += $pmpSys }
+    $env:PSModulePath = $pmp -join ';'
+}
+$script:PortHashCmd = $null
+function Get-PortFileHash([string]$LiteralPath, [string]$Algorithm = 'SHA256') {
+    if ($script:PortHashCmd -ne $false) {
+        try {
+            $r = Get-FileHash -LiteralPath $LiteralPath -Algorithm $Algorithm
+            $script:PortHashCmd = $true
+            if ($null -eq $r) { return $null }
+            return "$($r.Hash)".ToUpperInvariant()
+        } catch [System.Management.Automation.CommandNotFoundException] { $script:PortHashCmd = $false }
+    }
+    $a = switch ($Algorithm.ToUpperInvariant()) {
+        'SHA1' { [Security.Cryptography.SHA1]::Create() }
+        'SHA384' { [Security.Cryptography.SHA384]::Create() }
+        'SHA512' { [Security.Cryptography.SHA512]::Create() }
+        'MD5' { [Security.Cryptography.MD5]::Create() }
+        default { [Security.Cryptography.SHA256]::Create() }
+    }
+    $s = [IO.File]::OpenRead($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($LiteralPath))
+    try { return ([BitConverter]::ToString($a.ComputeHash($s)) -replace '-', '') } finally { $s.Dispose(); $a.Dispose() }
+}
+function Expand-PortZip([string]$LiteralPath, [string]$DestinationPath, [switch]$Force) {
+    try { Expand-Archive -LiteralPath $LiteralPath -DestinationPath $DestinationPath -Force:$Force -ErrorAction Stop; return }
+    catch {
+        $e = $_.Exception
+        while ($e -is [System.Management.Automation.ActionPreferenceStopException] -and $e.InnerException) { $e = $e.InnerException }
+        if (-not ($e -is [System.Management.Automation.CommandNotFoundException] -or $e -is [System.Management.Automation.MethodException])) { Write-Error -ErrorRecord $_; return }
+    }
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $src = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($LiteralPath)
+    $dst = [IO.Path]::GetFullPath($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($DestinationPath))
+    [void][IO.Directory]::CreateDirectory($dst)
+    $root = $dst.TrimEnd('\') + '\'
+    $z = [IO.Compression.ZipFile]::OpenRead($src)
+    try {
+        foreach ($en in $z.Entries) {
+            $t = [IO.Path]::GetFullPath([IO.Path]::Combine($dst, $en.FullName))
+            if (-not $t.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) { throw "Unsafe path in $src`: $($en.FullName)" }
+            if ($en.FullName.EndsWith('/') -or $en.FullName.EndsWith('\')) { [void][IO.Directory]::CreateDirectory($t); continue }
+            if (-not $Force -and [IO.File]::Exists($t)) { throw "$t already exists (Expand-Archive without -Force)" }
+            [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($t))
+            [IO.Compression.ZipFileExtensions]::ExtractToFile($en, $t, $true)
+        }
+    } finally { $z.Dispose() }
+}
 Set-StrictMode -Version 2.0
 $Repo = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $Dist = Join-Path $Repo 'dist'
@@ -96,8 +151,13 @@ if (Test-Path -LiteralPath $versionFile) {
 # ---------------------------------------------------------------- required files
 $required = @('README.md', 'LICENSE', 'THIRD_PARTY_NOTICES.md', 'VERSION', 'Setup.bat', 'setup.ps1', 'run.bat',
               'docs\RELEASE_NOTES_BETA.md', 'docs\REPORTING.md', 'docs\INSTALL.md', 'tools\installer\prereqs.ps1', 'tools\installer\gamefiles.ps1',
-              'tools\installer\build_installer.ps1', 'tools\installer\port.iss', 'tools\installer\port_common.iss')
+              'tools\installer\build_installer.ps1', 'tools\installer\port.iss', 'tools\installer\port_common.iss',
+              'tools\build_doctor.ps1', 'tools\fix_timestamps.ps1', 'tools\update.ps1')
 foreach ($f in $required) { if (-not (Test-Path -LiteralPath (Join-Path $Repo $f))) { Fail "$f missing" } }
+# The release zip is a git archive of HEAD: a required file that exists here but is not committed would be missing
+# from it (setup.ps1 dot-sources tools\build_doctor.ps1 and tools\installer\gamefiles.ps1).
+$headFiles = @(& git -C $Repo -c core.quotepath=off ls-tree -r --name-only HEAD 2>$null)
+foreach ($f in $required) { if ((Test-Path -LiteralPath (Join-Path $Repo $f)) -and ($headFiles -notcontains $f.Replace('\', '/'))) { Fail "$f is not committed: the release zip (git archive of HEAD) would not have it" } }
 foreach ($f in @('docs\INSTALL.md')) { if (-not (Test-Path -LiteralPath (Join-Path $Repo $f))) { Warn "$f missing (the setup work adds it)" } }
 $setupExeSrc = Join-Path $Repo 'tools\installer\setup_exe\setup.cpp'
 $setupExe = Join-Path $Repo 'Setup.exe'
@@ -153,7 +213,9 @@ $strict = [ordered]@{
     'downloaded SDKs'           = '^tools/(dlss|xess|ffmpeg_bin)/|(^|/)(nvngx_dlss|libxess|avcodec-\d+|avutil-\d+|swresample-\d+|r2_dlss|rfom_dlss)\.dll$|nvsdk_ngx'
     'RPCS3 key_vault'           = 'key_vault'
 }
-$allowBin = @('^Launcher\.exe$', '^Setup\.exe$', '^RFoMSwitch\.exe$', $Prof.FfxDlls)
+$allowBin = @('^Launcher\.exe$', '^Setup\.exe$', '^RFoMSwitch\.exe$', $Prof.FfxDlls,
+              # HD UI pack upscaler (Real-ESRGAN-ncnn, MIT; HDUIPack.exe checks their SHA-256; THIRD_PARTY_NOTICES.md)
+              '^tools/hdui_upscaler/bin/(realesrgan-ncnn-(cpu|vulkan)\.exe|vcomp140\.dll)$')
 $hits = @()
 foreach ($f in $set) {
     foreach ($k in $strict.Keys) { if ($f -match $strict[$k]) { $hits += "$f  [$k]"; break } }
@@ -161,6 +223,11 @@ foreach ($f in $set) {
 }
 $hits = @($hits | Sort-Object -Unique)
 foreach ($h in $hits) { Fail "the installer would ship $h" }
+# The SDL3 pad backend (DualSense / DualShock 4 without Steam Input) is compiled in only if this lib is in the
+# release; it used to be caught by ps3recomp/.gitignore's *.lib (GitHub issue #6, "DS4 not detected").
+if ($tracked -notcontains 'ps3recomp/third_party/SDL3/lib/SDL3-static.lib') {
+    Fail "ps3recomp/third_party/SDL3/lib/SDL3-static.lib is not committed: user builds would be XInput only (git add -f it)"
+}
 foreach ($f in 'README.md', 'LICENSE', 'THIRD_PARTY_NOTICES.md', 'VERSION', 'docs/RELEASE_NOTES_BETA.md', 'docs/REPORTING.md', 'docs/INSTALL.md') {
     if ((Test-Path -LiteralPath (Join-Path $Repo $f)) -and ($set -notcontains $f)) { Warn "$f is not in the installer yet: build_installer.ps1 only picks up new files under project/, tools/, ps3recomp/, docs/ and the root, so commit it" }
 }
@@ -228,6 +295,20 @@ if (Test-Path -LiteralPath $setupExe) {
     $z = [System.IO.Compression.ZipFile]::Open($relZip, 'Update')
     try {
         [void][System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($z, $setupExe, "$($Prof.Short)-$ver/Setup.exe")
+        # install_manifest.txt: "<sha256> <path>" of every shipped file. tools\update.ps1 deletes a file that a later
+        # version no longer ships only if it is listed here and unchanged, so nothing of the player's is ever deleted.
+        $pre = "$($Prof.Short)-$ver/"; $man = New-Object System.Text.StringBuilder
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            foreach ($e in @($z.Entries)) {
+                if ($e.FullName.EndsWith('/') -or -not $e.FullName.StartsWith($pre)) { continue }
+                $s = $e.Open(); try { $h = $sha.ComputeHash($s) } finally { $s.Dispose() }
+                [void]$man.Append(([BitConverter]::ToString($h) -replace '-', '').ToLowerInvariant() + ' ' + $e.FullName.Substring($pre.Length) + "`n")
+            }
+        } finally { $sha.Dispose() }
+        $me = $z.CreateEntry("${pre}install_manifest.txt")
+        $w = New-Object System.IO.StreamWriter($me.Open(), (New-Object System.Text.UTF8Encoding $false))
+        try { $w.Write($man.ToString()) } finally { $w.Dispose() }
         Set-ZipPastTimes $z
     } finally { $z.Dispose() }
     $assets += $relZip
@@ -241,7 +322,7 @@ if ($SourceZip) {
     try { Set-ZipPastTimes $z } finally { $z.Dispose() }
     $assets += $srcZip
 }
-$sums = @($assets | ForEach-Object { '{0}  {1}' -f (Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash.ToLowerInvariant(), (Split-Path -Leaf $_) })
+$sums = @($assets | ForEach-Object { '{0}  {1}' -f (Get-PortFileHash $_ SHA256).ToLowerInvariant(), (Split-Path -Leaf $_) })
 [System.IO.File]::WriteAllLines((Join-Path $Dist 'SHA256SUMS.txt'), $sums, (New-Object System.Text.UTF8Encoding $false))
 Write-Host ""
 $sums | ForEach-Object { Write-Host $_ }

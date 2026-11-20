@@ -120,12 +120,16 @@ function Get-IsoSha1($iso, $entry) {
     [void]$sha.TransformFinalBlock($buf, 0, 0)
     return ([BitConverter]::ToString($sha.Hash) -replace '-', '').ToLower()
 }
+# Top-level disc folders the game never reads, left out of the copy: PS3_CONTENT (bonus videos for the PS3 menu,
+# 2.5 GB on Resistance 3) and PS3_UPDATE (the PS3 system update on the disc).
+$script:GfSkipDirs = @('PS3_CONTENT', 'PS3_UPDATE')
 # Copies the whole image (or the subfolder $Base, e.g. a dump kept one folder down) to $Dest.
-function Export-IsoTree($iso, $dirEntry, [string]$Dest, [ref]$Done, [int64]$Total) {
+function Export-IsoTree($iso, $dirEntry, [string]$Dest, [ref]$Done, [int64]$Total, [string[]]$Skip = @()) {
     New-Item -ItemType Directory -Force -Path $Dest | Out-Null
     $d = Get-IsoDir $iso @{ Lba = $dirEntry.Extents[0][0]; Size = $dirEntry.Extents[0][1] }
     $buf = New-Object byte[] (4MB)
     foreach ($e in $d.Values) {
+        if ($e.Dir -and $Skip -contains $e.Name) { continue }
         $target = Join-Path $Dest $e.Name
         if ($e.Dir) { Export-IsoTree $iso $e $target $Done $Total; continue }
         $out = [IO.File]::Create($target)
@@ -357,7 +361,7 @@ function Copy-GameSource($Prof, $c, [string]$Dest, [switch]$Move) {
             try { Move-Item -LiteralPath $c.Root -Destination $Dest -ErrorAction Stop } catch { return "Moving the game folder failed: $($_.Exception.Message)" }
             return $null
         }
-        & robocopy $c.Root $Dest /E /NFL /NDL /NJH /NJS /NP | Out-Null
+        & robocopy $c.Root $Dest /E /NFL /NDL /NJH /NJS /NP /XD @($script:GfSkipDirs | ForEach-Object { Join-Path $c.Root $_ }) | Out-Null
         if ($LASTEXITCODE -ge 8) { return "Copying the game files failed (robocopy code $LASTEXITCODE). Check the free space and that the source is readable." }
         return $null
     }
@@ -375,7 +379,7 @@ function Copy-GameSource($Prof, $c, [string]$Dest, [switch]$Move) {
     }
     if ($letter) {
         $src = "${letter}:\"; if ($c.Sub) { $src = Join-Path $src $c.Sub }
-        & robocopy $src $Dest /E /NFL /NDL /NJH /NJS /NP | Out-Null
+        & robocopy $src $Dest /E /NFL /NDL /NJH /NJS /NP /XD @($script:GfSkipDirs | ForEach-Object { Join-Path $src $_ }) | Out-Null
         $rc = $LASTEXITCODE
         Dismount-GameSource
         if ($rc -lt 8) { return $null }
@@ -389,7 +393,7 @@ function Copy-GameSource($Prof, $c, [string]$Dest, [switch]$Move) {
         $iso = Open-Iso $c.Root
         $start = if ($c.Sub) { Get-IsoEntry $iso $c.Sub } else { @{ Dir = $true; Extents = @(, @($iso.Root.Lba, $iso.Root.Size)) } }
         $done = [int64]0
-        Export-IsoTree $iso $start $Dest ([ref]$done) $c.Bytes
+        Export-IsoTree $iso $start $Dest ([ref]$done) $c.Bytes $script:GfSkipDirs
         Write-Progress -Activity 'Copying the game files from the disc image' -Completed
     } catch { return "Copying from the disc image failed: $($_.Exception.Message)" }
     finally { Close-Iso $iso }
@@ -509,7 +513,9 @@ function Show-GameCheck($c) {
     foreach ($n in $c.Notes) { Write-Host "   Also: $n" -ForegroundColor $col }
 }
 function Test-IsWine {
-    try { return [bool](Get-ItemProperty 'HKLM:\Software\Wine' -ErrorAction Stop) } catch {}
+    # Test-Path, not Get-ItemProperty -ErrorAction Stop: that shows up as a TerminatingError in Setup's log on every
+    # normal Windows PC (the key only exists under Wine)
+    if (Test-Path -LiteralPath 'HKLM:\Software\Wine' -ErrorAction SilentlyContinue) { return $true }
     return [bool]$env:WINEPREFIX -or [bool]$env:STEAM_COMPAT_DATA_PATH
 }
 # Asks for the game copy without needing a file picker: lists the copies found on this PC, and accepts a

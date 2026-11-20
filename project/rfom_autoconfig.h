@@ -244,13 +244,24 @@ inline void detect_screen(Hardware& h)
 
 // Wine / Proton (Linux, Steam Deck): ntdll exports wine_get_version. Steam sets SteamDeck=1 on the Deck;
 // its APU also reports as "AMD Custom GPU 0405" (LCD) / "0932" (OLED) or "VanGogh".
-inline void detect_platform(Hardware& h)
+// The Deck's SMBIOS board / product name (Jupiter = LCD, Galileo = OLED), for Windows installed on a Deck.
+#pragma comment(lib, "advapi32.lib")
+inline bool deck_board()
+{
+    static const char* const names[] = { "BaseBoardProduct", "SystemProductName" };
+    for (const char* name : names) {
+        char b[64] = ""; DWORD n = sizeof b;
+        if (RegGetValueA(HKEY_LOCAL_MACHINE, "HARDWARE\\DESCRIPTION\\System\\BIOS", name, RRF_RT_REG_SZ, NULL, b, &n) == ERROR_SUCCESS &&
+            (!_stricmp(b, "Jupiter") || !_stricmp(b, "Galileo"))) return true;
+    }
+    return false;
+}inline void detect_platform(Hardware& h)
 {
     HMODULE nt = GetModuleHandleA("ntdll.dll");
     h.wine = nt && GetProcAddress(nt, "wine_get_version") != NULL;
     char v[8] = "";
     h.deck = (GetEnvironmentVariableA("SteamDeck", v, sizeof v) && v[0] == '1') ||
-             has(h.gpu, "Custom GPU 0405") || has(h.gpu, "Custom GPU 0932") || has(h.gpu, "VanGogh");
+             has(h.gpu, "Custom GPU 0405") || has(h.gpu, "Custom GPU 0932") || has(h.gpu, "VanGogh") || deck_board();
     if (h.deck) h.integrated = true;
 }
 

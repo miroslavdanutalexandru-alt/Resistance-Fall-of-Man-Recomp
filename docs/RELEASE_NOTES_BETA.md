@@ -1,12 +1,107 @@
 # Resistance: Fall of Man PC port: community beta release notes
 
-**Version:** 0.2.3-beta (GitHub pre-release). **Release date:** _to be filled in on release_.
+**Version:** 0.3.0-beta (GitHub pre-release). **Release date:** 2026-11-20.
 
 A native PC port of *Resistance: Fall of Man* (PS3) built by static recompilation: the game's PowerPC and SPU code is translated to C/C++ and compiled for Windows. Nothing is emulated. It renders through the port's own **Direct3D 12** renderer.
 
 > **No game files and no prebuilt game are included.** This release is the source code plus Setup. You need your own legally dumped copy of the game (see *Install*); Setup builds the game on your PC from that copy.
 
 This is a **beta**. The campaign has been played up to Cheddar Gorge. Later levels haven't been tested. Please report what you find (see *Reporting problems*).
+
+## 0.3.0-beta
+
+The first big update after the setup hotfixes: performance and stability work, tank controls, many new PC options and rendering fixes. Unzip it over your existing port folder (or use the launcher's new in-place updater next time) and run Setup; it only rebuilds what changed. Your settings, saves and game copy are kept.
+
+### Fixes
+- **No more black screen after the door in "A Fate Worse Than Death"** after a few cutscene movies: finished threads kept their slots in the game's thread table (`PS3_THREAD_SLOT_FIX`, default on).
+- **Movie freeze:** the movie demuxer's input wait now gives up after 100 ms instead of waiting forever (`RFOM_MOVIE_DEMUX_WAIT_MS`, default 100; 0 = old behaviour).
+- **DLSS Frame Generation now really starts on RTX 40 / 50:** the signature check rejected NVIDIA's genuine `nvngx_dlssg.dll`, so it always fell back to FSR 3 frame generation.
+- **FSR ghosting:** the shadow pass and modulating blends are no longer marked in the FSR reactive mask (`RSX_FSR_RX_MUL=1` restores the old mask).
+- **Split-screen co-op:** clearing player 2's half no longer wipes player 1's view (issue #13; `RSX_CLEAR_SCISSOR`, default on).
+- **Mouse look in co-op** turns only player 1's camera (`RFOM_COOP_ML`, default on).
+- **Freeze safety:** SPU writes into the GPU command buffer write the jump word last (`GCM_PUT_ORDER=2`); a new park-clear grace for frame-label freezes is opt-in (`GCM_PARK_CLEAR=1`, off by default until tested on this game).
+- **Settings carry over:** `settings.ini` keys renamed to the names shared with the R2 / R3 ports (for example `lod_bias` → `lodbias`, `hud169` → `hudfix`) are migrated automatically.
+- **Fall detection dumps** (`logs\fall_*.bin`) no longer pile up: only the newest 5 are kept (`RFOM_FALL_DUMPS=<n>`, `0` = log line only).
+- **Gyro aiming stops in the background:** while the game window is in the background and *Controller in the background* does not let controllers drive the game, gyro look now stops like the buttons and sticks instead of still turning the camera.
+- **Achievement pop-ups are no longer lost:** an achievement earned while the game window was not in the foreground (for example while the front end hands over to the game) is now shown once the pop-up can appear, instead of being marked as announced without ever showing.
+- **Ultrawide: aiming no longer flips the picture to 16:9.** Aiming down sights and scopes set their own 16:9 camera, which switched the present back to 16:9 with the wide view squeezed in (issue #2). Every 16:9 camera (gameplay, ADS, scopes) is now widened alike and the stretch follows the window's aspect, so 21:9 / 32:9 stays put while aiming (`RFOM_ASPECT`; 16:9 art screens without a 3D camera are letterboxed).
+- **The game window gets the focus on Play:** started from the launcher it no longer ran in the background until Alt+Tab (`RSX_CLAIM_FOREGROUND=0` = old).
+- **HD UI pack:** no more dark squares in the HUD corners (loose images are upscaled separately; run *Update HD UI pack* once), and a graphics-card failure while making the pack no longer takes the driver down (see *HD UI pack* below).
+- **Build fix for folders with spaces:** the build no longer fails on the FFmpeg headers when the port folder's path contains spaces (issues #4 / #5).
+- **No more turret jitter with the mouse:** where the mouse drives the virtual stick (vehicles, turrets), slow moves now give a slow, even turn: the deflection starts past the game's deadzone, fractions of a step carry over and the poll interval uses a precise clock (issue #9).
+- **Hang fix:** the GPU command position is no longer reported past a label before the label is written, which could leave the game waiting forever (`GCM_GET_AT_LABEL`, default on).
+- **Crash fix:** game threads opening and closing files at the same time could corrupt the file table and crash (shared with the R2 / R3 ports).
+- **Level-change freeze fixed** (a deadlock in the loading cover window), and the always-on-top F10 hint box, a likely cause of the intro flicker, is removed.
+- **Smoother movies:** movie frames are presented in step with V-Sync, and the decoder logs no longer flood `run.log`.
+- **HDR10 stays on** after a window resize or a switch to borderless / fullscreen.
+- **Faster exit:** quitting no longer runs the full PS3 shutdown path that could hang (`PS3_EXIT_CRT=1` = old).
+- **No debug keys in normal play:** the developer trace / profiler keys (F5 / F6 / F7 / F9 / F11 memory dump, pad watch, frame trace, audio recording, profiler) were armed by `run.bat` and fired together with photo mode (F7), the extras menu (F9) and the benchmark key (F11). They are now off; the renderer's debug keys (Ctrl+F10, Ctrl+F12, Home, Shift+F10) need `PORT_DEBUG_KEYS=1`.
+
+### New features
+- **In-place updater:** the launcher's *Updates* option (Advanced page): **Notify** (default) offers *Update now*, which downloads the release (SHA-256 checked), replaces the port's files, runs Setup in update mode and restarts the launcher; **Auto-install**; **Off** (`PORT_NO_UPDATE_CHECK=1`). Settings, saves, game copy and builds are kept; a failed update is rolled back (`logs\update.log`). `PORT_UPDATE_NOTIFY_ONLY=1` = the old notice. Git checkouts and RecompLauncher installs only get the notice.
+- **PC SETTINGS inside the game's own menus** (*Options > PC SETTINGS*, main menu and pause menu), grouped like the R2 / R3 ports. The main menu's OPTIONS list gets an EXTRAS entry for MOVIES and CREDITS.
+- **PS3-style achievement pop-ups** for the fan-made achievements (`PORT_TROPHY_STYLE=old` = the older pop-up with the grade badge; `PORT_TROPHY_TEST=1` shows a sample of each grade).
+- **Save backups:** before the game overwrites a save, the previous version is copied to `saves_backup\` (newest 5 per save; `PORT_SAVE_BACKUP=0` off, `PORT_SAVE_BACKUP_KEEP=<n>`). The launcher's **Saves & tools** page lists, restores and deletes its own backups (`RFOM_SAVE_BACKUP`, keep 10) and can **import saves from RPCS3**.
+- **Frame-time benchmark:** **F11** in game starts / stops a capture (`RFOM_BENCH_KEY`, default F11; `F6`, `F5`, `off`) and writes `logs\bench\RFOM_bench_<date>.txt` with average, 1 % / 0.1 % low and stutters. A frame-time report (`logs\frametimes_*.txt`) is written at exit (`PORT_FRAMETIME=0` off); **Scroll Lock** marks a bad moment.
+- **HD UI pack** (experimental, off): launcher › Saves & tools › *Create HD UI pack* upscales the menu / HUD textures from your own game on your PC (`RSX_HD_UI=1`): on the graphics card in one Real-ESRGAN run (official `realesrgan-x4plus` model, downloaded once); if the graphics card fails, the upscaler is stopped at once and the rest is made on the CPU, and later runs use the CPU (delete `tools\upscaler\gpu_fault.txt` or run `HDUIPack.exe --use-gpu` to retry the GPU).
+- **CPU check and a build for older CPUs:** on a CPU without AVX2 Setup builds a slower variant (`build_baseline\`, needs SSE4.1) and the launcher starts it; the game explains instead of crashing when the CPU is below what the build needs.
+- **Game language:** launcher (Advanced) and F9 option *Game language* (`PS3_LANG`): Windows language (default) or English, English (UK), French, German, Italian, Spanish, Dutch, Portuguese, Russian, Polish, Finnish, Swedish, Danish, Norwegian, Japanese, Korean. Languages your copy does not have fall back to English; takes effect at the next start.
+- **Local co-op options:** *Local co-op (split-screen)* on / off (`PAD_COOP`) and which controller is player 1 / player 2 (`PAD_P1_CONTROLLER`, `PAD_P2_CONTROLLER`; SDL3 controller support).
+- **Compile shaders before playing** (`PORT_SHADER_PRELOAD`, default On): shaders already seen are built behind a "Compiling shaders N / M" panel at start, so they never stutter in game; Off builds them in the background while you play.
+- **Crosshair colour and size** for the extra crosshair (`RFOM_CROSSHAIR_COLOR`, `RFOM_CROSSHAIR_SIZE`).
+- **Frame generation backend** choice in the launcher (`RFOM_FG_BACKEND`), plus `PORT_FG=dlssg|fsr3|off` (the name shared with the R2 / R3 ports) to override it.
+- **Mods load order:** `mods\order.txt`, also editable on Saves & tools › Mods.
+- **Window position memory:** a windowed game reopens where you left it (`RSX_WINDOW_REMEMBER`, default on).
+- **Portable build tools** (experimental): Setup can put the missing build tools into `tools_cache\` inside the port folder instead of installing them (**P** at the tools question, or `Setup.bat -PortableTools`): LLVM, CMake, Ninja, Python, MinGit and the MSVC libraries + Windows SDK (via xwin) from their official downloads, SHA-checked; nothing outside the port folder changes. Setup now explains each missing tool (what it is for, where it comes from) before asking, records what it installed in `tools_cache\installed_by_setup.txt`, and `Setup.bat -RemoveTools` removes it again (`tools\installer\buildtools.ps1`).
+- **Setup help:** if the compiler runs out of memory, Setup retries with fewer files at a time and continues where it stopped; it suggests excluding the port folder from Microsoft Defender and warns about slow USB / exFAT / network drives.
+- **Build repair and disk space:** `tools\build_doctor.ps1` (`-DiskUsage` how much space each part takes, `-ResetConfig` a fresh CMake configuration that keeps the compiled files, `-FirstError` the first error in the build logs). Setup uses it to retry a failed build once with a fresh configuration (also after the port folder was moved) and prints the disk usage at the end.
+
+### Controls
+- **Tank turret with the mouse** (Ice and Iron): the mouse turns the turret by a set angle like on-foot look, instead of a slowly accelerating stick (`RFOM_TANK_MOUSE`, default on; speed: `mouse_tank_sensitivity = 1.0` in `controls.txt`, 0.05–10).
+- **Keyboard driving in the LU-P Lynx:** W / S accelerate / brake, A / D steer (`RFOM_KBM_DRIVE`, default on).
+- **Controller options** (Controls page and F9): outer deadzone `PAD_OUTER_DEADZONE`, anti-deadzone `PAD_ANTI_DEADZONE`, trigger deadzone `PAD_TRIGGER_DEADZONE`, turn boost `PAD_TURN_BOOST` (all off by default), crouch toggle / hold `PAD_CROUCH_MODE` (experimental), vibration strength `PAD_RUMBLE` (100 %), confirm button `PS3_ENTER_BUTTON=circle`, controllers in the background `PAD_BACKGROUND_INPUT` (Auto).
+- Round sticks reach the corners like the PS3's square stick (`PAD_SQUIRCLE`, default 4000; `0` = old); `PAD_MERGE=1` lets every controller drive player 1 (off, because of co-op); Nintendo button prompts (`RFOM_PAD_GLYPHS=nintendo`, auto for Switch controllers).
+- The skip-cutscene hint now follows *Skip unwatched movies* (**Auto**, default): it shows when that option is on, since every story movie can then be skipped (`PORT_SKIP_HINT=1` always, `0` never). _Not yet tested in game._
+- **Skip unwatched movies:** holding Space / Enter / A / Menu for 1 s now also skips a story movie you have not watched yet; the game itself only allowed skipping movies already seen. The port lifts the game's watched check only after the hold, so a quick tap never skips (`RFOM_CUTSCENE_SKIP_ALL`, default on, `0` = the game's rule; needs *Hold to skip movies*). Launcher: Interface & Notifications › *Skip unwatched movies*; also in F9 and PC SETTINGS › Controls.
+
+### Graphics
+- **Ambient occlusion** (experimental, off): `RSX_SSAO=1`, with `RSX_SSAO_STRENGTH` (0.6) and `RSX_SSAO_RADIUS` (1.0).
+- **Ultrawide HUD fix** (experimental, off): Display › *Ultrawide HUD* = Centred 16:9 (`RSX_HUD_FIX=1`) keeps the HUD in a centred 16:9 area; world markers may sit off their targets.
+- **Brightness** (`PS3_DISPLAY_GAMMA`, 1.0 = as the game; SDR), **HDR saturation** (`RFOM_HDR_SAT`) and **texture LOD bias** (`RSX_LOD_BIAS`, auto) are now launcher / F9 options.
+- **Rendering accuracy:** strips split over draw batches, quad strips, point sprites (particles), user clip planes, alpha-to-coverage, per-texture game samplers, fog, border colours, depth bias and more fragment-program ops now follow the PS3 (each has an `RSX_*` switch, default on; see the README's *Other options*). Matching depth passes no longer z-fight (`RSX_VS_STRICT`, on except on NVIDIA).
+- **Frame Generation quality** (DLSS-G and FSR 3): the generated frames now get the real camera solved from the game's matrices, with fallbacks when the candidates disagree, a short camera hold and a pause of frame generation while the camera is unsure; per-object motion vectors follow each draw's depth range and only accept close matches, which removes most ghosting at building entrances and doorways. DLSS-G menu detection is automatic, which removes 100–175 ms gameplay hitches; the DLSS feature is created off the render thread. All on by default; opt-outs for comparison: `RFOM_DLSS_FG_REAL_CAM=0`, `RFOM_DLSS_CAM_MEDOID=0`, `RFOM_DLSS_CAM_MEDOID_REL` (0.75), `RFOM_DLSS_CAM_TOL2=0`, `RFOM_DLSS_FG_CAM_HOLD=0`, `RFOM_FG_UNSURE_PAUSE=0`, `RSX_DLSS_MATCH_RATIO=0`, `RSX_DLSS_MV_ZRANGE=0`, `RFOM_DLSSG_MENU_DETECT=0|1` (force off / on), `RFOM_DLSS_PRECREATE=0`.
+- **AMD FSR 1 scaling:** Display › *Scaling* = AMD FSR 1 (`RSX_FILTER=fsr`) fits the final image to the screen with FSR 1's edge-adaptive upscale.
+- **Photo mode hides the HUD** (`RFOM_PHOTO_HIDEHUD`, default on).
+- **Pipeline library:** compiled pipelines are kept in `shadercache\pso_library_*.bin` and reused at start (`RSX_PSO_LIBRARY`, default on).
+- **DLSS quality options** (opt-in, off by default): `PORT_DLSS_RESET_HITCH_MS=<ms>` resets the DLSS history after a frame gap longer than that, `PORT_DLSS_RESET_CUTS=1` also on render / output size changes, and `PORT_UPSCALE_LOD_BIAS=auto|nv|<n>` overrides the texture LOD bias under upscaling. `PORT_DLSS_BIAS_MASK` is the name shared with the R2 / R3 ports for the DLSS effect mask (`RFOM_DLSS_REACTIVE`). The *DLSS preset* is checked against the installed DLSS version (a warning in the log if it ignores the preset), and Auto now picks CNN preset E on RTX 20 / 30, where the transformer model costs much more (`PORT_DLSS_AUTO_ARCH=0` = NVIDIA's default everywhere).
+
+### Audio
+- **Steadier audio:** the buffer grows after underruns and shrinks again when clean (`PORT_AUDIO_ADAPTIVE`, on), clock drift is steered smoothly (`PORT_AUDIO_DRIFT`, on), audio freezes cleanly while paused (`PORT_AUDIO_PAUSE_FREEZE`, on) and restarts fresh after the PC menu (`PORT_AUDIO_FOCUS_REPRIME`, on). Elastic late-block handling is experimental and off (`PORT_AUDIO_ELASTIC=1`).
+- **Movie sound** no longer sounds hollow in stereo (`AUDIO_P1_DECOMB`, on).
+- **Volume and mono:** master volume `PORT_VOLUME` (100) and an accessibility mono downmix `PORT_AUDIO_MONO=1`.
+- **English (UK) voice fallback:** speech missing from the UK set uses the English file (`PS3_LANG_VOICE_FALLBACK`, default 1; 2 = any language, 0 = off).
+
+### Performance
+- **PGO-optimised builds:** `build.bat` uses the committed profile `pgo\r1.profdata` automatically (2–5 % on CPU-bound frames); `set PORT_PGO=0` or `build.bat nopgo` builds without it. The profile needs **LLVM 22 or newer**; Setup updates an older LLVM.
+- **No-spin waits:** SPU and system waits park after a short spin instead of holding a core (`PORT_NOSPIN`, default on; `auto` = only below 12 threads; `0` = old), and idle SPUs skip their spin (`PORT_SPU_SPIN_ADAPT`, default 25 %).
+- **Thread placement:** on Intel hybrid CPUs the game's busy threads prefer P-cores (`PORT_CPU_PCORES`, on); optional raised priority (`PORT_THREAD_PRIORITY`, off) and large pages (`PORT_LARGE_PAGES`, off).
+- **Render thread offload:** texture views and change checks run on worker threads (`RSX_MT_RECORD`, on); multi-threaded draw recording is opt-in (`RSX_MT_REPLAY=1`).
+- **No Windows power throttling:** the game's threads opt out of EcoQoS, so a game window that started in the background is not slowed down (`PORT_ECOQOS=1` keeps the Windows default).
+- **Native texture decode** with SSE2, self-checked against the reference (`RSX_NATIVE_TEXDEC`, on).
+- **Few-core CPUs:** the port detects a CPU with few physical cores (`PORT_CORE_SCARCE`, below `PORT_CORE_SCARCE_BELOW` = 6 cores; `0` / `1` forces it, logged as `[cores]`) and then lets the GPU frame clock sleep until new work arrives instead of spinning on a core (`RSX_SPINWAIT=4`; other CPUs keep `1`, the old busy spin).
+
+### Settings
+- **Overlay:** the F3 overlay draws a frame-time graph (`PORT_OVERLAY_GRAPH`, on); the PC menus, overlay and notifications scale with the window (`PORT_UI_SCALE`, auto; 75–200 %).
+- **Latency reduction:** `PORT_LATENCY` = `off`, `reflex`, `antilag` (**AMD Anti-Lag 2**, Radeon RX 5000 or newer) or `auto`; unset = the NVIDIA Reflex setting alone decides.
+- **Frame rate:** new 40 and 45 fps caps; *Unlimited* is now capped at 240 fps.
+- New launcher options: *Achievement pop-up style* and *Show cutscene skip hint* (Interface & Notifications), *Brightness*, *HDR saturation* and *Ultrawide HUD* (Display); Brightness and HDR saturation are also in F9.
+
+### Known issues
+- **Frame Generation is still experimental:** some artifacts remain, such as some ghosting at building entrances and artifacts on the weapon (carbine) and at a distance. They will be fixed in an upcoming hot patch.
+- **Missing HUD / health bar and menu selection highlight:** some players see no HUD or health bar, or no highlight on the selected menu entry. Under investigation; please send `logs\run.log` if it happens to you.
+
+### Support
+If you enjoy the port and want to support it: [buymeacoffee.com/damiro98](https://buymeacoffee.com/damiro98) (always optional; nothing is unlocked by it).
 
 ## 0.2.3-beta (last hotfix)
 
@@ -38,7 +133,7 @@ If 0.2.0 is already built and runs, you don't need this update.
 ### Launcher
 - `Launcher.exe` holds all settings and key bindings. On first start it detects your hardware and picks a preset (Steam Deck included).
 - Pages: Display, Graphics, Upscaling & Frame Gen, Performance, Controls, Audio, Interface & Notifications, Advanced, Achievements, Saves & tools and About (`Launcher.exe --page N` opens one, 0–10).
-- The update check only opens the Releases page. Turn it off on the Advanced page or with `PORT_NO_UPDATE_CHECK=1`.
+- **Updates:** the launcher checks the Releases page at start and can update in place (*Update now*: downloads, replaces the port's files, runs Setup and restarts; a failed update is rolled back). The *Updates* option on the Advanced page picks Notify (default), Auto-install or Off (`PORT_NO_UPDATE_CHECK=1`).
 
 ### Graphics
 - **Anti-aliasing / upscaling:** Off, AMD FSR 3.1, NVIDIA DLSS / DLAA (GeForce RTX) or **Intel XeSS 2** (any DirectX 12 GPU with SM 6.4). Set it in the launcher or with `RSX_FSR` = 0 / 1 / 2 / 3.
@@ -72,7 +167,7 @@ If 0.2.0 is already built and runs, you don't need this update.
 
 ## What you download
 
-- **`ResistancePort-Setup-0.2.0-beta.exe`** from the GitHub release: an installer with the port's source, scripts and `Launcher.exe`. It installs the files and starts Setup.
+- **`ResistancePort-Setup-<version>.exe`** (for this release `ResistancePort-Setup-0.3.0-beta.exe`) from the GitHub release: an installer with the port's source, scripts and `Launcher.exe`. It installs the files and starts Setup.
 - or the **source code** (the release's source archive or `git clone` at the tag), then `Setup.bat`.
 
 Either way, the game itself is built on your PC; no built game program is published. Setup downloads the build tools, FFmpeg (an LGPL build), shaderscan, AMD's FSR 3 frame generation DLL and, if you accept their licences, the NVIDIA DLSS, Streamline (DLSS Frame Generation) and Intel XeSS SDKs.
@@ -80,12 +175,12 @@ Either way, the game itself is built on your PC; no built game program is publis
 ## Requirements
 
 - Windows 10 or 11, 64-bit. Steam Deck / Proton works; see the README.
-- A CPU with **AVX2** (Intel 4th generation or newer, or any AMD Ryzen).
+- A CPU with **AVX2** (Intel 4th generation or newer, or any AMD Ryzen) for the normal build. Older CPUs with SSE4.1 (Intel Core 2 Penryn or newer, AMD Bulldozer / FX or newer) get a slower variant without AVX2, which Setup builds by itself.
 - A **DirectX 12** GPU. It has been tested on AMD RX 6700 XT and NVIDIA RTX 5070. DLSS needs a GeForce RTX card.
 - The Microsoft Visual C++ 2015–2022 x64 runtime, version 14.40 or newer.
 - Your own copy of **Resistance: Fall of Man, US disc (BCUS98107), version 1.00**. Other regions and patched versions are not supported yet.
 - About **25 GB** of free disk space: about 16.5 GB for the game files plus the build.
-- For setup: an internet connection and the free build tools. Setup installs the tools itself.
+- For setup: an internet connection and the free build tools (LLVM 22 or newer). Setup installs or updates the tools itself.
 
 ## Install
 
@@ -116,7 +211,7 @@ Either way, the game itself is built on your PC; no built game program is publis
 - **FSR can ghost** on some things, such as the sky, at rare moments. DLSS doesn't show this.
 - **Out-of-bounds water** (off the dock in Grimsby, under the bridge in Manchester) shows some stray triangles.
 - **The Rollers level** hasn't been reached on this port yet. On RPCS3 it needed OpenGL.
-- **Ultrawide HUD:** the HUD is stretched with the view, not kept in a centred 16:9 area.
+- **Ultrawide HUD:** by default the HUD is stretched with the view. The experimental *Ultrawide HUD* option (`RSX_HUD_FIX=1`) keeps it in a centred 16:9 area; world markers may then sit off their targets and full-screen fades may cover only the centre.
 - **Two programs:** the main menu and the levels are separate programs on the disc, so the game process restarts between them; a black cover window hides the switch.
 - Everything else, including levels after Cheddar Gorge: **TBD after testing**.
 - What's planned next: [ROADMAP.md](ROADMAP.md).

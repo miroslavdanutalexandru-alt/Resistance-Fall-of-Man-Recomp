@@ -51,6 +51,7 @@ extern int g_spu_force_ch_block;              /* spu_channels.c */
 extern int spu_run_with_halt(void (*)(spu_context*), spu_context*);
 /* For attributing an MMIO store to the guest code that made it. */
 #include "../ppu/ppu_context.h"
+#include "../platform/port_hires_sleep.h"   /* port_sleep_1ms (perf pass 9) */
 extern PPU_THREAD_LOCAL ppu_context* g_active_ctx;
 extern void ps3_hle_register_ctx(uint32_t nid, const char* name,
                                  void (*fn)(ppu_context*));

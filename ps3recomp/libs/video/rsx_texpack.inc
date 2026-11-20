@@ -9,7 +9,15 @@
  *
  * Replacements must keep the guest texture's size; DDS files must also keep its
  * DXT format. Missing mips are generated (PNG) or kept from the guest (DDS).
- * Both off: one cached int test per upload. */
+ * Both off: one cached int test per upload.
+ *
+ *   RSX_HD_UI=1|<dir>    the HD UI pack: load 2x..8x replacements from mods\hd_ui\ (or <dir>), made on this PC by
+ *                        the launcher's Create HD UI pack (GPU) button (HDUIPack.exe). The texture is created at the
+ *                        replacement's size; sampling uses normalized coordinates, so nothing else changes. Missing,
+ *                        damaged or mismatched files fall back to the game's own texture.
+ *   RSX_HD_UI_CACHE_MB=n MB of loaded replacements kept in memory (64..8192, default 512). */
+
+#include "r1_hd_ui.h"
 
 /* stb_image / stb_image_write are compiled into the runtime (cellPngDec.c,
  * cellPngEnc.c). */
@@ -123,32 +131,11 @@ static void tp_init(void)
 }
 
 /* Texture key, stable across runs (never the guest address): 64-bit hash of
- * the guest bytes of every mip level, seeded with width/height/format/mips. */
-static void tp_mix(u64* hsh, const u8* p, u32 n)
-{
-    u64 x = *hsh; u32 i = 0;
-    for (; i + 8 <= n; i += 8) {
-        u64 v; memcpy(&v, p + i, 8);
-        x ^= v; x *= 0xFF51AFD7ED558CCDull; x ^= x >> 32;
-    }
-    { u64 tail = 0; memcpy(&tail, p + i, n - i);
-      x ^= tail ^ ((u64)n << 56); x *= 0xFF51AFD7ED558CCDull; x ^= x >> 32; }
-    *hsh = x;
-}
-
+ * the guest bytes of every mip level, seeded with width/height/format/mips.
+ * r1_hd_ui.h has it, shared with the HD UI pack builder (HDUIPack.exe). */
 static u64 tp_hash(const u8* p, u32 n0, u32 w, u32 h, u32 fmt, u32 nm, int bc, u32 bb)
 {
-    u64 hsh = 0x9E3779B97F4A7C15ull ^ ((u64)w << 48) ^ ((u64)h << 32) ^ ((u64)(nm & 0xFFu) << 8) ^ fmt;
-    tp_mix(&hsh, p, n0);
-    /* lower levels follow level 0 tightly packed (as the decoder reads them) */
-    u32 o = bc ? ((w + 3) / 4) * ((h + 3) / 4) * bb : w * h * bb, lw = w, lh = h;
-    for (u32 l = 1; l < nm; l++) {
-        lw = lw > 1 ? lw >> 1 : 1; lh = lh > 1 ? lh >> 1 : 1;
-        const u32 sz = bc ? ((lw + 3) / 4) * ((lh + 3) / 4) * bb : lw * lh * bb;
-        tp_mix(&hsh, p + o, sz);
-        o += sz;
-    }
-    return hsh;
+    return r1hd_hash(p, n0, w, h, fmt, nm, bc, bb);
 }
 
 static int tp_dumped_insert(u64 hv)
@@ -348,4 +335,150 @@ static void tp_upload(const u8* src, u32 src_bytes, u32 w, u32 h, u32 fmt, u32 d
         }
     }
     if (s_tp_dump) tp_dump(hv, w, h, fmt, dxfmt, nm, map, pitch0, lvl_off, lvl_pitch);
+}
+
+/* ---------------------------------------------------------------------------
+ * HD UI pack (RSX_HD_UI): replacements 2x..8x the game texture's size, keyed
+ * like the texture pack (r1_hd_ui.h). The upload creates the texture at the
+ * replacement's size and copies the file's levels instead of decoding the
+ * guest's; the SRV samples it with the same normalized coordinates. Texture
+ * slots are only ever sampled (render targets live in the off_rt pool and
+ * nothing copies out of a slot), and unnormalized-coordinate textures are
+ * never replaced, so the larger size changes nothing else.
+ * -------------------------------------------------------------------------*/
+typedef struct HdEntry {
+    u64 key;
+    char path[MAX_PATH];
+    int state;              /* 0 = not loaded, 1 = loaded, -1 = unusable */
+    u8* file;
+    size_t bytes;
+    r1hd_dds dds;
+} HdEntry;
+
+static int s_hd_on = -1;                    /* -1: env not read yet */
+static int s_hd_mips_env = 1;               /* RSX_TEX_MIPS, as the upload reads it */
+static char s_hd_dir[MAX_PATH];
+static HdEntry* s_hd = NULL;
+static u32 s_hd_n = 0, s_hd_replaced = 0;
+static size_t s_hd_cache = 0, s_hd_budget = 512u << 20;
+
+static void hd_scan(const char* dir, int depth)
+{
+    char pat[MAX_PATH]; snprintf(pat, sizeof pat, "%s\\*", dir);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        /* '.' names: tool scratch (.work, .tmp) is never loaded as a replacement */
+        if (fd.cFileName[0] == '.') continue;
+        char full[MAX_PATH]; snprintf(full, sizeof full, "%s\\%s", dir, fd.cFileName);
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) { if (depth < 8) hd_scan(full, depth + 1); continue; }
+        const char* ext = strrchr(fd.cFileName, '.');
+        if (!ext || _stricmp(ext, ".dds")) continue;   /* HDUIPack.exe writes DDS (every level, in the game's format) */
+        u64 hv;
+        if (strlen(fd.cFileName) < 16 || !r1hd_key_of_name(fd.cFileName, &hv)) continue;
+        if ((s_hd_n & 255u) == 0) {
+            HdEntry* n = (HdEntry*)realloc(s_hd, (s_hd_n + 256u) * sizeof(HdEntry));
+            if (!n) break;
+            s_hd = n;
+        }
+        HdEntry* t = &s_hd[s_hd_n++];
+        memset(t, 0, sizeof *t);
+        t->key = hv;
+        snprintf(t->path, sizeof t->path, "%s", full);
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+}
+
+static int hd_cmp(const void* a, const void* b)
+{
+    const u64 x = ((const HdEntry*)a)->key, y = ((const HdEntry*)b)->key;
+    return x < y ? -1 : x > y;
+}
+
+static void hd_init(void)
+{
+    s_hd_on = r1hd_env_dir(getenv("RSX_HD_UI"), s_hd_dir, sizeof s_hd_dir);
+    if (!s_hd_on) return;
+    { const char* e = getenv("RSX_TEX_MIPS"); s_hd_mips_env = e ? atoi(e) : 1; }
+    s_hd_budget = r1hd_cache_budget(getenv("RSX_HD_UI_CACHE_MB"));
+    hd_scan(s_hd_dir, 0);
+    if (s_hd_n) qsort(s_hd, s_hd_n, sizeof(HdEntry), hd_cmp);
+    fprintf(stderr, "[texpack] HD UI pack: %u texture(s) in %s%s%c", s_hd_n, s_hd_dir,
+            s_hd_n ? "" : " (none: make it with the launcher's Create HD UI pack button)", 10);
+    if (!s_hd_n) s_hd_on = 0;
+}
+
+static HdEntry* hd_find(u64 hv)
+{
+    u32 lo = 0, hi = s_hd_n;
+    while (lo < hi) {
+        const u32 mid = (lo + hi) / 2;
+        if (s_hd[mid].key < hv) lo = mid + 1; else hi = mid;
+    }
+    return (lo < s_hd_n && s_hd[lo].key == hv) ? &s_hd[lo] : NULL;
+}
+
+/* The replacement for the texture about to be uploaded, loaded and checked, or NULL (the game's own texture is
+ * used). gcm = format byte, nm = the levels the upload sends, row_bytes = level 0's source row stride. */
+static HdEntry* hd_lookup(const u8* src, u32 gcm, u32 w, u32 h, u32 mips, u32 tpitch, int cube, u32 nm, u32 row_bytes)
+{
+    if (s_hd_on < 0) hd_init();
+    if (!s_hd_on || r1hd_ineligible(gcm, w, h, cube, rsx_texture_argb_is_rgba())) return NULL;
+    u64 key; u32 knm = 0;
+    if (!r1hd_texture_key(src, ~0ull, gcm, w, h, mips, tpitch, cube, s_hd_mips_env, &key, &knm, NULL) || knm != nm) return NULL;
+    HdEntry* e = hd_find(key);
+    if (!e || e->state < 0) return NULL;
+    if (r1hd_is_fe_atlas(src, row_bytes, gcm, w, h)) return NULL;   /* the port redraws its button pictures */
+    if (e->state == 0) {
+        char why[160] = "cannot read the file";
+        FILE* f = fopen(e->path, "rb");
+        long n = -1;
+        if (f) { fseek(f, 0, SEEK_END); n = ftell(f); fseek(f, 0, SEEK_SET); }
+        e->file = (n > 0) ? (u8*)malloc((size_t)n) : NULL;
+        int ok = f && e->file && fread(e->file, 1, (size_t)n, f) == (size_t)n;
+        if (f) fclose(f);
+        if (ok) ok = r1hd_dds_check(e->file, (size_t)n, w, h, gcm, nm, &e->dds, why, sizeof why);
+        if (!ok) {
+            const char* b = strrchr(e->path, '\\');
+            /* the game's texture is used: a bad file never breaks the picture */
+            fprintf(stderr, "[texpack] HD UI pack: %s skipped: %s (game texture %ux%u %s, %u mips)%c",
+                    b ? b + 1 : e->path, why, w, h, r1hd_fmt_name(gcm), nm, 10);
+            free(e->file); e->file = NULL; e->state = -1;
+            return NULL;
+        }
+        e->bytes = (size_t)n; e->state = 1;
+        s_hd_cache += e->bytes;
+    }
+    return e;
+}
+
+/* Fills the upload rows (level 0 at 0 / pitch0, level l at lvl_off[l] / lvl_pitch[l]) from a replacement */
+static void hd_fill(const HdEntry* e, u8* map, u32 pitch0, const u32* lvl_off, const u32* lvl_pitch, u32 w, u32 h, u32 gcm, u32 nm)
+{
+    for (u32 l = 0; l < nm; l++)
+        r1hd_copy_level(map + (l ? lvl_off[l] : 0), l ? lvl_pitch[l] : pitch0, e->file, &e->dds, l, w, h, gcm);
+    if (r1hd_milestone(++s_hd_replaced)) {
+        const char* b = strrchr(e->path, '\\');
+        fprintf(stderr, "[texpack] HD UI pack: %u texture upload(s) replaced so far (latest %s, %ux%u -> %ux%u)%c",
+                s_hd_replaced, b ? b + 1 : e->path, w, h, w * e->dds.scale, h * e->dds.scale, 10);
+    }
+}
+
+/* After the copy is recorded. A replacement staged in the slot's own upload buffer (the batch's upload ring was
+ * full) does not keep that buffer: it is HD-sized, and a slot keeps its buffer for as long as it lives, so screens
+ * full of replacements would pin hundreds of MB of upload heap that RSX_HD_UI_CACHE_MB does not count. `bury`
+ * frees it once the batch that copies from it is done (0 = could not take it: then the slot keeps it, as before). */
+static void hd_stage_done(int hd, int use_ring, ID3D12Resource** up, u32* up_batch, int (*bury)(ID3D12Resource*))
+{
+    if (!hd || use_ring || !*up || !bury(*up)) return;
+    *up = NULL; *up_batch = 0;
+}
+
+/* After the copy is recorded: over the memory budget, this replacement is dropped (read again if re-uploaded) */
+static void hd_after_upload(HdEntry* e)
+{
+    if (!e || s_hd_cache <= s_hd_budget) return;
+    s_hd_cache -= e->bytes < s_hd_cache ? e->bytes : s_hd_cache;
+    free(e->file); e->file = NULL; e->bytes = 0; e->state = 0;
 }

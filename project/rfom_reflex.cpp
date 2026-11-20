@@ -1,6 +1,7 @@
 // Resistance: Fall of Man PC port: NVIDIA Reflex Low Latency through NVAPI (tools/nvapi, MIT).
 //
 // RFOM_REFLEX   0 / unset: off | 1: Reflex On | 2: Reflex On + Boost
+// PORT_LATENCY  unset: RFOM_REFLEX alone | off | reflex | antilag (AMD Anti-Lag 2) | auto (Reflex, else Anti-Lag 2)
 //
 // On an NVIDIA GPU (driver with Reflex support) the D3D12 device gets
 // NvAPI_D3D_SetSleepMode and the game thread calls NvAPI_D3D_Sleep once per
@@ -32,6 +33,17 @@
 #include <cstring>
 #include <mutex>
 
+// AMD Anti-Lag 2 (PORT_LATENCY=antilag | auto, port_latency.h): tools/antilag2 (AMD Anti-Lag 2 SDK, MIT).
+// The renderer calls g_pc_antilag_init with its D3D12 device (only without frame generation); Initialize
+// succeeds on Radeon drivers with Anti-Lag 2 only. Update(enable) is called where NvAPI_D3D_Sleep would
+// be: once per game frame after the limiter, just before input sampling (that call inserts the delay).
+#if __has_include("../tools/antilag2/ffx_antilag2_dx12.h")
+#include "../tools/antilag2/ffx_antilag2_dx12.h"
+#define RFOM_HAVE_AL2 1
+#else
+#define RFOM_HAVE_AL2 0
+#endif
+
 #if __has_include("nvapi.h")
 #include "nvapi.h"
 #define RFOM_HAVE_NVAPI 1
@@ -43,6 +55,8 @@ extern "C" {
 // rsx_d3d12_backend.c hooks
 extern int (*volatile g_pc_reflex_init)(void* device);
 extern void (*volatile g_pc_reflex_marker)(int type);
+extern int (*volatile g_pc_antilag_init)(void* device);
+extern volatile int g_pc_reflex_want;   // RFOM_REFLEX after PORT_LATENCY (0 off, 1 on, 2 on + boost)
 // rsx_dlssg.inc: Streamline Reflex / PCL (set only while DLSS Frame Generation is usable)
 extern void (*volatile g_pc_fg_marker)(int type, unsigned long long id);
 extern void (*volatile g_pc_fg_sleep)(unsigned long long id);
@@ -93,8 +107,7 @@ void marker(int t, unsigned long long id)
 
 int reflex_init(void* device)
 {
-    const char* e = getenv("RFOM_REFLEX");
-    const int want = e ? atoi(e) : 0;
+    const int want = g_pc_reflex_want;
     if (g_pc_fg_marker && g_pc_fg_sleep) {
         // DLSS Frame Generation: Reflex is required and already configured in Streamline by the renderer
         s_fg = true;
@@ -205,9 +218,34 @@ void lat_update()
 }
 #endif
 
+#if RFOM_HAVE_AL2
+AMD::AntiLag2DX12::Context s_al2{};
+std::atomic<int> s_al2_on{0};
+
+int antilag_init(void* device)
+{
+    if (!device || s_al2_on) return s_al2_on;
+    const HRESULT hr = AMD::AntiLag2DX12::Initialize(&s_al2, static_cast<ID3D12Device*>(device));
+    if (hr != S_OK) {
+        fprintf(stderr, "[latency] AMD Anti-Lag 2 unavailable (0x%08lX: not a Radeon GPU, or the driver lacks it)%c",
+                (unsigned long)hr, 10);
+        return 0;
+    }
+    s_al2_on = 1;
+    fprintf(stderr, "[latency] AMD Anti-Lag 2 on (D3D12 SDK; the frame limiter stays RFOM_FPS)%c", 10);
+    return 1;
+}
+#endif
+
 struct HookInit
 {
-    HookInit() { g_pc_reflex_init = reflex_init; g_pc_reflex_marker = render_marker; }
+    HookInit()
+    {
+        g_pc_reflex_init = reflex_init; g_pc_reflex_marker = render_marker;
+#if RFOM_HAVE_AL2
+        g_pc_antilag_init = antilag_init;
+#endif
+    }
 } s_hook_init;
 
 } // namespace
@@ -233,6 +271,9 @@ void rfom_reflex_sim_end(void)
 // Game thread, after the port's frame limiter: Reflex sleep, then the next frame starts.
 void rfom_reflex_sim_start(void)
 {
+#if RFOM_HAVE_AL2
+    if (s_al2_on) AMD::AntiLag2DX12::Update(&s_al2, true, 0);   // the Anti-Lag 2 delay, before input sampling
+#endif
     if (!s_mode) return;
     const unsigned long long id = s_sim.load(std::memory_order_relaxed) + 1;
     if (s_fg) { if (g_pc_fg_sleep) g_pc_fg_sleep(id); }
