@@ -784,3 +784,82 @@ u8 rsx_texture_expand_mask(u32 format, u32 control1, u32 filter, u32 address)
     if (mask && ((format & 0x9Fu) == 0x94u || (format & 0x9Fu) == 0x95u)) mask |= 0x10u;
     return mask;
 }
+
+/* --- BC1/2/3 to RGBA8 ----------------------------------------------------- */
+
+static void bc_color_block(const u8* b, int four_colour, u8 out[16][4])
+{
+    const u32 c0 = (u32)b[0] | ((u32)b[1] << 8), c1 = (u32)b[2] | ((u32)b[3] << 8);
+    const u32 idx = (u32)b[4] | ((u32)b[5] << 8) | ((u32)b[6] << 16) | ((u32)b[7] << 24);
+    u8 pal[4][4];
+    for (int i = 0; i < 2; i++) {
+        const u32 c = i ? c1 : c0;
+        const u32 r = (c >> 11) & 31u, g = (c >> 5) & 63u, bl = c & 31u;
+        pal[i][0] = (u8)((r << 3) | (r >> 2));
+        pal[i][1] = (u8)((g << 2) | (g >> 4));
+        pal[i][2] = (u8)((bl << 3) | (bl >> 2));
+        pal[i][3] = 255;
+    }
+    if (four_colour || c0 > c1) {
+        for (int k = 0; k < 3; k++) {
+            pal[2][k] = (u8)((2u * pal[0][k] + pal[1][k] + 1u) / 3u);
+            pal[3][k] = (u8)((pal[0][k] + 2u * pal[1][k] + 1u) / 3u);
+        }
+        pal[2][3] = pal[3][3] = 255;
+    } else {
+        for (int k = 0; k < 3; k++) pal[2][k] = (u8)((pal[0][k] + pal[1][k] + 1u) / 2u);
+        pal[2][3] = 255;
+        pal[3][0] = pal[3][1] = pal[3][2] = pal[3][3] = 0;   /* BC1 punch-through */
+    }
+    for (int i = 0; i < 16; i++) memcpy(out[i], pal[(idx >> (2 * i)) & 3u], 4);
+}
+
+int rsx_texture_bc_to_rgba8(void* dst, u32 dst_pitch, const u8* src,
+                            u32 w, u32 h, const rsx_tex_layout* tl)
+{
+    if (!dst || !src || !tl || !w || !h || !tl->compressed) return 0;
+    const u32 bw = (w + 3u) / 4u, bh = (h + 3u) / 4u;
+    if (dst_pitch < w * 4u || tl->row_bytes < bw * tl->block_bytes || tl->rows < bh) return 0;
+    u8* d = (u8*)dst;
+    for (u32 by = 0; by < bh; by++) {
+        const u8* row = src + (size_t)by * tl->row_bytes;
+        for (u32 bx = 0; bx < bw; bx++) {
+            const u8* b = row + (size_t)bx * tl->block_bytes;
+            u8 px[16][4];
+            if (tl->fmt == RSX_TEXFMT_BC1) {
+                bc_color_block(b, 0, px);
+            } else {
+                bc_color_block(b + 8, 1, px);   /* BC2/BC3 colour is always the 4-colour mode */
+                if (tl->fmt == RSX_TEXFMT_BC2) {
+                    for (int i = 0; i < 16; i++) {
+                        const u32 a = (b[i >> 1] >> ((i & 1) * 4)) & 15u;
+                        px[i][3] = (u8)(a * 17u);
+                    }
+                } else {
+                    const u32 a0 = b[0], a1 = b[1];
+                    u8 ap[8];
+                    ap[0] = (u8)a0; ap[1] = (u8)a1;
+                    if (a0 > a1) {
+                        for (u32 k = 1; k < 7; k++) ap[k + 1] = (u8)(((7u - k) * a0 + k * a1 + 3u) / 7u);
+                    } else {
+                        for (u32 k = 1; k < 5; k++) ap[k + 1] = (u8)(((5u - k) * a0 + k * a1 + 2u) / 5u);
+                        ap[6] = 0; ap[7] = 255;
+                    }
+                    u64 bits = 0;
+                    for (int k = 0; k < 6; k++) bits |= (u64)b[2 + k] << (8 * k);
+                    for (int i = 0; i < 16; i++) px[i][3] = ap[(bits >> (3 * i)) & 7u];
+                }
+            }
+            for (u32 y = 0; y < 4; y++) {
+                const u32 ty = by * 4u + y;
+                if (ty >= h) break;
+                for (u32 x = 0; x < 4; x++) {
+                    const u32 tx = bx * 4u + x;
+                    if (tx >= w) break;
+                    memcpy(d + (size_t)ty * dst_pitch + (size_t)tx * 4u, px[y * 4u + x], 4);
+                }
+            }
+        }
+    }
+    return 1;
+}

@@ -182,6 +182,17 @@ void rsx_texture_decode_reference(void* dst, u32 dst_pitch,
                                   const u8* src, u32 w, u32 h,
                                   const rsx_tex_layout* tl, int argb_as_rgba);
 
+/* Decompress one level of a BC1/2/3 (DXT1/23/45) texture to RGBA8: exactly
+ * w x h texels (the padding texels of partial edge blocks are dropped), rows
+ * dst_pitch apart, read from tl->row_bytes-strided block rows. For hosts that
+ * cannot create a block-compressed resource whose top level is not a multiple
+ * of 4 (D3D12 without OPTIONS8.UnalignedBlockTexturesSupported, i.e. Windows
+ * 10). Channels come out R,G,B,A like a BC sampler returns them, so the
+ * component remap is unchanged. Returns 0 (nothing written) for a layout that
+ * is not compressed or a dst_pitch / source stride too small. */
+int rsx_texture_bc_to_rgba8(void* dst, u32 dst_pitch, const u8* src,
+                            u32 w, u32 h, const rsx_tex_layout* tl);
+
 /* Per-final-RGBA-lane gamma flags from TEXTURE_ADDRESS bits 20..23.
  * Float/depth/non-gamma formats return zero; source signed flags take
  * precedence after the existing crossbar. No texture bytes are converted. */

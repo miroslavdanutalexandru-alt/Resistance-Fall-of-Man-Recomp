@@ -4258,10 +4258,14 @@ static void ext_report_unsupported(const rsx_state* st)
 static int s_dbounds_hw;   /* D3D12_OPTIONS2.DepthBoundsTestSupported */
 static int s_stencil2_hw;  /* D3D12_OPTIONS14.IndependentFrontAndBackStencilRefMaskSupported */
 static int s_alphafac_hw;  /* D3D12_OPTIONS13.AlphaBlendFactorSupported (device constant: CONSTANT_ALPHA -> ALPHA_FACTOR) */
+static int s_bc_unaligned_hw;   /* D3D12_OPTIONS8.UnalignedBlockTexturesSupported (Windows 11 runtimes; never on Windows 10) */
 static ID3D12Device2* s_dev2;   /* stream pipelines (ext_caps) */
 static void ext_caps(void)
 {
     ID3D12Device* d = s_d3d.device;
+    { D3D12_FEATURE_DATA_D3D12_OPTIONS8 o8; memset(&o8, 0, sizeof o8);
+      s_bc_unaligned_hw = SUCCEEDED(d->lpVtbl->CheckFeatureSupport(d, D3D12_FEATURE_D3D12_OPTIONS8, &o8, sizeof o8))
+                          && o8.UnalignedBlockTexturesSupported ? 1 : 0; }
     D3D12_FEATURE_DATA_D3D12_OPTIONS2 o2; memset(&o2, 0, sizeof o2);
     D3D12_FEATURE_DATA_D3D12_OPTIONS14 o14; memset(&o14, 0, sizeof o14);
     D3D12_FEATURE_DATA_D3D12_OPTIONS13 o13; memset(&o13, 0, sizeof o13);
@@ -4274,8 +4278,9 @@ static void ext_caps(void)
         s_stencil2_hw = o14.IndependentFrontAndBackStencilRefMaskSupported ? 1 : 0;
     if (FAILED(d->lpVtbl->QueryInterface(d, &IID_ID3D12Device2, (void**)&s_dev2))) s_dev2 = NULL;
     if (!s_dev2) s_dbounds_hw = s_stencil2_hw = 0;
-    fprintf(stderr, "[EXT] depth bounds %s, independent back-face stencil masks %s, alpha blend factor %s%c",
-            s_dbounds_hw ? "yes" : "no", s_stencil2_hw ? "yes" : "no", s_alphafac_hw ? "yes" : "no", 10);
+    fprintf(stderr, "[EXT] depth bounds %s, independent back-face stencil masks %s, alpha blend factor %s, unaligned BC textures %s%c",
+            s_dbounds_hw ? "yes" : "no", s_stencil2_hw ? "yes" : "no", s_alphafac_hw ? "yes" : "no",
+            s_bc_unaligned_hw ? "yes" : "no", 10);
 }
 static u32 rsx_blend_key(const rsx_state* st, int enable);
 static void ext_record(D3D12DrawRecord* dr, const rsx_state* st)
@@ -7659,6 +7664,30 @@ static void fe_put_keycap(u8* map, u32 pitch, u32 x0, u32 y0, int cell)
         fe_bc3_block(map + (u64)((y0 >> 2) + by) * pitch + ((x0 >> 2) + bx) * 16, px);
     }
 }
+/* RSX_BC_UNALIGNED (see vp_upload_tex_slot_impl): 1 = default, 0 = old path, 2 = only without device support */
+static int bc_unaligned_mode(void)
+{
+    static int m = -1;
+    if (m < 0) { const char* e = getenv("RSX_BC_UNALIGNED"); m = (e && *e) ? atoi(e) : 1; if (m < 0 || m > 2) m = 1; }
+    return m;
+}
+/* One line the first time a DXT texture whose size is not a multiple of 4 is
+ * uploaded: which way it went, and whether the device could have taken it. */
+static void bc_unaligned_note(u32 fmt, u32 w, u32 h, int decoded, int mode)
+{
+    static int logged = 0;
+    if (logged) return;
+    logged = 1;
+    if (decoded)
+        fprintf(stderr, "[BCALIGN] DXT texture %ux%u (fmt 0x%02X) is not a multiple of 4: decompressed to RGBA8"
+                        " (device unaligned BC textures: %s; RSX_BC_UNALIGNED=%d, 0 = old path)%c",
+                w, h, fmt, s_bc_unaligned_hw ? "yes" : "no", mode, 10);
+    else
+        fprintf(stderr, "[BCALIGN] %sDXT texture %ux%u (fmt 0x%02X) is not a multiple of 4 and is created as BC"
+                        " (RSX_BC_UNALIGNED=%d); device unaligned BC textures: %s%s%c",
+                s_bc_unaligned_hw ? "" : "WARNING: ", w, h, fmt, mode, s_bc_unaligned_hw ? "yes" : "no",
+                s_bc_unaligned_hw ? "" : " -- the HUD and menu textures will be missing", 10);
+}
 #include "rsx_texpack.inc"   /* RSX_TEXPACK / RSX_TEXDUMP */
 
 static int vp_upload_tex_slot_impl(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips, u32 tpitch)
@@ -7933,6 +7962,32 @@ static int vp_upload_tex_slot_impl(u32 off, u32 w, u32 h, u32 fmt, int cube, u32
         }
     }
 
+    /* Issues #19/#21/#23 (no health bar, no menu highlight, black boxes in the
+     * pause menu): most of Fall of Man's HUD and menu art is small linear
+     * DXT1/3/5 at sizes like 174x14, 18x14 or 3x23. D3D12 only creates a BC
+     * texture whose top level is not a multiple of 4 when the runtime reports
+     * OPTIONS8.UnalignedBlockTexturesSupported -- Windows 11; on Windows 10 the
+     * create fails and those draws sampled nothing. The HD UI pack hid it: its
+     * replacements are 4x, so always aligned. Such a texture is decompressed
+     * to RGBA8 at its exact size instead. RSX_BC_UNALIGNED: 1 (default) =
+     * always, the same on every PC; 2 = only when the device can't create it;
+     * 0 = old path (BC as-is). Single-level only: no game texture of this
+     * shape has mips, and level 1 of an unaligned BC chain would need its own
+     * RGBA8 rebuild. */
+    int bcdec = 0;
+    if (dxt && !hd && !cube && ((w & 3u) || (h & 3u))) {
+        const int m = bc_unaligned_mode();
+        bcdec = m == 1 || (m == 2 && !s_bc_unaligned_hw);
+        bc_unaligned_note(fmt, w, h, bcdec, m);
+        if (bcdec) {
+            dxfmt = DXGI_FORMAT_R8G8B8A8_UNORM;
+            nm = 1;
+            memset(lvl_off, 0, sizeof lvl_off); memset(lvl_pitch, 0, sizeof lvl_pitch); memset(lvl_rows, 0, sizeof lvl_rows);
+            pitch = (w * 4u + 255u) & ~255u;
+            up_total = (u64)pitch * h;
+        }
+    }
+
     /* Also recreate when the CUBE-ness changes: a slot holding a 2D texture of
      * the same dimensions would otherwise be reused with 1 array slice while the
      * cube path copies 6 subresources and writes a 6x upload buffer -- which
@@ -7963,13 +8018,28 @@ static int vp_upload_tex_slot_impl(u32 off, u32 w, u32 h, u32 fmt, int cube, u32
                   s_d3d.device, &hp, (D3D12_HEAP_FLAGS)0x1000, &td,
                   D3D12_RESOURCE_STATE_COPY_DEST, NULL,
                   &IID_ID3D12Resource, (void**)&t->res);
-              if (FAILED(hrc)) { nz = 0; t->res = NULL; }
+              if (FAILED(hrc)) t->res = NULL;
           }
-          if (FAILED(hrc) && FAILED(s_d3d.device->lpVtbl->CreateCommittedResource(
+          if (FAILED(hrc)) {
+              const int flagged = nz;
+              hrc = s_d3d.device->lpVtbl->CreateCommittedResource(
                   s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &td,
                   D3D12_RESOURCE_STATE_COPY_DEST, NULL,
-                  &IID_ID3D12Resource, (void**)&t->res)))
-              return -1; }
+                  &IID_ID3D12Resource, (void**)&t->res);
+              if (FAILED(hrc)) {
+                  /* the resource itself is invalid, not the flag: keep using it */
+                  t->res = NULL;
+                  static int nfail = 0;
+                  if (PS3_LOG_FIRST(nfail, 8))
+                      fprintf(stderr, "[TEX] WARNING: could not create the texture for 0x%08X %ux%u fmt 0x%02X"
+                                      " (DXGI %d, %u mip(s)): hr=0x%08X -- its draws sample nothing%s%c",
+                              key_off, cw, ch, fmt, (int)dxfmt, nm, (unsigned)hrc,
+                              (dxt && !bcdec && ((cw & 3u) || (ch & 3u)))
+                                  ? " (BC size not a multiple of 4; RSX_BC_UNALIGNED=1 fixes it)" : "", 10);
+                  return -1;
+              }
+              if (flagged) nz = 0;   /* older runtimes reject CREATE_NOT_ZEROED */
+          } }
         fresh = 1;
     }
 
@@ -8056,8 +8126,13 @@ static int vp_upload_tex_slot_impl(u32 off, u32 w, u32 h, u32 fmt, int cube, u32
     /* Pixel conversion -- deswizzle, channel order, block copy -- is RSX
      * semantics and lives in rsx_texture_layout.c, so a second backend gets
      * it by calling this rather than porting the loops again. */
-    rsx_texture_decode(mapped, pitch, vm_base + off, w, h, &tl,
-                       rsx_texture_argb_is_rgba());
+    if (bcdec) {   /* unaligned DXT: decompressed (see the RSX_BC_UNALIGNED note above) */
+        if (!rsx_texture_bc_to_rgba8(mapped, pitch, vm_base + off, w, h, &tl))
+            memset(mapped, 0, (size_t)pitch * h);
+    } else {
+        rsx_texture_decode(mapped, pitch, vm_base + off, w, h, &tl,
+                           rsx_texture_argb_is_rgba());
+    }
 
     /* The diagnostics below only apply to the linear 8-bit case (Bink video
      * planes); they used to sit inside that branch of the conversion. */
