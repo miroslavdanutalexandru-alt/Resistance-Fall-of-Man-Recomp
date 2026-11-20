@@ -15,8 +15,9 @@
  * Screens without a 3D camera (loading screens, 2D briefing / stats screens,
  * menus) set no camera at all, and are full-frame 16:9 art: the present shows
  * them letterboxed. So the stretch also needs a recent widened camera -- one
- * within recent_ms (RFOM_ASPECT_HOLD, default 2000; ADS / scope cameras count)
- * -- see rfom_aspect_present_mul. */
+ * within recent_ms (RFOM_ASPECT_HOLD, default 2000; ADS / scope cameras count),
+ * or 3D scene frames still being drawn since (RFOM_ASPECT_SCENE_HOLD) -- see
+ * rfom_aspect_present_mul. */
 #ifndef RFOM_ASPECT_H
 #define RFOM_ASPECT_H
 
@@ -73,13 +74,21 @@ static inline double rfom_aspect_note(rfom_aspect_state* s, double a, double t, 
 }
 
 /* The present's horizontal stretch: mul while a widened camera was set within recent_ms
- * (last_ms = its time, 0 = none or ended; recent_ms 0 = no timeout) and no movie plays. */
-static inline float rfom_aspect_present_mul(float mul, unsigned long long last_ms, unsigned long long now_ms,
-                                            unsigned recent_ms, int movie)
+ * (last_ms = its time, 0 = none or ended; recent_ms 0 = no timeout) and no movie plays.
+ * The game does not set its gameplay camera every frame: it keeps the one it set (already
+ * widened) until something changes it, such as aiming. On 0.3.0 the stretch timed out a few
+ * seconds into gameplay (issue #2 again) and came back only while aiming. So after
+ * recent_ms the stretch also stays while the guest frames still draw a 3D scene: scene_ms
+ * is the last frame that did (enough depth-tested, depth-writing draws; 0 = none), within
+ * scene_hold_ms (0 = off: the camera timeout alone, as in 0.3.0). 2D screens draw no
+ * 3D scene, so they still go back to their 16:9 letterbox. */
+static inline float rfom_aspect_present_mul(float mul, unsigned long long last_ms, unsigned long long scene_ms,
+                                            unsigned long long now_ms, unsigned recent_ms, unsigned scene_hold_ms, int movie)
 {
     if (!last_ms || movie) return 1.0f;
-    if (recent_ms && now_ms > last_ms && now_ms - last_ms >= recent_ms) return 1.0f;
-    return mul;
+    if (!recent_ms || now_ms <= last_ms || now_ms - last_ms < recent_ms) return mul;
+    if (scene_hold_ms && scene_ms && (now_ms <= scene_ms || now_ms - scene_ms < scene_hold_ms)) return mul;
+    return 1.0f;
 }
 
 #endif

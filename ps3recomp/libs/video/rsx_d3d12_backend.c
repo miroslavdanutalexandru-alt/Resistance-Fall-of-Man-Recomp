@@ -2256,15 +2256,35 @@ static void gpt_frame_end(void)
 
 /* Scale the finished guest frame (virtual backbuffer s_d3d.frame_index) into
  * the swap chain, letterboxed to its aspect, and present. */
+/* RFOM_ASPECT_SCENE_DRAWS (default 32, 0 = off): a guest frame with this many depth-tested, depth-writing draws
+ * draws a 3D scene; the replay loop stamps s_aspect_scene_ms with its time. RFOM_ASPECT_SCENE_HOLD (default 500 ms,
+ * 0 = off) keeps the Hor+ stretch on while such frames come, after the camera hold (rfom_aspect_present_mul). */
+static volatile unsigned long long s_aspect_scene_ms;
+static u32 s_aspect_scene_n;
+static u32 aspect_scene_draws(void)
+{
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("RFOM_ASPECT_SCENE_DRAWS"); v = e && *e ? atoi(e) : 32; if (v < 0) v = 0; }
+    return (u32)v;
+}
 /* The horizontal stretch the present pass gives the guest frame (RFOM_ASPECT Hor+, project/stubs.cpp); 1 = none. */
 static float present_aspect_mul(void)
 {
-    /* project/rfom_aspect.h: only while a widened camera (gameplay, ADS, scope) was set within
-     * RFOM_ASPECT_HOLD ms (default 2000, 0 = no timeout), so 2D screens are letterboxed again. */
-    static int hold = -1;
+    /* project/rfom_aspect.h: while a widened camera (gameplay, ADS, scope) was set within RFOM_ASPECT_HOLD ms
+     * (default 2000, 0 = no timeout), or 3D scene frames keep coming after it (RFOM_ASPECT_SCENE_HOLD), so 2D
+     * screens are letterboxed again but gameplay keeps the stretch between camera setter calls (issue #2). */
+    static int hold = -1, shold = -1;
     if (hold < 0) { const char* e = getenv("RFOM_ASPECT_HOLD"); hold = e ? atoi(e) : 2000; if (hold < 0) hold = 0; }
-    return rfom_aspect_present_mul(g_rsx_aspect_mul, g_rsx_aspect_ms, GetTickCount64(), (unsigned)hold,
-                                   cellGcm_get_flip_mode() == 2);
+    if (shold < 0) { const char* e = getenv("RFOM_ASPECT_SCENE_HOLD"); shold = e && *e ? atoi(e) : 500; if (shold < 0) shold = 0;
+                     if (!aspect_scene_draws()) shold = 0; }
+    const unsigned long long now = GetTickCount64(), cam = g_rsx_aspect_ms, scene = s_aspect_scene_ms;
+    const float m = rfom_aspect_present_mul(g_rsx_aspect_mul, cam, scene, now, (unsigned)hold, (unsigned)shold,
+                                            cellGcm_get_flip_mode() == 2);
+    { static float said = 1.0f; static int n = 0;   /* the first changes, for reports */
+      if (fabsf(m - said) > 0.001f && n < 40) { n++; said = m;
+          fprintf(stderr, "[aspect] present stretch x%.3f (camera set %lld ms ago, 3D scene %lld ms ago)%c", (double)m,
+                  cam ? (long long)(now - cam) : -1LL, scene ? (long long)(now - scene) : -1LL, 10); } }
+    return m;
 }
 
 /* RFOM_HUD_169=1 (experimental, default off): while the present pass stretches the 16:9 guest frame to an
@@ -11865,6 +11885,7 @@ static void render_frame_impl(void)
       if (!cont) {
         fg_hud_frame_start();   /* DLSS-G HUD split: a new guest frame */
         s_hud169_scene = 0;
+        s_aspect_scene_n = 0;
         s_d3d.cmd_list->lpVtbl->ClearRenderTargetView(
             s_d3d.cmd_list, rtv_handle, s_d3d.clear_color, 0, NULL);
         s_d3d.cmd_list->lpVtbl->ClearDepthStencilView(
@@ -12494,6 +12515,8 @@ static void render_frame_impl(void)
                     mtrp_bfactor(dr->bfact); memcpy(f_bf, dr->bfact, sizeof f_bf); f_bf_ok = 1; }
                 if (((dr->cmask >> 4) & RSX_X_DBOUNDS) && (!f_db_ok || f_db[0] != dr->dbmin || f_db[1] != dr->dbmax)) {
                     mtrp_dbounds(dr->dbmin, dr->dbmax); f_db[0] = dr->dbmin; f_db[1] = dr->dbmax; f_db_ok = 1; }
+                if ((dr->cull & 0x700u) == 0x700u && ++s_aspect_scene_n == aspect_scene_draws())
+                    s_aspect_scene_ms = GetTickCount64();   /* this frame draws a 3D scene (Hor+ present stretch) */
                 if (cur_rt < 0 && hud169_on()) {   /* RSX_HUD_FIX (old: RFOM_HUD_169) */
                     u32 hk;
                     if ((dr->cull & 0x100u) && (dr->cull & 0x400u)) s_hud169_scene = 1;

@@ -88,18 +88,44 @@ static void test_present_recency(void)
     for (int i = 0; i < 60; i++, t += 16)   /* gameplay and ADS cameras alternate */
         if (rfom_aspect_note(&s, i & 1 ? (double)(float)A169 : A169, W219, t, 1000, 3, &base) != 1.0) last = t;
     CHECK(s.on && last == t - 16);
-    CHECK(rfom_aspect_present_mul(s.mul, last, t, 2000, 0) == m);
-    CHECK(rfom_aspect_present_mul(s.mul, last, t + 1500, 2000, 0) == m);   /* the setter skips some frames */
-    CHECK(rfom_aspect_present_mul(s.mul, last, t + 2000, 2000, 0) == 1.0f);   /* no camera for 2 s */
-    CHECK(rfom_aspect_present_mul(s.mul, last, t + 60000, 2000, 0) == 1.0f);
+    CHECK(rfom_aspect_present_mul(s.mul, last, 0, t, 2000, 500, 0) == m);
+    CHECK(rfom_aspect_present_mul(s.mul, last, 0, t + 1500, 2000, 500, 0) == m);   /* the setter skips some frames */
+    CHECK(rfom_aspect_present_mul(s.mul, last, 0, t + 2000, 2000, 500, 0) == 1.0f);   /* no camera, no 3D scene for 2 s */
+    CHECK(rfom_aspect_present_mul(s.mul, last, 0, t + 60000, 2000, 500, 0) == 1.0f);
     CHECK(s.on);   /* the next camera (an ADS one) brings the stretch straight back */
     t += 60000;
     if (rfom_aspect_note(&s, (double)(float)A169, W219, t, 1000, 3, &base) != 1.0) last = t;
-    CHECK(rfom_aspect_present_mul(s.mul, last, t, 2000, 0) == m);
-    CHECK(rfom_aspect_present_mul(s.mul, last, t, 2000, 1) == 1.0f);   /* movie */
-    CHECK(rfom_aspect_present_mul(s.mul, last, t + 60000, 0, 0) == m);   /* RFOM_ASPECT_HOLD=0 */
-    CHECK(rfom_aspect_present_mul(s.mul, last, last - 5, 2000, 0) == m);   /* stamped after "now" was read */
-    CHECK(rfom_aspect_present_mul(s.mul, 0, t, 2000, 0) == 1.0f);   /* ended */
+    CHECK(rfom_aspect_present_mul(s.mul, last, 0, t, 2000, 500, 0) == m);
+    CHECK(rfom_aspect_present_mul(s.mul, last, 0, t, 2000, 500, 1) == 1.0f);   /* movie */
+    CHECK(rfom_aspect_present_mul(s.mul, last, 0, t + 60000, 0, 500, 0) == m);   /* RFOM_ASPECT_HOLD=0 */
+    CHECK(rfom_aspect_present_mul(s.mul, last, 0, last - 5, 2000, 500, 0) == m);   /* stamped after "now" was read */
+    CHECK(rfom_aspect_present_mul(s.mul, 0, t, t, 2000, 500, 0) == 1.0f);   /* ended (target back at 16:9) */
+}
+
+/* Issue #2 on 0.3.0: the game set its gameplay camera once and kept it, so the stretch timed out a
+ * few seconds into gameplay (and came back only while aiming). 3D scene frames keep it on. */
+static void test_present_scene_keeps_stretch(void)
+{
+    rfom_aspect_state s = { 0, 1.0f, 0, 0 };
+    double base;
+    unsigned long long t = 10000;
+    const float m = (float)(W219 / A169);
+    CHECK(rfom_aspect_note(&s, A169, W219, t, 1000, 3, &base) != 1.0);
+    const unsigned long long last = t;
+    for (int i = 0; i < 600; i++, t += 16)   /* ~10 s of gameplay, no camera setter call */
+        CHECK(rfom_aspect_present_mul(s.mul, last, t, t, 2000, 500, 0) == m);
+    CHECK(rfom_aspect_present_mul(s.mul, last, t - 16, t, 2000, 500, 0) == m);   /* stamped this frame */
+    CHECK(rfom_aspect_present_mul(s.mul, last, t + 5, t, 2000, 500, 0) == m);   /* stamped after "now" was read */
+    /* a loading screen: no 3D scene; the letterbox comes back once the scene hold runs out */
+    const unsigned long long scene = t;
+    CHECK(rfom_aspect_present_mul(s.mul, last, scene, t + 499, 2000, 500, 0) == m);
+    CHECK(rfom_aspect_present_mul(s.mul, last, scene, t + 500, 2000, 500, 0) == 1.0f);
+    CHECK(rfom_aspect_present_mul(s.mul, last, scene, t + 30000, 2000, 500, 0) == 1.0f);
+    /* gameplay goes on through the kept camera: the stretch is back with the first 3D frame */
+    CHECK(rfom_aspect_present_mul(s.mul, last, t + 30016, t + 30016, 2000, 500, 0) == m);
+    CHECK(rfom_aspect_present_mul(s.mul, last, t, t, 2000, 500, 1) == 1.0f);   /* movie */
+    CHECK(rfom_aspect_present_mul(s.mul, last, t, t, 2000, 0, 0) == 1.0f);   /* RFOM_ASPECT_SCENE_HOLD=0: 0.3.0 */
+    CHECK(rfom_aspect_present_mul(s.mul, 0, t, t, 2000, 500, 0) == 1.0f);   /* target back at 16:9 */
 }
 
 int main(void)
@@ -108,6 +134,7 @@ int main(void)
     test_off_hysteresis();
     test_off_and_narrow_targets();
     test_present_recency();
+    test_present_scene_keeps_stretch();
     if (fails) { fprintf(stderr, "aspect_test: %d failure(s)\n", fails); return 1; }
     printf("aspect_test: all passed\n");
     return 0;

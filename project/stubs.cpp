@@ -593,7 +593,9 @@ extern "C" void rfom_fov_set_live(double deg) { s_rfom_fov_live = deg > 0.0 ? de
  * sights uses its own (plain 16:9) camera, and deciding per camera flipped the
  * picture to 16:9 (GitHub issue #2); it is widened like the gameplay one and
  * refreshes the stretch too (rfom_aspect.h). The stretch is shown while such a
- * camera was set within RFOM_ASPECT_HOLD ms (default 2000; 0 = no timeout), so
+ * camera was set within RFOM_ASPECT_HOLD ms (default 2000; 0 = no timeout) or the
+ * guest frames still draw a 3D scene since (RFOM_ASPECT_SCENE_HOLD, default 500 ms:
+ * the game keeps its gameplay camera without setting it each frame), so
  * loading screens, 2D briefing / stats screens and menus, which set no 3D camera,
  * go back to their 16:9 letterbox; it ends at once when the target aspect has been
  * 16:9 for RFOM_ASPECT_OFF_MS (default 1000), and pauses while a movie plays
