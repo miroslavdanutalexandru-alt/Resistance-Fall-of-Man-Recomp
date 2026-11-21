@@ -49,16 +49,25 @@ int main(void)
     assert(strcmp(resolve("x!", NULL), "marge") == 0);
     assert(strcmp(resolve("1abc", NULL), "marge") == 0);
 
-    /* --psnr goes online; with no name, the OS login name is used. */
+    /* --psnr goes online; with no name, a random valid ID is used -- never
+     * the OS login name. */
     set_env("PS3_NP_ONLINE_ID", "");
-    set_env(OS_USER, "Lisa S.");
-    assert(strcmp(resolve(NULL, "127.0.0.1:36100"), "LisaS") == 0);
+    set_env(OS_USER, "LisaS");
+    {
+        const char* id = resolve(NULL, "127.0.0.1:36100");
+        char clean[17];
+        assert(id && strcmp(id, "LisaS") != 0);
+        assert(clean_online_id(id, clean) && strcmp(clean, id) == 0);
+    }
     assert(np_psnr_enabled());
     assert(strcmp(getenv("PSNR_SERVER"), "127.0.0.1:36100") == 0);
 
-    /* An OS name that can't be an online ID falls back to "PS3Player". */
-    set_env(OS_USER, "42");
-    assert(strcmp(resolve(NULL, NULL), "PS3Player") == 0);
+    /* Every generated name is a valid ID. */
+    for (int i = 0; i < 1000; i++) {
+        char id[17], clean[17];
+        np_psnr_random_id(id);
+        assert(clean_online_id(id, clean) && strcmp(clean, id) == 0);
+    }
 
     printf("test_np_identity: all passed\n");
     return 0;

@@ -6,9 +6,11 @@
  */
 
 #include "sceNp.h"
+#include "../../runtime/ppu/ppu_context.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
+#include <time.h>
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
 #include "np_psnr.h"
 #include "../system/cellSysutil.h"
@@ -343,4 +345,180 @@ s32 sceNpDrmIsAvailable(const u8* k_licensee, const char* drm_path)
 s32 sceNpDrmIsAvailable2(const u8* k_licensee, const char* drm_path)
 {
     return np_drm_is_available(k_licensee, drm_path);
+}
+
+/* ---------------------------------------------------------------------------
+ * NP ticket: sceNpManagerRequestTicket / GetTicket / GetTicketParam
+ *
+ * A title that authenticates against its own servers asks the NP manager for
+ * a ticket, waits for the manager callback to report it, then copies the blob
+ * out with GetTicket and reads fields from it with GetTicketParam. None of the
+ * three had an entry, so such a title waited forever for a completion that
+ * never came.
+ *
+ * On a console the ticket is an SCE-signed blob. There is no SCE here: the
+ * blob only has to be accepted by whatever server the player connects to,
+ * and middleware usually forwards it opaque. It carries a recognisable
+ * header and the online ID, and nothing that identifies the machine.
+ * -----------------------------------------------------------------------*/
+
+#define SCE_NP_MANAGER_EVENT_GOT_TICKET 255
+#define NP_TICKET_SIZE                  0x100
+#define NP_TICKET_LIFETIME_MS           (24ull * 3600ull * 1000ull)
+
+enum {
+    SCE_NP_TICKET_PARAM_SERIAL_ID = 0,
+    SCE_NP_TICKET_PARAM_ISSUER_ID,
+    SCE_NP_TICKET_PARAM_ISSUED_DATE,
+    SCE_NP_TICKET_PARAM_EXPIRE_DATE,
+    SCE_NP_TICKET_PARAM_SUBJECT_ACCOUNT_ID,
+    SCE_NP_TICKET_PARAM_SUBJECT_ONLINE_ID,
+    SCE_NP_TICKET_PARAM_SUBJECT_REGION,
+    SCE_NP_TICKET_PARAM_SUBJECT_DOMAIN,
+    SCE_NP_TICKET_PARAM_SERVICE_ID,
+    SCE_NP_TICKET_PARAM_SUBJECT_STATUS,
+    SCE_NP_TICKET_PARAM_STATUS_DURATION,
+    SCE_NP_TICKET_PARAM_SUBJECT_DOB,
+};
+
+static u8   s_np_ticket[NP_TICKET_SIZE];
+static int  s_np_ticket_ready = 0;
+static char s_np_ticket_service[25];   /* the service ID it was requested for */
+static u64  s_np_ticket_issued_ms;
+
+/* A stable 64-bit account ID from the online ID (FNV-1a), so one player keeps
+ * one account across runs and two players never share one. */
+static u64 np_ticket_account_id(const char* online_id)
+{
+    u64 h = 0xCBF29CE484222325ull;
+    for (const char* p = online_id; *p; p++) { h ^= (u8)*p; h *= 0x100000001B3ull; }
+    return h;
+}
+
+static void np_ticket_build(u32 service_ea)
+{
+    const char* id = np_psnr_online_id();
+    memset(s_np_ticket, 0, sizeof s_np_ticket);
+    memcpy(s_np_ticket, "PS3RECOMP-NP-TICKET", 19);   /* serial: obviously not SCE's */
+    memcpy(s_np_ticket + 24, id, strnlen(id, SCE_NP_ONLINEID_MAX_LENGTH));
+    for (u32 i = 48; i < NP_TICKET_SIZE; i++) s_np_ticket[i] = (u8)(i * 7 + 0x5A);
+
+    memset(s_np_ticket_service, 0, sizeof s_np_ticket_service);
+    for (u32 i = 0; i < sizeof s_np_ticket_service - 1; i++) {
+        u8 c = vm_read8(service_ea + i);
+        if (!c) break;
+        s_np_ticket_service[i] = (char)c;
+    }
+    s_np_ticket_issued_ms = (u64)time(NULL) * 1000ull;
+    s_np_ticket_ready = 1;
+}
+
+/* RequestTicket(npId, serviceId, cookie, cookieSize, entitlementId,
+ * consumedCount). There is no per-call callback: completion is reported as
+ * SCE_NP_MANAGER_EVENT_GOT_TICKET through the callback the title registered
+ * with sceNpManagerRegisterCallback, on its next cellSysutilCheckCallback. */
+static s32 np_ticket_request(u32 np_id_ea, u32 service_ea, u32 cookie_ea, u32 cookie_size)
+{
+    if (!s_np_initialized) return SCE_NP_ERROR_NOT_INITIALIZED;
+    if (!service_ea) return SCE_NP_ERROR_INVALID_ARGUMENT;
+    np_ticket_build(service_ea);
+    printf("[sceNp] ManagerRequestTicket(npId=0x%08X, service=\"%s\", cookie=0x%08X/%u) -> %u bytes\n",
+           np_id_ea, s_np_ticket_service, cookie_ea, cookie_size, (u32)NP_TICKET_SIZE);
+    if (s_npmgr_cb) {
+        const u64 args[8] = { (u64)(u32)SCE_NP_MANAGER_EVENT_GOT_TICKET, 0,
+                              (u64)(u32)(uintptr_t)s_npmgr_cb_arg, 0, 0, 0, 0, 0 };
+        cellSysutilQueueGuestCallbackArgs((u32)(uintptr_t)s_npmgr_cb, args);
+    } else {
+        printf("[sceNp] ManagerRequestTicket: no manager callback registered to report it\n");
+    }
+    return CELL_OK;
+}
+
+/* GetTicket(buffer, bufferSize*): a NULL buffer asks for the size; otherwise
+ * *bufferSize is the buffer's capacity and becomes the ticket's size. */
+static s32 np_ticket_get(u32 buf_ea, u32 size_ea)
+{
+    if (!s_np_initialized) return SCE_NP_ERROR_NOT_INITIALIZED;
+    if (!size_ea) return SCE_NP_ERROR_INVALID_ARGUMENT;
+    if (!s_np_ticket_ready) return SCE_NP_ERROR_INVALID_STATE;
+    if (buf_ea) {
+        if (vm_read32(size_ea) < NP_TICKET_SIZE) return SCE_NP_ERROR_INVALID_ARGUMENT;
+        for (u32 i = 0; i < NP_TICKET_SIZE; i++)
+            vm_write8(buf_ea + i, s_np_ticket[i]);   /* raw bytes, not BE fields */
+    }
+    vm_write32(size_ea, NP_TICKET_SIZE);
+    return CELL_OK;
+}
+
+/* GetTicketParam(paramId, SceNpTicketParam* param): one field of the ticket
+ * into a 256-byte union. Dates are SceNpTime, s64 ms since the Unix epoch;
+ * a title typically turns expire - issued into the ticket's lifetime. */
+static s32 np_ticket_get_param(s32 id, u32 out_ea)
+{
+    if (!s_np_initialized) return SCE_NP_ERROR_NOT_INITIALIZED;
+    if (!out_ea) return SCE_NP_ERROR_INVALID_ARGUMENT;
+    if (!s_np_ticket_ready) return SCE_NP_ERROR_INVALID_STATE;
+    if (id < SCE_NP_TICKET_PARAM_SERIAL_ID || id > SCE_NP_TICKET_PARAM_SUBJECT_DOB)
+        return SCE_NP_ERROR_INVALID_ARGUMENT;
+
+    for (u32 i = 0; i < 256; i++) vm_write8(out_ea + i, 0);
+    const char* online_id = np_psnr_online_id();
+    switch (id) {
+    case SCE_NP_TICKET_PARAM_SERIAL_ID:
+        for (u32 i = 0; i < 20; i++) vm_write8(out_ea + i, s_np_ticket[i]);
+        break;
+    case SCE_NP_TICKET_PARAM_ISSUER_ID:   vm_write32(out_ea, 0x100u); break;
+    case SCE_NP_TICKET_PARAM_ISSUED_DATE: vm_write64(out_ea, s_np_ticket_issued_ms); break;
+    case SCE_NP_TICKET_PARAM_EXPIRE_DATE:
+        vm_write64(out_ea, s_np_ticket_issued_ms + NP_TICKET_LIFETIME_MS);
+        break;
+    case SCE_NP_TICKET_PARAM_SUBJECT_ACCOUNT_ID:
+        vm_write64(out_ea, np_ticket_account_id(online_id));
+        break;
+    case SCE_NP_TICKET_PARAM_SUBJECT_ONLINE_ID:
+        for (u32 i = 0; i < SCE_NP_ONLINEID_MAX_LENGTH && online_id[i]; i++)
+            vm_write8(out_ea + i, (u8)online_id[i]);
+        break;
+    case SCE_NP_TICKET_PARAM_SUBJECT_REGION:   /* country code, then language */
+        vm_write8(out_ea + 0, 'u'); vm_write8(out_ea + 1, 's');
+        vm_write8(out_ea + 2, 'e'); vm_write8(out_ea + 3, 'n');
+        break;
+    case SCE_NP_TICKET_PARAM_SUBJECT_DOMAIN:
+        vm_write8(out_ea, 'u'); vm_write8(out_ea + 1, 'n');
+        break;
+    case SCE_NP_TICKET_PARAM_SERVICE_ID:
+        for (u32 i = 0; s_np_ticket_service[i]; i++) vm_write8(out_ea + i, (u8)s_np_ticket_service[i]);
+        break;
+    case SCE_NP_TICKET_PARAM_SUBJECT_STATUS:   /* age 30 in the top byte, no restrictions */
+        vm_write32(out_ea, 30u << 24);
+        break;
+    default:   /* status duration, date of birth: zero */
+        break;
+    }
+    return CELL_OK;
+}
+
+static void h_np_request_ticket(ppu_context* ctx)
+{
+    ctx->gpr[3] = (u64)(int64_t)np_ticket_request((u32)ctx->gpr[3], (u32)ctx->gpr[4],
+                                                  (u32)ctx->gpr[5], (u32)ctx->gpr[6]);
+}
+static void h_np_get_ticket(ppu_context* ctx)
+{
+    ctx->gpr[3] = (u64)(int64_t)np_ticket_get((u32)ctx->gpr[3], (u32)ctx->gpr[4]);
+}
+static void h_np_get_ticket_param(ppu_context* ctx)
+{
+    ctx->gpr[3] = (u64)(int64_t)np_ticket_get_param((s32)ctx->gpr[3], (u32)ctx->gpr[4]);
+}
+
+extern void ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context*));
+
+/* Called from ppu_sysprx_register(): the generated NID table has no entry for
+ * these, and they must be in place before the title's first call. */
+void np_register_ctx(void)
+{
+    ps3_hle_register_ctx(0x7E2FEF28u, "sceNpManagerRequestTicket",  h_np_request_ticket);
+    ps3_hle_register_ctx(0x0968AA36u, "sceNpManagerGetTicket",      h_np_get_ticket);
+    ps3_hle_register_ctx(0x58FA4FCDu, "sceNpManagerGetTicketParam", h_np_get_ticket_param);
 }
