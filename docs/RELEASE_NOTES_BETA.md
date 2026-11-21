@@ -8,6 +8,15 @@ A native PC port of *Resistance: Fall of Man* (PS3) built by static recompilatio
 
 This is a **beta**. The campaign has been played up to Cheddar Gorge. Later levels haven't been tested. Please report what you find (see *Reporting problems*).
 
+## 0.3.1-beta (unreleased)
+
+### Fixes
+- **Missing HUD / menu highlight on some Windows 10 PCs:** textures whose size isn't a multiple of 4 are decompressed before upload (`RSX_BC_UNALIGNED`, default on).
+- **Ultrawide:** the Hor+ stretch no longer drops back to 16:9 a few seconds into gameplay; it stays while 3D scenes are drawn (issue #2; `RFOM_ASPECT_SCENE_HOLD`).
+- **Frame generation:** less ghosting on the first-person weapon during fast turns (`RSX_DLSS_VIEWMODEL_W`).
+- **Portable build tools:** unpacking xwin / LLVM fixed (issue #16).
+- **Split-screen co-op:** DLSS / FSR / XeSS and frame generation pause while two players are in play and the two views render natively (the upscaler assumes one camera per frame; issue #25, player 1's half black). `RFOM_SPLIT_AA=1` keeps them on. The log now records how the two views are cleared and drawn (`[coop]` lines, `RFOM_SPLIT_LOG`).
+
 ## 0.3.0-beta
 
 The first big update after the setup hotfixes: performance and stability work, tank controls, many new PC options and rendering fixes. Unzip it over your existing port folder (or use the launcher's new in-place updater next time) and run Setup; it only rebuilds what changed. Your settings, saves and game copy are kept.

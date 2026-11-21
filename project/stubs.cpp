@@ -578,6 +578,7 @@ static int rfom_frame_wait_impl(uint64_t target, uint32_t last_ea)
  * zoom-in animation stays smooth. 0 / unset = the original. */
 #include <cmath>
 #include "rfom_aspect.h"
+#include "rfom_split.h"   /* split-screen co-op detection (issue #25) */
 static volatile double g_rfom_game_fov = 82.0;   /* last FOV the game set (degrees, before widening) */
 extern "C" volatile double g_rfom_view_fov;   /* v190e: cellPad.c scope mode reads the player's FOV */
 static volatile double s_rfom_fov_live = -1.0;   /* the PC menu's FOV (degrees); -1 = RFOM_FOV */
@@ -1314,6 +1315,7 @@ static int ptrace_key_start() {
 }
 static int s_ptrace_key_init = ptrace_key_start();
 static ULONGLONG s_ml_script_until;   /* v169: scripted camera active until (ms) */
+extern "C" volatile long g_rfom_split;   /* rsx_fsr.inc: split-screen co-op on (rfom_split_update) */
 /* Split-screen co-op (GitHub #13): the look hooks run once per local player
  * object, and all the mouse state was global -- the mouse counts went to
  * whichever player's hook ran first, player 2's stick looked like a scripted
@@ -1454,6 +1456,14 @@ extern "C" void rfom_mouselook_pre(uint32_t player)
               if (n++ < 50) { FILE* f = fopen("logs\\dyndiff.txt", n == 1 ? "w" : "a");
                   if (f) { fprintf(f, "t=%llu diff=%u d %.3f -> %.3f\n", GetTickCount64(), diff, d, base); fclose(f); } }
           } } }
+    { static rfom_split_state ss;   /* split-screen co-op: the renderer pauses DLSS / FSR (rsx_fsr.inc) */
+      if (player) {
+          const int on = rfom_split_update(&ss, player, GetTickCount64(), 1000u, 60000u);
+          if (on != (int)g_rfom_split) {
+              g_rfom_split = on; static int n = 0;
+              if (n++ < 20) fprintf(stderr, "[coop] split screen %s%c", on ? "on: two local players in play" : "off: one player", 10);
+          }
+      } }
     const int ml_own = ml_coop_owner(player, ml_rdf(player + 976), ml_rdf(player + 980));
     if (!g_ml_mode || !player) return;
     ml_load();

@@ -139,6 +139,21 @@ static int s_fsr_ab_ctx;   /* auto-exposure state the context was made with */
  * them for depth-based disocclusion and reprojection tolerance; the 0.1 / 1000
  * / 1.0 placeholders over- or under-reject. RSX_FSR_CAMERA=0 = placeholders. */
 volatile float g_rfom_cam_near, g_rfom_cam_far, g_rfom_cam_vfov;
+/* stubs.cpp: split-screen co-op is on (rfom_split_update: two local players ran
+ * their look code; off once one has played alone for 60 s). */
+volatile long g_rfom_split;
+/* RFOM_SPLIT_AA=0 (default): no DLSS / FSR / XeSS pass (and so no frame generation)
+ * while split screen is on. The temporal upscaler is built around one camera per
+ * frame: jitter, motion, the camera solve and the single dispatch that replaces the
+ * whole scene surface all assume it, and split screen draws two views into that
+ * surface (issue #25: player 1's half black). Native rendering there instead.
+ * RFOM_SPLIT_AA=1: keep them on (the 0.3.0 behaviour). */
+static int fsr_split_paused(void)
+{
+    static int keep = -1;
+    if (keep < 0) { const char* e = getenv("RFOM_SPLIT_AA"); keep = (e && atoi(e) > 0) ? 1 : 0; }
+    return !keep && g_rfom_split != 0;
+}
 static void fsr_camera(float* n, float* f, float* fov)
 {
     static int on = -1;
@@ -2706,6 +2721,19 @@ static void fsr_note_scene_draw(const D3D12DrawRecord* dr, int slot)
 static void fsr_frame_end(void)
 {
     if (!fsr_mode()) return;
+    {   /* RFOM_SPLIT_AA: split screen renders natively (no scene surface, no jitter) */
+        static int was = 0; const int sp = fsr_split_paused();
+        if (sp != was) { was = sp; static int n = 0;
+            if (n++ < 20) fprintf(stderr, "[FSR] split screen %s%c", sp ?
+                "on: DLSS / FSR / XeSS and frame generation paused, the two views render natively (RFOM_SPLIT_AA=1 keeps them)" :
+                "off: the upscaler resumes", 10); }
+        if (sp) {
+            for (int i = 0; i < MAX_OFF_RTS; i++) s_fsr_cnt[i] = 0;
+            g_fsr_scene_off = 0;
+            s_fsr_done = 1;   /* no dispatch on a stale scene pick */
+            return;
+        }
+    }
     int best = -1; u32 bn = 0;
     for (int i = 0; i < MAX_OFF_RTS; i++) {
         if (s_fsr_cnt[i] > bn) { bn = s_fsr_cnt[i]; best = i; }

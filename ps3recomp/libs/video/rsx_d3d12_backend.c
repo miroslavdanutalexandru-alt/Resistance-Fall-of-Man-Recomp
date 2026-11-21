@@ -33,6 +33,7 @@ static int border_on(void);
 #include "rsx_pso_cache.h"    /* RSX_PSO_LIBRARY: guest pipelines through a saved ID3D12PipelineLibrary */
 #include "../../../project/port_native_summary.h"   /* port_native_parse_bool: the shared switch rules */
 #include "../../../project/rfom_aspect.h"   /* rfom_aspect_present_mul: the Hor+ present stretch */
+#include "../../../project/rfom_split.h"    /* split-screen co-op state (issue #25) */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -10890,6 +10891,17 @@ static const char* ssao_status(void);   /* rsx_ssao.inc */
  * once as "[FXSCALE] ..."; nothing is re-allocated (no screen-shaped feeder
  * exists in R1, so there is nothing that can safely be moved). 0 = no audit. */
 static u8 s_fx_pre_w[MAX_OFF_RTS], s_fx_pre_s[MAX_OFF_RTS], s_fx_post[MAX_OFF_RTS];
+/* RFOM_SPLIT_LOG=<n> (default 64, 0 = off): the first n split-screen clears and
+ * target / viewport changes go to the log as "[coop] ..." lines -- how the two
+ * views share the scene surface, for co-op rendering reports. Render thread. */
+static int split_log_take(void)
+{
+    static int left = -1;
+    if (left < 0) { const char* e = getenv("RFOM_SPLIT_LOG"); left = e ? atoi(e) : 64; if (left < 0) left = 0; }
+    if (!left || !g_rfom_split) return 0;
+    left--;
+    return 1;
+}
 static int fx_scale_on(void)
 {
     static int m = -1;
@@ -12298,6 +12310,10 @@ static void render_frame_impl(void)
                         }
                     }
                     const D3D12_RECT* prc = ncr ? &crc : NULL;
+                    if (split_log_take())
+                        fprintf(stderr, "[coop] clear rt 0x%08X mask 0x%X scissor (%u,%u %ux%u) window offset (%u,%u) -> %s (%ld,%ld)-(%ld,%ld)%c",
+                                dr->rt_off, dr->clear_mask, dr->sc_x, dr->sc_y, dr->sc_w, dr->sc_h, dr->wo_x, dr->wo_y,
+                                ncr ? "rect" : "whole target", ncr ? crc.left : 0L, ncr ? crc.top : 0L, ncr ? crc.right : 0L, ncr ? crc.bottom : 0L, 10);
                     /* RT_CLEARDBG=1: clear offscreen targets to magenta rather
                      * than the guest colour. "0.000% nonzero" cannot tell an
                      * untouched surface from one written black, and that
@@ -12421,6 +12437,16 @@ static void render_frame_impl(void)
                             const float kx = dvp.Width / dvp_w, ky = dvp.Height / dvp_h;
                             dsc.left = (LONG)(sr[0] * kx + 0.5f); dsc.top = (LONG)(sr[1] * ky + 0.5f);
                             dsc.right = (LONG)(sr[2] * kx + 0.5f); dsc.bottom = (LONG)(sr[3] * ky + 0.5f);
+                        }
+                    }
+                    {   /* split screen: each change of target / viewport, for the co-op logs */
+                        static u32 lk[3];
+                        const u32 k0 = dr->rt_off, k1 = (u32)dr->vp_x | ((u32)dr->vp_y << 16), k2 = (u32)dr->vp_w | ((u32)dr->vp_h << 16);
+                        if ((k0 != lk[0] || k1 != lk[1] || k2 != lk[2]) && split_log_take()) {
+                            lk[0] = k0; lk[1] = k1; lk[2] = k2;
+                            fprintf(stderr, "[coop] draw rt 0x%08X fp 0x%08X viewport (%d,%d %ux%u) scissor (%u,%u %ux%u) -> (%ld,%ld)-(%ld,%ld)%s%c",
+                                    dr->rt_off, dr->fp_addr, (int)dr->vp_x, (int)dr->vp_y, (u32)dr->vp_w, (u32)dr->vp_h, dr->sc_x, dr->sc_y, dr->sc_w, dr->sc_h,
+                                    dsc.left, dsc.top, dsc.right, dsc.bottom, dr->fsr_up > 0.0f && dr->fsr_up < 1.0f ? " upscaled corner" : "", 10);
                         }
                     }
                     /* CLIP_MIN/MAX: the VS remapped z into the range (vp_record_cb_impl) */
