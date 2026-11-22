@@ -387,9 +387,11 @@ function Invoke-BtPyProbe([string]$Exe, [string[]]$Pre = @(), [int]$TimeoutMs = 
         if ($p.ExitCode -ne 0) { return $null }
         $l = @($out.Result -split "`r?`n" | Where-Object { $_.Trim() })
         if ($l.Count -lt 1 -or $l[0].Trim() -notmatch '^\d+\.\d+\.\d+$') { return $null }
-        $exe = if ($l.Count -ge 2) { $l[1].Trim() } else { '' }
-        if (-not $exe -or -not (Test-Path -LiteralPath $exe)) { $exe = $Exe }
-        return @{ Version = [version]$l[0].Trim(); Exe = $exe }
+        # not "$exe": PowerShell variable names ignore case, so that is the $Exe parameter and the fallback below
+        # would assign it to itself
+        $found = if ($l.Count -ge 2) { $l[1].Trim() } else { '' }
+        if (-not $found -or -not (Test-Path -LiteralPath $found)) { $found = $Exe }
+        return @{ Version = [version]$l[0].Trim(); Exe = $found }
     } catch { return $null } finally { $p.Dispose() }
 }
 function ConvertTo-BtPyTagVersion([string]$Tag) { try { return [version](($Tag -replace '[^\d.].*$', '') + '.0') } catch { return [version]'0.0' } }

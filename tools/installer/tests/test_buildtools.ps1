@@ -95,6 +95,12 @@ if (Test-Path -LiteralPath $tarExe) {
     Check ((Test-Path "$tout\top\hello.txt") -and (Get-Content "$tout\top\hello.txt") -eq 'hola') 'Expand-BtTar unpacks the archive with tar.exe (not tar.exe itself: $tar / $Tar are one variable)'
 } else { Write-Host '  skip Expand-BtTar: no tar.exe' }
 
+Write-Host '-- Python probe'
+# cmd.exe stands in for python: it prints a version and a sys.executable that does not exist
+$cmdExe = Join-Path $env:SystemRoot 'System32\cmd.exe'
+$pr = Invoke-BtPyProbe $cmdExe @('/c', 'echo 3.12.1&echo C:\no\such\python.exe&rem')
+Check ($pr -and $pr.Version -eq [version]'3.12.1' -and $pr.Exe -eq $cmdExe) 'probe: a sys.executable that does not exist falls back to the probed exe ($exe / $Exe are one variable)'
+
 Write-Host '-- which clang-cl'
 $cc = Join-Path $Cache 'llvm\bin\clang-cl.exe'; Touch $cc
 Check ((Find-BtClangCl) -eq $cc) 'tools_cache\llvm first, as tools\toolchain_env.bat puts it on PATH'
