@@ -215,9 +215,21 @@ function Test-BtCmakeNative([string]$Exe) {
     Push-Location -LiteralPath $script:BtPort
     try { & $Exe -P tools/cmake_native_probe.cmake *> $null; return ($LASTEXITCODE -eq 0) } catch { return $false } finally { Pop-Location; $ErrorActionPreference = $old }
 }
-function Get-BtClangMajor {
+# The clang-cl the build uses, in tools\toolchain_env.bat's PATH order: tools_cache\llvm\bin, then
+# C:\Program Files\LLVM\bin, then the rest of PATH. Checking the first clang-cl on PATH instead would test another
+# copy than the build runs: an older one earlier on PATH (another LLVM, an SDK's) hid an LLVM 22+ in Program Files,
+# and Setup kept reporting "update from 19" after LLVM 23 was installed.
+function Find-BtClangCl([string]$Cache = (Get-BtCache)) {
+    foreach ($p in @((Join-Path $Cache 'llvm\bin\clang-cl.exe'), (Join-Path $env:ProgramFiles 'LLVM\bin\clang-cl.exe'))) {
+        if (Test-Path -LiteralPath $p) { return $p }
+    }
     $c = Get-Command clang-cl -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-    $exe = if ($c) { $c.Source } elseif (Test-Path -LiteralPath 'C:\Program Files\LLVM\bin\clang-cl.exe') { 'C:\Program Files\LLVM\bin\clang-cl.exe' } else { return 0 }
+    if ($c) { return $c.Source }
+    return $null
+}
+function Get-BtClangMajor {
+    $exe = Find-BtClangCl
+    if (-not $exe) { return 0 }
     $v = "$(& $exe --version 2>$null | Select-Object -First 1)"
     if ($v -match 'version (\d+)\.') { return [int]$Matches[1] }
     return 0
@@ -253,9 +265,10 @@ function Expand-BtZip([string]$Zip, [string]$Dest) {
 # .tar.gz / .tar.xz: Windows' tar.exe (bsdtar), else Python's tarfile
 function Expand-BtTar([string]$Tar, [string]$Dest, [string]$Python = '') {
     New-Item -ItemType Directory -Force -Path $Dest | Out-Null
-    $tar = Join-Path $env:SystemRoot 'System32\tar.exe'
-    if (Test-Path -LiteralPath $tar) {
-        if ((Invoke-BtNative $tar @('-xf', $Tar, '-C', $Dest)) -eq 0) { return }
+    # not "$tar": PowerShell variable names ignore case, so that would overwrite the $Tar parameter and unpack tar.exe itself
+    $tarExe = Join-Path $env:SystemRoot 'System32\tar.exe'
+    if (Test-Path -LiteralPath $tarExe) {
+        if ((Invoke-BtNative $tarExe @('-xf', $Tar, '-C', $Dest)) -eq 0) { return }
         Write-BtMsg 'tar.exe could not unpack it; trying Python'
     }
     if (-not $Python) { throw "cannot unpack $Tar (no tar.exe and no Python)" }

@@ -281,7 +281,8 @@ function Test-NativeCmake { $c = Get-Command cmake -CommandType Application -Err
 function Test-CmakeOk { if (-not (Have 'cmake')) { return $false }; return ((Test-NativeCmake) -or (Test-Path -LiteralPath "$env:ProgramFiles\CMake\bin\cmake.exe")) }
 # the build tools still missing (buildtools.ps1 keys); the portable ones in tools_cache\ count (Refresh-Path adds them)
 # clang-cl $script:BtClangMin+ (buildtools.ps1): the committed PGO profile needs it; an older LLVM counts as missing (updated)
-function Test-ClangOk { return ((Have 'clang-cl') -and (Get-BtClangMajor) -ge $script:BtClangMin) }
+# (Get-BtClangMajor checks the clang-cl the build uses: tools_cache\llvm, then Program Files\LLVM, then PATH)
+function Test-ClangOk { return ((Get-BtClangMajor) -ge $script:BtClangMin) }
 function Get-MissingToolKeys {
     $k = @()
     if (-not (Find-Python)) { $k += 'python' }
