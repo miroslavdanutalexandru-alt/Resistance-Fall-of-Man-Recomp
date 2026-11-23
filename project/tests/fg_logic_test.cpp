@@ -515,6 +515,33 @@ static void test_nn_ambiguous()
 	volatile double z0 = 0.0;
 	CHECK(!rfom_viewmodel_near(0.0, 0.0, z0 / z0, 1.0));  // NaN
 }
+// RFOM_DLSS_CAM_REP: a program whose candidates keep missing the solved camera is left out, then let back in
+static void test_camrep()
+{
+	rfom_camrep_t r; std::memset(&r, 0, sizeof r);
+	CHECK(rfom_camrep_step(&r, 0.45, 0.003, 0.01) == 0 && r.score == 2);   // York 397F3C37: 0.45 ndc off a 0.003 pan
+	CHECK(rfom_camrep_step(&r, 0.003, 0.003, 0.01) == 0 && r.score == 1);  // one close frame takes one back
+	CHECK(rfom_camrep_step(&r, 1e9, 0.003, 0.01) == 0);                     // behind the camera counts as far
+	CHECK(rfom_camrep_step(&r, 0.2, 0.003, 0.01) == 0);
+	CHECK(rfom_camrep_step(&r, 0.2, 0.003, 0.01) == 0 && r.score == 7);
+	CHECK(rfom_camrep_step(&r, 0.2, 0.003, 0.01) == 1 && r.out);            // 9: left out
+	CHECK(rfom_camrep_step(&r, 0.2, 0.003, 0.01) == 0 && r.out);
+	for (int i = 0; i < 7; ++i) CHECK(rfom_camrep_step(&r, 0.002, 0.003, 0.01) == 0 && r.out);
+	CHECK(rfom_camrep_step(&r, 0.002, 0.003, 0.01) == -1 && !r.out);        // 3: back in
+	rfom_camrep_t g; std::memset(&g, 0, sizeof g);
+	for (int i = 0; i < 40; ++i) rfom_camrep_step(&g, 0.025, 0.14, 0.01);  // fast turn: 0.025 off a 0.14 motion is close
+	CHECK(!g.out && g.score == 0);
+	rfom_camrep_step(&g, 0.2, 0.14, 0.01);
+	CHECK(g.score == 2);                                                   // 0.2 off it is far
+	rfom_camrep_step(&g, 0.03, 0.14, 0.01);
+	CHECK(g.score == 2);                                                   // 0.03 is in between: no change
+	volatile double z0 = 0.0;
+	for (int i = 0; i < 4; ++i) rfom_camrep_step(&g, z0 / z0, 0.01, 0.01);  // NaN counts as far
+	CHECK(g.out);
+	int probes = 0;
+	for (unsigned f = 0; f < 64; ++f) probes += rfom_camrep_probe(0x397F3C37u, f);
+	CHECK(probes == 4);
+}
 #endif
 
 int main()
@@ -532,6 +559,7 @@ int main()
 	test_unsure_pause();
 	test_vote_majority();
 	test_nn_ambiguous();
+	test_camrep();
 #endif
 	std::printf("fg_logic_test: %d checks, %d failed\n", g_checks, g_fail);
 	return g_fail ? 1 : 0;

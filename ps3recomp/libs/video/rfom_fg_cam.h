@@ -77,6 +77,30 @@ static inline const double* rfom_fgcam_hold(rfom_fgcam_hold_t* h, const double* 
     return 0;
 }
 
+/* RFOM_DLSS_CAM_REP (rsx_fsr.inc cam_solve / cam_note): a camera candidate comes from a program whose shared
+ * (non per-instance) rows changed since last frame -- normally the camera, but some programs change those rows
+ * for their own reasons and give a camera nowhere near the real one (York logs: programs 397F3C37 / 8F6F6F59,
+ * 0.15-10 ndc off). Two such programs took 2 of the 8 candidate slots each on nearly every unsolved frame, so a
+ * tight group of 4 good candidates was no majority. Per program, on solved frames: d = its candidate's distance
+ * to the solved camera (ndc), motion = the solved camera's own motion. Far (> max(0.05, motion / 2)) counts +2,
+ * close (<= max(good, motion / 5)) -1; left out at 8, back in at 3 (it is still probed now and then). Returns
+ * 1 when the program was just left out, -1 when just let back in, else 0. */
+typedef struct { unsigned char score, out; } rfom_camrep_t;
+static inline int rfom_camrep_step(rfom_camrep_t* r, double d, double motion, double good)
+{
+    const double far_t = motion * 0.5 > 0.05 ? motion * 0.5 : 0.05, near_t = motion * 0.2 > good ? motion * 0.2 : good;
+    int s = r->score;
+    if (!(d <= far_t)) s += 2;   /* NaN / behind (1e9) count as far */
+    else if (d <= near_t && s > 0) s--;
+    if (s > 16) s = 16;
+    r->score = (unsigned char)s;
+    if (!r->out && s >= 8) { r->out = 1; return 1; }
+    if (r->out && s <= 3) { r->out = 0; return -1; }
+    return 0;
+}
+/* a left-out program is still evaluated (not voted with) on one frame in 16, so it can earn its way back */
+static inline int rfom_camrep_probe(unsigned hash, unsigned fr) { return ((hash >> 5 ^ fr) & 15u) == 0u; }
+
 /* HUD split unsure-frame pause (rsx_dlssg.inc, RFOM_FG_UNSURE_PAUSE). A frame is truly unsure when the
  * classifier gave up (unsure) or a HUD run was started and then closed by a later scene draw; a frame
  * without HUD runs is fine (empty UI layer). Generation pauses after n_on consecutive unsure frames and

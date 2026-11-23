@@ -9,6 +9,13 @@
  *                     generated frames then interpolate the HUD together with the scene.
  *   RFOM_FG_HUDDBG    1: show the HUD-less image the generator gets | 2: show the separated UI layer over grey.
  *                     Works whenever DLSS runs, also with frame generation off or unsupported.
+ *   RSX_FG_HUD_DIM    1 (default): SRC_ALPHA/ONE additive HUD draws (the dim unlit digit segments / bullet ticks
+ *                     of the ammo and health display) get src.a as alpha in the UI layer, and the layer's colour
+ *                     is rebuilt from the real frame (ui.rgb = frame - (1 - ui.a) * hudless; ONE/ONE draws keep
+ *                     the old alpha; without the rebuild pass the old layer is used) | 0: old layer (additive
+ *                     parts at alpha 0, missing from generated frames).
+ *   RFOM_FG_HUDLOG    N (default 0, diagnostic): log every display-buffer draw of N frames with DLSS inputs
+ *                     ("[FG-HUD]": HUD or why not, run state, blend / depth state, textures).
  *   RFOM_FG_UNSURE_PAUSE 1 (default): with the HUD split on, 3 consecutive frames whose HUD could not be
  *                     separated pause generation (for at least 15 frames) | 0: generate anyway.
  *   RFOM_DLSSG_MENU_DETECT unset: DLSS-G menu detection off while the HUD split runs, on otherwise (HDR,
@@ -69,9 +76,11 @@ static u32 s_fg_presents, s_fg_hud_ok, s_fg_hud_fb;
 static ID3D12Resource *s_fg_hl, *s_fg_ui, *s_fg_hsc, *s_fg_usc;
 static D3D12_RESOURCE_STATES s_fg_hl_st, s_fg_ui_st, s_fg_hsc_st, s_fg_usc_st;
 static u32 s_fg_sc_w, s_fg_sc_h;
-static ID3D12DescriptorHeap *s_fg_rtv_heap, *s_fg_srv_heap;   /* rtv: ui, hsc, usc | srv: hl, ui, render_targets[] */
+static ID3D12DescriptorHeap *s_fg_rtv_heap, *s_fg_srv_heap;   /* rtv: ui, hsc, usc | srv: hl, ui, render_targets[],
+                                                                 * then (hl, ui, render_targets[i]) per i */
 static UINT s_fg_rtv_inc, s_fg_srv_inc;
-static ID3D12PipelineState *s_fg_pass_pso, *s_fg_over_pso;
+static ID3D12PipelineState *s_fg_pass_pso, *s_fg_over_pso, *s_fg_dim_pso;
+static ID3D12RootSignature* s_fg_dim_rs;
 static int s_fg_res_bad;
 
 /* Per-frame HUD-split state (render thread; a frame can span several command-list batches). */
@@ -86,6 +95,18 @@ static struct {
 } s_fgh;
 
 static void fg_log(const char* m) { fprintf(stderr, "[DLSS-G] %s%c", m, 10); }
+
+/* RSX_FG_HUD_DIM (default 1, 0 = old UI layer): see the header. */
+static int fg_hud_dim(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char* e = getenv("RSX_FG_HUD_DIM"); v = e ? (atoi(e) != 0) : 1;
+        fg_log(v ? "HUD split: additive HUD parts (dim digit segments) kept in the UI layer (RSX_FG_HUD_DIM=0 off)"
+                 : "HUD split: additive HUD parts left out of the UI layer (RSX_FG_HUD_DIM=0)");
+    }
+    return v;
+}
 
 /* AMD FSR 3 frame generation, the fallback (rsx_fsr3fg.inc, included after rsx_fsr.inc) */
 static int s_f3_want;    /* FSR 3 frame generation usable: make the frame interpolation swap chain */
@@ -280,6 +301,65 @@ static const char s_fg_pass_hlsl[] =
     "  o.uv = uv; o.p = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1); return o; }\n"
     "float4 ps(V i) : SV_Target { return t0.Sample(s0, i.uv); }\n";
 
+/* RSX_FG_HUD_DIM: the UI layer's colour rebuilt from the real frame, so ui.rgb + (1 - ui.a) * hudless is the
+ * frame exactly, also where additive HUD draws only added light (t0 = HUD-less, t1 = UI layer, t2 = frame). */
+static const char s_fg_dim_hlsl[] =
+    "Texture2D t0 : register(t0); Texture2D t1 : register(t1); Texture2D t2 : register(t2);\n"
+    "SamplerState s0 : register(s0);\n"
+    "struct V { float4 p : SV_Position; float2 uv : TEXCOORD0; };\n"
+    "V vs(uint id : SV_VertexID) { V o; float2 uv = float2((id << 1) & 2, id & 2);\n"
+    "  o.uv = uv; o.p = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1); return o; }\n"
+    "float4 ps(V i) : SV_Target { float4 u = t1.Sample(s0, i.uv); if (u.a <= 0.0) return u;\n"
+    "  float3 h = t0.Sample(s0, i.uv).rgb, f = t2.Sample(s0, i.uv).rgb;\n"
+    "  return float4(max(f - (1.0 - u.a) * h, 0.0), u.a); }\n";
+
+/* fg_res_init: root signature (one table of 3 SRVs) and pipeline of the rebuild pass; none = the old pass. */
+static void fg_dim_init(ID3D12Device* d)
+{
+    D3D12_DESCRIPTOR_RANGE rg = {0};
+    rg.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; rg.NumDescriptors = 3;
+    D3D12_ROOT_PARAMETER rp = {0};
+    rp.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    rp.DescriptorTable.NumDescriptorRanges = 1; rp.DescriptorTable.pDescriptorRanges = &rg;
+    rp.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    D3D12_STATIC_SAMPLER_DESC sm = {0};
+    sm.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    sm.AddressU = sm.AddressV = sm.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sm.MaxLOD = D3D12_FLOAT32_MAX; sm.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    D3D12_ROOT_SIGNATURE_DESC rd = {0};
+    rd.NumParameters = 1; rd.pParameters = &rp; rd.NumStaticSamplers = 1; rd.pStaticSamplers = &sm;
+    ID3DBlob *sig = NULL, *err = NULL, *vsb = NULL, *psb = NULL;
+    HRESULT hr = D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err);
+    if (SUCCEEDED(hr)) hr = d->lpVtbl->CreateRootSignature(d, 0, sig->lpVtbl->GetBufferPointer(sig), sig->lpVtbl->GetBufferSize(sig),
+                                                         &IID_ID3D12RootSignature, (void**)&s_fg_dim_rs);
+    if (err) { err->lpVtbl->Release(err); err = NULL; }
+    if (SUCCEEDED(hr)) hr = D3DCompile(s_fg_dim_hlsl, sizeof s_fg_dim_hlsl - 1, "fg_dim", NULL, NULL, "vs", "vs_5_0", 0, 0, &vsb, &err);
+    if (err) { err->lpVtbl->Release(err); err = NULL; }
+    if (SUCCEEDED(hr)) hr = D3DCompile(s_fg_dim_hlsl, sizeof s_fg_dim_hlsl - 1, "fg_dim", NULL, NULL, "ps", "ps_5_0", 0, 0, &psb, &err);
+    if (err) { err->lpVtbl->Release(err); err = NULL; }
+    if (SUCCEEDED(hr)) {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {0};
+        pd.pRootSignature = s_fg_dim_rs;
+        pd.VS.pShaderBytecode = vsb->lpVtbl->GetBufferPointer(vsb); pd.VS.BytecodeLength = vsb->lpVtbl->GetBufferSize(vsb);
+        pd.PS.pShaderBytecode = psb->lpVtbl->GetBufferPointer(psb); pd.PS.BytecodeLength = psb->lpVtbl->GetBufferSize(psb);
+        pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        pd.SampleMask = 0xFFFFFFFFu;
+        pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID; pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        pd.RasterizerState.DepthClipEnable = TRUE;
+        pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        pd.NumRenderTargets = 1; pd.RTVFormats[0] = s_sc_fmt; pd.SampleDesc.Count = 1;
+        hr = d->lpVtbl->CreateGraphicsPipelineState(d, &pd, &IID_ID3D12PipelineState, (void**)&s_fg_dim_pso);
+    }
+    if (sig) sig->lpVtbl->Release(sig);
+    if (vsb) vsb->lpVtbl->Release(vsb);
+    if (psb) psb->lpVtbl->Release(psb);
+    if (FAILED(hr)) {
+        s_fg_dim_pso = NULL;
+        if (s_fg_dim_rs) { s_fg_dim_rs->lpVtbl->Release(s_fg_dim_rs); s_fg_dim_rs = NULL; }
+        fg_log("HUD split: UI colour rebuild unavailable -- additive HUD parts slightly darken the scene behind them");
+    }
+}
+
 /* Guest-sized textures, heaps and pipelines (once; needs blit_init's root signature). */
 static int fg_res_init(void)
 {
@@ -296,15 +376,19 @@ static int fg_res_init(void)
     hd.NumDescriptors = 3; hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
     if (FAILED(d->lpVtbl->CreateDescriptorHeap(d, &hd, &IID_ID3D12DescriptorHeap, (void**)&s_fg_rtv_heap))) { s_fg_rtv_heap = NULL; return 0; }
     s_fg_rtv_inc = d->lpVtbl->GetDescriptorHandleIncrementSize(d, D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-    hd.NumDescriptors = 2 + FRAME_COUNT; hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV; hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    hd.NumDescriptors = 2 + 4 * FRAME_COUNT; hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV; hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     if (FAILED(d->lpVtbl->CreateDescriptorHeap(d, &hd, &IID_ID3D12DescriptorHeap, (void**)&s_fg_srv_heap))) { s_fg_srv_heap = NULL; return 0; }
     s_fg_srv_inc = d->lpVtbl->GetDescriptorHandleIncrementSize(d, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     d->lpVtbl->CreateRenderTargetView(d, s_fg_ui, NULL, fg_rtv(0));
     { D3D12_CPU_DESCRIPTOR_HANDLE h; s_fg_srv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_fg_srv_heap, &h);
-      ID3D12Resource* src[2 + FRAME_COUNT];
+      ID3D12Resource* src[2 + 4 * FRAME_COUNT];
       src[0] = s_fg_hl; src[1] = s_fg_ui;
-      for (u32 i = 0; i < FRAME_COUNT; i++) src[2 + i] = s_d3d.render_targets[i];
-      for (u32 i = 0; i < 2 + FRAME_COUNT; i++) {
+      for (u32 i = 0; i < FRAME_COUNT; i++) {
+          src[2 + i] = s_d3d.render_targets[i];
+          src[2 + FRAME_COUNT + 3 * i] = s_fg_hl; src[3 + FRAME_COUNT + 3 * i] = s_fg_ui;
+          src[4 + FRAME_COUNT + 3 * i] = s_d3d.render_targets[i];
+      }
+      for (u32 i = 0; i < 2 + 4 * FRAME_COUNT; i++) {
           D3D12_SHADER_RESOURCE_VIEW_DESC sv = {0};
           sv.Format = DXGI_FORMAT_R8G8B8A8_UNORM; sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
           sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING; sv.Texture2D.MipLevels = 1;
@@ -337,6 +421,7 @@ static int fg_res_init(void)
     vsb->lpVtbl->Release(vsb); psb->lpVtbl->Release(psb);
     if (FAILED(hr)) { fg_log("HUD split unavailable (pipeline creation failed)"); return 0; }
     s_fg_res_bad = 0;
+    if (fg_hud_dim()) fg_dim_init(d);
     return 1;
 }
 
@@ -483,8 +568,14 @@ static void fg_present(ID3D12GraphicsCommandList* cl, UINT bi, u32 fi, D3D12_CPU
         /* UI: the separated HUD (premultiplied), then the port's own OSD on top of it */
         cl->lpVtbl->OMSetRenderTargets(cl, 1, &ur, FALSE, NULL);
         if (valid) {
-            cl->lpVtbl->SetPipelineState(cl, s_fg_pass_pso);
-            cl->lpVtbl->SetGraphicsRootDescriptorTable(cl, 1, fg_srv(1));
+            if (s_fg_dim_pso && fg_hud_dim()) {   /* RSX_FG_HUD_DIM: colour rebuilt from the real frame */
+                cl->lpVtbl->SetGraphicsRootSignature(cl, s_fg_dim_rs);
+                cl->lpVtbl->SetPipelineState(cl, s_fg_dim_pso);
+                cl->lpVtbl->SetGraphicsRootDescriptorTable(cl, 0, fg_srv(2 + FRAME_COUNT + 3 * (int)fi));
+            } else {
+                cl->lpVtbl->SetPipelineState(cl, s_fg_pass_pso);
+                cl->lpVtbl->SetGraphicsRootDescriptorTable(cl, 1, fg_srv(1));
+            }
             cl->lpVtbl->DrawInstanced(cl, 3, 1, 0, 0);
         }
         osd_draw(cl, bi);

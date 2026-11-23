@@ -414,9 +414,25 @@ typedef struct {
     u32 mt[5];                   /* scene draws by match type this frame */
     float jnx, jny;              /* this frame's clip-space jitter */
     u32 prog[CAM_MAX];
+    u8 probe[CAM_MAX];           /* RFOM_DLSS_CAM_REP: a left-out program's probe (scored, not voted with) */
+    u32 rskip;                   /* candidates left out by RFOM_DLSS_CAM_REP this frame */
     double M[CAM_MAX][16];
 } CamFrame;
 static CamFrame s_cam[FSR_RING];
+/* RFOM_DLSS_CAM_REP (default 1, 0 = off): programs whose camera candidates keep landing far from the solved camera
+ * (rfom_camrep_step) stop taking candidate slots. Scored on the render thread (cam_solve), read on the FIFO thread
+ * (cam_note); a stale read only delays one decision by a frame. */
+static int dlss_cam_rep(void)
+{
+    static int v = -1;
+    if (v < 0) { v = dlss_env_i("RFOM_DLSS_CAM_REP", 1, 0, 1);
+                 fprintf(stderr, "[DLSS] camera candidates: %s%c", v ? "programs that keep disagreeing with the solved camera are left out (RFOM_DLSS_CAM_REP=0: off)"
+                                                                     : "every program (RFOM_DLSS_CAM_REP=0)", 10); }
+    return v;
+}
+typedef struct { volatile u32 hash; rfom_camrep_t r; } CamRep;
+static CamRep s_cam_rep[512];
+static CamRep* cam_rep(u32 hash) { return &s_cam_rep[(hash * 2654435761u) >> 23]; }
 typedef struct { u32 hash; u8 st; signed char pa; } CamProg;   /* st: 0 unknown, 1 position attribute pa, 2 can't evaluate */
 static CamProg s_cam_prog[512];
 static CamFrame* cam_frame(u32 fr)
@@ -424,7 +440,7 @@ static CamFrame* cam_frame(u32 fr)
     CamFrame* cf = &s_cam[fr % FSR_RING];
     if (cf->tag != fr) {
         cf->tag = 0; MemoryBarrier();
-        cf->n = 0; cf->elig = cf->tried = cf->bad = 0; memset(cf->mt, 0, sizeof cf->mt);
+        cf->n = 0; cf->elig = cf->tried = cf->bad = cf->rskip = 0; memset(cf->mt, 0, sizeof cf->mt);
         MemoryBarrier(); cf->tag = fr;
     }
     return cf;
@@ -444,6 +460,14 @@ static void cam_note(const D3D12DrawRecord* dr, int vs_idx, const char* csrc, co
     int per = 0;
     for (u32 i = 0; i < cf->n; i++) if (cf->prog[i] == ve->hash) per++;
     if (per >= 2) return;
+    int probe = 0;
+    if (dlss_cam_rep()) {
+        const CamRep* rp = cam_rep(ve->hash);
+        if (rp->hash == ve->hash && rp->r.out) {
+            if (!rfom_camrep_probe(ve->hash, fr)) { cf->rskip++; return; }
+            probe = 1;
+        }
+    }
     CamProg* pg = &s_cam_prog[(ve->hash * 2654435761u) >> 23];
     if (pg->hash != ve->hash) { pg->hash = ve->hash; pg->st = 0; pg->pa = -1; }
     if (pg->st == 2) return;
@@ -473,7 +497,7 @@ static void cam_note(const D3D12DrawRecord* dr, int vs_idx, const char* csrc, co
             !vpcpu_camera(Ac, epi, Ap, epi, M)) { cf->bad++; return; }
     }
     const u32 k = cf->n;
-    memcpy(cf->M[k], M, sizeof M); cf->prog[k] = ve->hash;
+    memcpy(cf->M[k], M, sizeof M); cf->prog[k] = ve->hash; cf->probe[k] = (u8)probe;
     MemoryBarrier();
     cf->n = k + 1u;
 }
@@ -2282,6 +2306,8 @@ static int cf_init(void)
 /* This frame's camera M from the record side's candidates. Returns 1 exact,
  * 2 fallback (candidates disagree), 0 none (no candidates: a still camera or no
  * static instance seen), 3 no record data. */
+static int cam_solve_core(u32 fr, u32 n, double (*Ms)[16], const u32* pg, double M[16], int* cut);
+static u32 s_cf_rskip, s_cf_rout;   /* RFOM_DLSS_CAM_REP: candidates left out / programs left out (camera/600) */
 static int cam_solve(u32 fr, double M[16], float j[2], int* cut)
 {
     *cut = 0;
@@ -2289,15 +2315,43 @@ static int cam_solve(u32 fr, double M[16], float j[2], int* cut)
     if (cf->tag != fr) return 3;
     MemoryBarrier();
     u32 n = cf->n; if (n > CAM_MAX) n = CAM_MAX;
-    static double Ms[CAM_MAX][16];
+    static double Ms[CAM_MAX][16], Mv[CAM_MAX][16];
+    u32 pg[CAM_MAX], pv[CAM_MAX]; u8 pr[CAM_MAX];
     memcpy(Ms, (const void*)cf->M, n * sizeof Ms[0]);
+    memcpy(pg, (const void*)cf->prog, n * sizeof pg[0]);
+    memcpy(pr, (const void*)cf->probe, n * sizeof pr[0]);
     j[0] = cf->jnx; j[1] = cf->jny;
-    const u32 el = cf->elig, tr = cf->tried, bd = cf->bad; u32 mt[5]; memcpy(mt, cf->mt, sizeof mt);
+    const u32 el = cf->elig, tr = cf->tried, bd = cf->bad, rs = cf->rskip; u32 mt[5]; memcpy(mt, cf->mt, sizeof mt);
     MemoryBarrier();
     if (cf->tag != fr) return 3;
-    s_cf_cand += n; s_cf_elig += el; s_cf_tried += tr; s_cf_bad += bd;
+    s_cf_cand += n; s_cf_elig += el; s_cf_tried += tr; s_cf_bad += bd; s_cf_rskip += rs;
     for (int k = 0; k < 5; k++) s_cf_mt[k] += mt[k];
     if (!n) return 0;
+    /* RFOM_DLSS_CAM_REP: left-out programs' probes are scored below but never voted with */
+    u32 nv = 0;
+    for (u32 i = 0; i < n; i++) if (!pr[i]) { memcpy(Mv[nv], Ms[i], sizeof Ms[0]); pv[nv++] = pg[i]; }
+    if (!nv) return 0;
+    const int r = cam_solve_core(fr, nv, Mv, pv, M, cut);
+    if (r == 1 && dlss_cam_rep()) {
+        static const double I[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
+        const double mo = vpcpu_mdist(M, I), good = dlss_cam_tol2() > dlss_cam_tol() ? dlss_cam_tol2() : dlss_cam_tol();
+        static u32 nlog;
+        for (u32 i = 0; i < n; i++) {
+            CamRep* rp = cam_rep(pg[i]);
+            if (rp->hash != pg[i]) { rp->r.score = 0; rp->r.out = 0; rp->hash = pg[i]; }
+            const double d = vpcpu_mdist(M, Ms[i]);
+            const int ch = rfom_camrep_step(&rp->r, d, mo, good);
+            if (ch > 0) s_cf_rout++;
+            if (ch && (nlog < 16 || nlog % 200 == 0))
+                fprintf(stderr, "[DLSS] camera candidates from program %08X %s (%.2g ndc from the solved camera, motion %.2g; RFOM_DLSS_CAM_REP)%c",
+                        pg[i], ch > 0 ? "left out: they keep disagreeing" : "taken again", d > 1e8 ? -1.0 : d, mo, 10);
+            if (ch) nlog++;
+        }
+    }
+    return r;
+}
+static int cam_solve_core(u32 fr, u32 n, double (*Ms)[16], const u32* pg, double M[16], int* cut)
+{
     int agree = 0;
     const double tol = dlss_cam_tol();
     const int b = vpcpu_vote((const double (*)[16])Ms, (int)n, tol, &agree);
@@ -2318,7 +2372,7 @@ static int cam_solve(u32 fr, double M[16], float j[2], int* cut)
                                               fr, n, gc, uniq ? "" : ", tied");
             for (u32 i = 0; i < n && o > 0 && o < (int)sizeof line - 48; i++) {
                 const double d = vpcpu_mdist(Ms[g], Ms[i]);
-                o += snprintf(line + o, sizeof line - (size_t)o, " %08X/%d/%.2g", cf->prog[i], cnt[i], d > 1e8 ? -1.0 : d);
+                o += snprintf(line + o, sizeof line - (size_t)o, " %08X/%d/%.2g", pg[i], cnt[i], d > 1e8 ? -1.0 : d);
             }
             fprintf(stderr, "%s (program/group/ndc to the largest group, -1 = behind)%c", line, 10);
         }
@@ -2356,7 +2410,7 @@ static int cam_solve(u32 fr, double M[16], float j[2], int* cut)
                                                   fr, n, sp, mo > 1e8 ? -1.0 : mo);
                 for (u32 i = 0; i < n && o > 0 && o < (int)sizeof line - 40; i++) {
                     const double d = vpcpu_mdist(Ms[i], I);
-                    o += snprintf(line + o, sizeof line - (size_t)o, " %08X/%.2g", cf->prog[i], d > 1e8 ? -1.0 : d);
+                    o += snprintf(line + o, sizeof line - (size_t)o, " %08X/%.2g", pg[i], d > 1e8 ? -1.0 : d);
                 }
                 fprintf(stderr, "%s (program/motion ndc, -1 = behind)%c", line, 10);
             }
@@ -2641,17 +2695,17 @@ static void fsr_dispatch(void)
           { const u32 cf = s_cf_st[0] + s_cf_st[1] + s_cf_st[2] + s_cf_st[3];
             const u32 md = s_cf_mt[0] + s_cf_mt[1] + s_cf_mt[2] + s_cf_mt[3] + s_cf_mt[4];
             fprintf(stderr, "[DLSS] camera/600: %s | exact %u (plurality %u, loose vote %u, medoid %u), fallback %u (candidates disagree; last camera held %u; streaks 1-3/4-10/11-30/31+ %u/%u/%u/%u), none %u (no candidates), no record %u, cuts->reset %u"
-                            " | candidates %.1f/frame (exact-instance draws %.1f, evaluated %.1f, refused %.1f) | fill depth scene %u / none %u"
+                            " | candidates %.1f/frame (exact-instance draws %.1f, evaluated %.1f, refused %.1f, left out %.1f; programs left out %u) | fill depth scene %u / none %u"
                             " | draws exact %.1f%% instance %.1f%% nearest %.1f%% camera-split %.1f%% unmatched %.1f%%"
                             " | render %ux%u of %ux%u (%.4f) | SSAO: %s%c",
                     !dlss_cam_exact() ? "RFOM_DLSS_CAM=fallback" : s_cf_armed ? "exact" : "exact (idle: debug / Home mode)",
                     s_cf_st[1], s_cf_plur, s_cf_loose, s_cf_med, s_cf_st[2], s_cf_held, s_cf_run[0], s_cf_run[1], s_cf_run[2], s_cf_run[3], s_cf_st[0], s_cf_st[3], s_cf_cut,
-                    cf ? (double)s_cf_cand / cf : 0.0, cf ? (double)s_cf_elig / cf : 0.0, cf ? (double)s_cf_tried / cf : 0.0, cf ? (double)s_cf_bad / cf : 0.0,
+                    cf ? (double)s_cf_cand / cf : 0.0, cf ? (double)s_cf_elig / cf : 0.0, cf ? (double)s_cf_tried / cf : 0.0, cf ? (double)s_cf_bad / cf : 0.0, cf ? (double)s_cf_rskip / cf : 0.0, s_cf_rout,
                     s_cf_dep[0], s_cf_dep[1],
                     md ? 100.0 * s_cf_mt[1] / md : 0.0, md ? 100.0 * s_cf_mt[2] / md : 0.0, md ? 100.0 * s_cf_mt[3] / md : 0.0,
                     md ? 100.0 * s_cf_mt[4] / md : 0.0, md ? 100.0 * s_cf_mt[0] / md : 0.0, rw, rh, w, h, uf, ssao_status(), 10);
             memset(s_cf_st, 0, sizeof s_cf_st); memset(s_cf_mt, 0, sizeof s_cf_mt); memset(s_cf_dep, 0, sizeof s_cf_dep); memset(s_cf_run, 0, sizeof s_cf_run);
-            s_cf_cut = s_cf_cand = s_cf_elig = s_cf_tried = s_cf_bad = s_cf_plur = s_cf_med = s_cf_held = s_cf_loose = 0; }
+            s_cf_cut = s_cf_cand = s_cf_elig = s_cf_tried = s_cf_bad = s_cf_plur = s_cf_med = s_cf_held = s_cf_loose = s_cf_rskip = s_cf_rout = 0; }
           s_fsr_st_rec = s_fsr_st_match = s_fsr_st_over = s_fsr_st_wait = s_fsr_st_exact = s_fsr_st_cam = s_fsr_st_amb = s_fsr_st_vm = s_fsr_st_zr = 0; s_fsr_st_tsc = 0; nr = gap = 0;
       } }
     s_fsr_last_frame = s_fsr_frame_r;
