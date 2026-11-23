@@ -48,6 +48,9 @@ char* rsx_getenv(const char* name);
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <dwmapi.h>     /* RFOM_MOVIE_VSYNC: DwmGetCompositionTimingInfo (display refresh period) */
+#pragma comment(lib, "dwmapi.lib")
+#include "../../../project/rfom_movie_pace.h"   /* movie vsync vs VRR, shared with the vblank lock */
 
 /* We need these GUIDs — define them here to avoid uuid.lib dependency.
  * initguid.h only turns DEFINE_GUID into a definition for headers included
@@ -2426,6 +2429,8 @@ static int hud169_on(void)
     return s_hud169;
 }
 
+static int present_notear(void);
+
 static void present_blit(int vs)
 {
     const u32 fi = s_d3d.frame_index;
@@ -2435,19 +2440,50 @@ static void present_blit(int vs)
      * fixed-refresh panel tears every frame and judders whenever the
      * free-running frame clock drifts across the real vblank. Movies only;
      * gameplay is unchanged. RFOM_MOVIE_VSYNC=0 restores the old behaviour,
-     * =N picks the sync interval (1-4); default 1, or 0 with RFOM_FPS=vrr.
+     * =N picks the sync interval (1-4). Default 0 with RFOM_FPS=vrr; else
+     * 1 on 60/120/240 Hz (the frame clock locks to the real vblank there,
+     * project/main.cpp) or without tearing presents, and 0 + tearing on any
+     * other rate (144, 165 Hz...): vsync there shows the 30 fps frames for
+     * alternating refresh counts (5/6 at 165 Hz = judder), while VRR follows
+     * the steady frame clock (rfom_movie_pace.h). The refresh rate is
+     * re-read every 500 ms while a movie plays (window moved to another
+     * monitor).
      * "Movie" = flip mode 2 AND the video decoder fed in the last 500 ms, so
      * boot/loading time in flip mode 2 keeps the old present. Frame
      * generation never runs on these untagged frames, and fg_present still
      * clamps the interval if it ever did. */
-    { static int mv = -1;
-      if (mv < 0) { const char* e = getenv("RFOM_MOVIE_VSYNC"); const char* f = getenv("RFOM_FPS");
-                    mv = e ? atoi(e) : (f && !_stricmp(f, "vrr")) ? 0 : 1;
-                    if (mv < 0) mv = 0; if (mv > 4) mv = 4; }
+    { static int mv = -2, auto_mv = 1, said = -1, said_n = 0; static ULONGLONG last_q = 0; static double per_us = 0.0;
+      if (mv == -2) { const char* e = getenv("RFOM_MOVIE_VSYNC"); const char* f = getenv("RFOM_FPS");
+                      mv = (e && *e) ? atoi(e) : (f && !_stricmp(f, "vrr")) ? 0 : -1;
+                      if (mv < -1) mv = 0; if (mv > 4) mv = 4; }
       if (mv && vs == 0 && cellGcm_get_flip_mode() == 2 && cellVdec_movie_active(500)) {
-          static int said = 0;
-          if (!said) { said = 1; fprintf(stderr, "[D3D12] movie: vsync present, interval %d (RFOM_MOVIE_VSYNC=0 restores no-vsync)%c", mv, 10); }
-          vs = mv;
+          int iv = mv;
+          if (mv < 0) {   /* default: follow the display */
+              const ULONGLONG t = GetTickCount64();
+              if (!last_q || t - last_q >= 500) {
+                  last_q = t;
+                  DWM_TIMING_INFO ti; memset(&ti, 0, sizeof ti); ti.cbSize = sizeof ti;
+                  LARGE_INTEGER qf; QueryPerformanceFrequency(&qf);
+                  per_us = (SUCCEEDED(DwmGetCompositionTimingInfo(NULL, &ti)) && ti.qpcRefreshPeriod && qf.QuadPart)
+                         ? (double)ti.qpcRefreshPeriod * 1e6 / (double)qf.QuadPart : 0.0;
+                  auto_mv = rfom_movie_vsync_default(per_us, s_tearing && !present_notear());
+              }
+              iv = auto_mv;
+          }
+          if (iv != said && said_n < 16) {
+              said = iv; said_n++;
+              if (mv > 0)
+                  fprintf(stderr, "[D3D12] movie: vsync present, interval %d (RFOM_MOVIE_VSYNC=%d)%c", mv, mv, 10);
+              else if (iv)
+                  fprintf(stderr, "[D3D12] movie: vsync present, interval 1 (display %.2f Hz, %s; RFOM_MOVIE_VSYNC=0 = no vsync)%c",
+                          per_us > 0.0 ? 1e6 / per_us : 0.0,
+                          !(per_us > 0.0) ? "refresh rate unknown"
+                          : rfom_movie_lock_k(per_us) ? "shows 30 fps evenly" : "no tearing/VRR presents", 10);
+              else
+                  fprintf(stderr, "[D3D12] movie: no vsync, tearing allowed (VRR) (display %.2f Hz does not show 30 fps evenly; RFOM_MOVIE_VSYNC=1 = vsync)%c",
+                          1e6 / per_us, 10);
+          }
+          vs = iv;
       } }
     if (s_sc_wait) WaitForSingleObjectEx(s_sc_wait, 100, TRUE);   /* RFOM_REFLEX: at most one frame queued */
     if (InterlockedExchange(&s_sc_resize, 0)) sc_resize();
@@ -2573,9 +2609,9 @@ static void present_blit(int vs)
     /* RFOM_PRESENT=notear: with vsync off, present without tearing (DXGI drops
      * late frames instead, like mailbox). Default: tearing allowed, which is also
      * what lets G-Sync / FreeSync follow the frame rate in a borderless window. */
-    { static int nt = -1;
-      if (nt < 0) { const char* e = getenv("RFOM_PRESENT");
-                    nt = e && (!_stricmp(e, "notear") || !_stricmp(e, "mailbox") || !_stricmp(e, "fifo")) ? 1 : 0;
+    { const int nt = present_notear();
+      static int said = 0;
+      if (!said) { said = 1;
                     fprintf(stderr, "[D3D12] present: %s%c", vs ? "vsync" : (nt || !s_tearing) ? "no vsync, no tearing" : "no vsync, tearing allowed (VRR)", 10); }
       RFX_MARK(RFX_PRESENT_START);
       const double _gp0 = gpt_on() ? gpt_now_ms() : 0.0;
@@ -2585,6 +2621,14 @@ static void present_blit(int vs)
       port_ft_present();   /* frame-time recorder (project/port_frametime.h) */
       RFX_MARK(RFX_PRESENT_END); }
     s_vbb_index = (s_vbb_index + 1) % FRAME_COUNT;
+}
+
+static int present_notear(void)
+{
+    static int nt = -1;
+    if (nt < 0) { const char* e = getenv("RFOM_PRESENT");
+                  nt = e && (!_stricmp(e, "notear") || !_stricmp(e, "mailbox") || !_stricmp(e, "fifo")) ? 1 : 0; }
+    return nt;
 }
 
 /* ---- Phase 2: per-texture guest samplers (RSX_GUEST_SAMPLER) --------------------------------------
