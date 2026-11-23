@@ -84,6 +84,31 @@ try {
     Check (-not (Use-PortableTools $c1) -and $env:Path -eq $savedPath) 'Use-PortableTools: PORT_TOOLCHAIN=system'
 } finally { $env:Path = $savedPath; $env:INCLUDE = $savedInc; $env:LIB = $savedLib; $env:PORT_TOOLCHAIN = $null }
 
+Write-Host '-- unpacking (the real Expand-BtTar; the portable install below mocks it)'
+$tarExe = Join-Path $env:SystemRoot 'System32\tar.exe'
+if (Test-Path -LiteralPath $tarExe) {
+    $tsrc = Join-Path $Root 'tar_src'; Touch "$tsrc\top\hello.txt" 'hola'
+    $tgz = Join-Path $Root 'tar_test.tar.gz'
+    & $tarExe -czf $tgz -C $tsrc top
+    $tout = Join-Path $Root 'tar_out'
+    try { Expand-BtTar $tgz $tout } catch { Write-Host "    $_" }
+    Check ((Test-Path "$tout\top\hello.txt") -and (Get-Content "$tout\top\hello.txt") -eq 'hola') 'Expand-BtTar unpacks the archive with tar.exe (not tar.exe itself: $tar / $Tar are one variable)'
+} else { Write-Host '  skip Expand-BtTar: no tar.exe' }
+
+Write-Host '-- Python probe'
+# cmd.exe stands in for python: it prints a version and a sys.executable that does not exist
+$cmdExe = Join-Path $env:SystemRoot 'System32\cmd.exe'
+$pr = Invoke-BtPyProbe $cmdExe @('/c', 'echo 3.12.1&echo C:\no\such\python.exe&rem')
+Check ($pr -and $pr.Version -eq [version]'3.12.1' -and $pr.Exe -eq $cmdExe) 'probe: a sys.executable that does not exist falls back to the probed exe ($exe / $Exe are one variable)'
+
+Write-Host '-- which clang-cl'
+$cc = Join-Path $Cache 'llvm\bin\clang-cl.exe'; Touch $cc
+Check ((Find-BtClangCl) -eq $cc) 'tools_cache\llvm first, as tools\toolchain_env.bat puts it on PATH'
+Remove-Item -LiteralPath (Join-Path $Cache 'llvm') -Recurse -Force
+$pfc = Join-Path $env:ProgramFiles 'LLVM\bin\clang-cl.exe'
+if (Test-Path -LiteralPath $pfc) { Check ((Find-BtClangCl) -eq $pfc) 'then Program Files\LLVM, ahead of any other clang-cl on PATH' }
+else { Write-Host '  skip Program Files\LLVM order: no LLVM there' }
+
 Write-Host '-- portable key choice'
 function Get-BtClangMajor { return 18 }
 Check ((@(Resolve-BtPortableKeys @('vs')) -join ',') -eq 'clang,vs') 'portable MSVC with clang 18 installed: portable LLVM too'

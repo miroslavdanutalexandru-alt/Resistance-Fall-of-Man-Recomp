@@ -215,9 +215,21 @@ function Test-BtCmakeNative([string]$Exe) {
     Push-Location -LiteralPath $script:BtPort
     try { & $Exe -P tools/cmake_native_probe.cmake *> $null; return ($LASTEXITCODE -eq 0) } catch { return $false } finally { Pop-Location; $ErrorActionPreference = $old }
 }
-function Get-BtClangMajor {
+# The clang-cl the build uses, in tools\toolchain_env.bat's PATH order: tools_cache\llvm\bin, then
+# C:\Program Files\LLVM\bin, then the rest of PATH. Checking the first clang-cl on PATH instead would test another
+# copy than the build runs: an older one earlier on PATH (another LLVM, an SDK's) hid an LLVM 22+ in Program Files,
+# and Setup kept reporting "update from 19" after LLVM 23 was installed.
+function Find-BtClangCl([string]$Cache = (Get-BtCache)) {
+    foreach ($p in @((Join-Path $Cache 'llvm\bin\clang-cl.exe'), (Join-Path $env:ProgramFiles 'LLVM\bin\clang-cl.exe'))) {
+        if (Test-Path -LiteralPath $p) { return $p }
+    }
     $c = Get-Command clang-cl -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-    $exe = if ($c) { $c.Source } elseif (Test-Path -LiteralPath 'C:\Program Files\LLVM\bin\clang-cl.exe') { 'C:\Program Files\LLVM\bin\clang-cl.exe' } else { return 0 }
+    if ($c) { return $c.Source }
+    return $null
+}
+function Get-BtClangMajor {
+    $exe = Find-BtClangCl
+    if (-not $exe) { return 0 }
     $v = "$(& $exe --version 2>$null | Select-Object -First 1)"
     if ($v -match 'version (\d+)\.') { return [int]$Matches[1] }
     return 0
@@ -375,9 +387,11 @@ function Invoke-BtPyProbe([string]$Exe, [string[]]$Pre = @(), [int]$TimeoutMs = 
         if ($p.ExitCode -ne 0) { return $null }
         $l = @($out.Result -split "`r?`n" | Where-Object { $_.Trim() })
         if ($l.Count -lt 1 -or $l[0].Trim() -notmatch '^\d+\.\d+\.\d+$') { return $null }
-        $exe = if ($l.Count -ge 2) { $l[1].Trim() } else { '' }
-        if (-not $exe -or -not (Test-Path -LiteralPath $exe)) { $exe = $Exe }
-        return @{ Version = [version]$l[0].Trim(); Exe = $exe }
+        # not "$exe": PowerShell variable names ignore case, so that is the $Exe parameter and the fallback below
+        # would assign it to itself
+        $found = if ($l.Count -ge 2) { $l[1].Trim() } else { '' }
+        if (-not $found -or -not (Test-Path -LiteralPath $found)) { $found = $Exe }
+        return @{ Version = [version]$l[0].Trim(); Exe = $found }
     } catch { return $null } finally { $p.Dispose() }
 }
 function ConvertTo-BtPyTagVersion([string]$Tag) { try { return [version](($Tag -replace '[^\d.].*$', '') + '.0') } catch { return [version]'0.0' } }
