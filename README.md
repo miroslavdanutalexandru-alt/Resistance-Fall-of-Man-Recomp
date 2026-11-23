@@ -714,7 +714,7 @@ The offline test for this stage is `ps3recomp\libs\audio\tests\test_audio_out.cp
 
 The port is a Windows program. On Linux and the Steam Deck it runs through Proton (Wine). This has not been tested on a real Deck yet, so treat it as experimental.
 
-1. Install and build the port on a Windows PC (Setup needs Windows: it uses winget and Visual Studio). No file picker is needed: the installer and Setup find the game on their own, or take a typed path. Then copy the whole port folder to the Deck, for example to `/home/deck/Games/ResistancePort` (or a microSD card).
+1. Build the port, either on Linux itself with `setup_linux.sh` (see [Building on Linux](#building-on-linux-experimental) below), or on a Windows PC with Setup (no file picker is needed: the installer and Setup find the game on their own, or take a typed path). If you built it on another PC, copy the whole port folder to the Deck, for example to `/home/deck/Games/ResistancePort` (or a microSD card). Setup.exe / Setup.bat themselves do not run under Wine or Proton (they need Windows PowerShell and Visual Studio).
 2. In Desktop Mode, open Steam → **Games → Add a Non-Steam Game to My Library…**, click **Browse**, and pick `Launcher.exe` in the port folder.
 3. Right-click the new entry → **Properties → Compatibility** → tick **Force the use of a specific Steam Play compatibility tool** and choose **Proton Experimental** (or Proton 9.0 or newer).
 4. Launch options are not needed. `SteamDeck=1 %command%` forces the Deck preset on other Linux PCs.
@@ -728,6 +728,25 @@ What the port does under Proton:
 - In the launcher, the controller's **A** or **Start** button starts the game. In game, Steam Input presents the Deck's controls as an Xbox controller.
 - The black cover window between the main menu and levels is off under Proton (the window closes and reopens). `RFOM_SEAMLESS=1` turns it on.
 - The update check works the same way and can be turned off on the launcher's Advanced page.
+
+### Building on Linux (experimental)
+
+`setup_linux.sh` does what Setup does, natively on Linux and without PowerShell: it checks and copies your game, decrypts the program files, generates the game code and builds the same Windows programs with LLVM (clang-cl and lld-link). The Windows headers and libraries (Microsoft's C runtime and the Windows SDK) are downloaded from Microsoft with [xwin](https://github.com/Jake-Shadle/xwin) into `tools_cache/msvc_linux`, after you accept Microsoft's licence. You then play the result through Proton as described above. It has been checked less than the Windows setup, so please report problems with `logs/setup_linux.log`.
+
+1. Install the tools (LLVM 22 or newer is recommended; with older LLVM the PGO profile is skipped and the game runs a bit slower):
+   - Arch: `sudo pacman -S --needed python cmake ninja clang lld llvm curl 7zip`
+   - Fedora: `sudo dnf install python3 cmake ninja-build clang lld llvm curl 7zip`
+   - Debian / Ubuntu: `sudo apt install python3 python3-venv cmake ninja-build clang lld llvm curl 7zip` (LLVM 22 from [apt.llvm.org](https://apt.llvm.org) if your release has an older one)
+2. Get the port (git clone or the source zip) into a folder with about 25 GB free, then run:
+   ```
+   ./setup_linux.sh --game "/path/to/Resistance Fall of Man [BCUS98107].iso"
+   ```
+   `--game` takes a decrypted .iso or a folder with `PS3_GAME` in it (for example from RPCS3's `games` folder). UDF disc images are unpacked with 7-Zip. Other options: `--jobs N` (fewer compile jobs if you have little RAM: 16 GB → 4, 8 GB → 2), `--check-only`, `--nopgo`; `./setup_linux.sh --help` lists them all.
+3. Later rebuilds (after `git pull`): run `./setup_linux.sh` again (it regenerates the game code only when the code generator changed), or `./build_linux.sh` for a build only.
+
+Steam Deck: SteamOS's system folders are read-only, so install the tools inside a [distrobox](https://distrobox.it/) container (for example Arch) and run `setup_linux.sh` there, or build on another Linux PC and copy the folder over. The build takes a long time on the Deck's 4 cores.
+
+Not on Linux: NVIDIA DLSS / DLSS Frame Generation and Intel XeSS are not set up (Proton does not offer DLSS to the port; FSR 3.1 and FSR 3 Frame Generation are used), and the launcher's **Update now** is not offered under Proton (the updater is a Windows PowerShell script): update with `git pull` and `./setup_linux.sh`, or the new release's source.
 
 ## Status
 
