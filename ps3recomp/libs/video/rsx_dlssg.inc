@@ -18,6 +18,12 @@
  *                     ("[FG-HUD]": HUD or why not, run state, blend / depth state, textures), starting when frame
  *                     generation is on, or at upscaler frame RFOM_FG_HUDLOG_AT. Ctrl+Shift+F2 logs N (3) frames
  *                     again at any time, plus the scene's per-draw motion matching ("[FG-MV]").
+ *   RFOM_FG_DIAG      1: a "[fg-diag]" line per second in run.log (presents, FG on / off and why, resets by cause,
+ *                     present-interval histogram, spikes, Reflex sleep, camera solve, draw matching); Pause
+ *                     (RFOM_FG_DIAG_KEY) dumps the previous 30 and next RFOM_FG_DIAG_FRAMES (120) presents to
+ *                     logs\fgdiag.txt | 2: also on suspect events | 3: every real present as a row in logs\fgdiag.txt
+ *                     until exit, with "--- event ---" lines; Pause / Ctrl+Shift+F2 add a "--- user marker ---" line.
+ *                     Game program only (the front end has no frame generation). See port_fgdiag.h.
  *   RFOM_FG_UNSURE_PAUSE 1 (default): with the HUD split on, 3 consecutive frames whose HUD could not be
  *                     separated pause generation (for at least 15 frames) | 0: generate anyway.
  *   RFOM_DLSSG_MENU_DETECT unset: DLSS-G menu detection off while the HUD split runs, on otherwise (HDR,
@@ -37,10 +43,25 @@
 
 #include "port_fg_logic.h"
 #include "rfom_fg_cam.h"
+#include "port_fgdiag.h"
 
 void (*volatile g_pc_fg_marker)(int type, unsigned long long id) = 0;
 void (*volatile g_pc_fg_sleep)(unsigned long long id) = 0;
 int (*volatile g_pc_fg_latency)(double* total_ms, double* render_ms, double* gpu_ms) = 0;
+/* RFOM_FG_DIAG (port_fgdiag.h): rfom_reflex.cpp times its sleep into g_pc_fg_sleep_us while g_pc_fg_diag is set */
+volatile int g_pc_fg_diag = 0;
+volatile long long g_pc_fg_sleep_us = 0;
+static int s_fgd_on;                 /* RFOM_FG_DIAG > 0 (fg_load); every hook tests only this */
+static volatile u32 s_fgd_common;    /* rsx_fsr.inc (FIFO thread): common-camera-term matches kept, never reset */
+/* this present's diagnostics, filled by fsr_dispatch / fg_tag_scene / fg_present / f3_present / the draw batches,
+ * sent and cleared by fg_diag_frame after the Present (render thread) */
+static struct {
+    u32 up, m[6];
+    float sp, mo;
+    u16 hruns, hdraws;
+    u8 scene, reset, off, on, n;
+    char cam, hud;
+} s_fgdf;
 int fsr_mode(void);   /* rsx_fsr.inc */
 
 static int  (*p_fg_init)(ID3D12Device*, const wchar_t*, void (*)(const char*), int);
@@ -189,6 +210,7 @@ static int fg_load_dlss(ID3D12Device* dev)
  * the swap chain is made by f3_create_swapchain. */
 static int fg_load(ID3D12Device* dev)
 {
+    s_fgd_on = fgd_level() > 0; g_pc_fg_diag = s_fgd_on;   /* RFOM_FG_DIAG */
     { const char* e = getenv("RFOM_FG_HUDSPLIT"); s_fg_split = pfg_hudless(getenv("PORT_FG_HUDLESS"), e ? atoi(e) != 0 : 1);
       e = getenv("RFOM_FG_HUDDBG"); s_fg_dbg = e ? atoi(e) : 0; if (s_fg_dbg < 0 || s_fg_dbg > 2) s_fg_dbg = 0;
       e = getenv("RFOM_DLSSG_NULLTAGS"); s_fg_null_tags = e && *e == '1'; }
@@ -469,6 +491,7 @@ static void fg_tag_scene(ID3D12GraphicsCommandList* cl, ID3D12Resource* z, unsig
         rfom_fgcam_sl(M, c2p, p2c);
         p_fg_camera(c2p, p2c, cn, cf, cv);
     }
+    if (s_fgd_on && !s_fg_on) s_fgdf.reset |= FGD_R_RESUME;   /* the tag below asks for a reset */
     p_fg_tag(cl, z, zst, mv, mst, rw, rh, jx, jy, reset || !s_fg_on);
 }
 
@@ -487,6 +510,7 @@ static void fg_set(int gen)
 static void fg_before_resize(void)
 {
     if (s_fg_ready && s_fg_on) fg_set(0);
+    if (s_fgd_on) { s_fgdf.reset |= FGD_R_RESIZE; s_fgdf.off |= FGD_W_RESIZE; }
     f3_before_resize();
     s_fg_streak = 0;
     if (s_fg_hsc) { s_fg_hsc->lpVtbl->Release(s_fg_hsc); s_fg_hsc = NULL; }
@@ -545,6 +569,7 @@ static void fg_present(ID3D12GraphicsCommandList* cl, UINT bi, u32 fi, D3D12_CPU
     fg_late_check();
     const int split = s_fgh.gate && s_fgh.tagged && fg_sc_res();
     const int valid = split && s_fgh.open && !s_fgh.unsure && s_fgh.ndraw > 0;
+    if (s_fgd_on) { s_fgdf.hud = !split ? '-' : valid ? 'V' : 'F'; s_fgdf.hruns = (u16)s_fgh.runs; s_fgdf.hdraws = (u16)s_fgh.ndraw; }
     if (split) {
         if (valid) s_fg_hud_ok++; else s_fg_hud_fb++;
         fg_tr(cl, s_fg_ui, &s_fg_ui_st, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
@@ -650,6 +675,13 @@ static void fg_present(ID3D12GraphicsCommandList* cl, UINT bi, u32 fi, D3D12_CPU
             if (s_fg_on) { static int n = 0; if (n < 3) { n++; fprintf(stderr, "[DLSS-G] frame generation on: %dx, %ux%u%s%c",
                                 s_fg_gen + 1, s_sc_w, s_sc_h, ui_on ? ", HUD kept out of generated frames" : "", 10); } }
         } else if (!want && s_fg_on) fg_set(0);
+        if (s_fgd_on) {
+            s_fgdf.on = (u8)(s_fg_on != 0); s_fgdf.n = (u8)(s_fg_on ? s_fg_gen + 1 : 1);
+            if (paused) s_fgdf.hud = 'P';
+            if (!s_fg_on) s_fgdf.off |= (u8)((!s_fgh.tagged ? FGD_W_INPUTS : 0) | (!s_app_active ? FGD_W_BG : 0) |
+                                             (IsIconic(s_d3d.hwnd) ? FGD_W_MIN : 0) | (paused ? FGD_W_HUDP : 0) |
+                                             (ui_on && !split ? FGD_W_HUD : 0) | (want ? FGD_W_WARM : 0));
+        }
         if (s_fg_on && *vs) {
             if (!s_fg_vs_ok) { static int n = 0; if (!n++) fg_log("vsync is not supported with frame generation on this system -- presenting without it");
                                *vs = 0; }
@@ -680,4 +712,36 @@ static void fg_present(ID3D12GraphicsCommandList* cl, UINT bi, u32 fi, D3D12_CPU
     else if (s_fg_dbg && (++s_fg_presents % 600u) == 0)
         fprintf(stderr, "[DLSS-G] HUD split (debug view): HUD separated in %u of %u frames%c", s_fg_hud_ok, s_fg_hud_ok + s_fg_hud_fb, 10);
     fg_hud_reset();
+}
+
+/* RFOM_FG_DIAG: present_blit, after the Present (t0 / t1: QPC before / after the call): this real present's row. */
+static void fg_diag_frame(LONGLONG t0, LONGLONG t1)
+{
+    static LONGLONG qf, prev0, prev1;
+    static u32 common0;
+    if (!qf) { LARGE_INTEGER f; QueryPerformanceFrequency(&f); qf = f.QuadPart; }
+    const double k = 1000.0 / (double)qf;
+    fgd_row r; memset(&r, 0, sizeof r);
+    r.type = s_fg_ready ? 'D' : s_f3_ready ? 'F' : '-';
+    r.t_ms = (double)t0 * k;
+    r.dt = prev0 ? (float)((double)(t0 - prev0) * k) : 0.0f;
+    r.cpu = prev1 ? (float)((double)(t0 - prev1) * k) : 0.0f;
+    r.call = (float)((double)(t1 - t0) * k);
+    r.sleep = (float)((double)InterlockedExchange64(&g_pc_fg_sleep_us, 0) / 1000.0);
+    prev0 = t0; prev1 = t1;
+    r.up = s_fgdf.scene ? s_fgdf.up : 0u;
+    r.cam = s_fgdf.scene && s_fgdf.cam ? s_fgdf.cam : '-';
+    r.sp = s_fgdf.scene && s_fgdf.cam ? s_fgdf.sp : -1.0f;
+    r.mo = s_fgdf.scene && s_fgdf.cam ? s_fgdf.mo : -1.0f;
+    r.reset = s_fgdf.reset; r.off = s_fgdf.off; r.on = s_fgdf.on; r.n = s_fgdf.n ? s_fgdf.n : 1;
+    r.hud = s_fgdf.hud ? s_fgdf.hud : '-'; r.hud_runs = s_fgdf.hruns; r.hud_draws = s_fgdf.hdraws;
+    { static const int ord[6] = { 1, 2, 3, 4, 5, 0 };   /* exact instance nearest camera-split ambiguous unmatched */
+      for (int i = 0; i < 6; i++) r.m[i] = (unsigned short)(s_fgdf.m[ord[i]] > 65535u ? 65535u : s_fgdf.m[ord[i]]); }
+    { const u32 c = s_fgd_common, d = c - common0; common0 = c; r.m[6] = (unsigned short)(d > 65535u ? 65535u : d); }
+    if (r.type == 'D') {
+        unsigned st = 0, mx = 0, pr = 0; int vok = 1; unsigned long long vram = 0;
+        if (p_fg_state(&st, &mx, &vok, &pr, &vram)) { r.status = st; r.shown = (unsigned char)(r.on ? (pr > 255u ? 255u : pr) : 0u); }
+    }
+    memset(&s_fgdf, 0, sizeof s_fgdf);
+    fgd_frame(&r, s_app_active && s_d3d.hwnd && GetForegroundWindow() == s_d3d.hwnd);
 }

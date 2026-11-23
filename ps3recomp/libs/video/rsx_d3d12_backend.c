@@ -2830,6 +2830,7 @@ static void present_blit(int vs)
       LARGE_INTEGER tq; QueryPerformanceCounter(&tq);
       s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain, (UINT)vs,
                                         (vs == 0 && s_tearing && !nt) ? DXGI_PRESENT_ALLOW_TEARING : 0);
+      if (s_fgd_on) { LARGE_INTEGER t1; QueryPerformanceCounter(&t1); fg_diag_frame(tq.QuadPart, t1.QuadPart); }   /* RFOM_FG_DIAG */
       if (_gp0 > 0.0) s_gpt_cpu_sc += gpt_now_ms() - _gp0;
       port_ft_present();   /* frame-time recorder (project/port_frametime.h) */
       RFX_MARK(RFX_PRESENT_END);

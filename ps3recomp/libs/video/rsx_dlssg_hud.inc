@@ -60,6 +60,7 @@ static void fg_hud_log_poll(void)
         s_fg_hlog_wait = 0; s_fg_hlog_left = s_fg_hlog_cfg > 0 ? s_fg_hlog_cfg : 3; s_fg_hmv_pend = 1;
         fprintf(stderr, "[FG-HUD] Ctrl+Shift+F2: logging %d frames         from upscaler frame %u (frame generation %s)%c", s_fg_hlog_left,
                         (unsigned)s_fsr_frame_r, s_fg_on || s_f3_on ? "on" : "off", 10);
+        if (s_fgd_on) fgd_user_mark("Ctrl+Shift+F2, FG-HUD / FG-MV log", (unsigned)s_fsr_frame_r);   /* RFOM_FG_DIAG */
     }
     was = down;
 }
@@ -79,6 +80,9 @@ static void fg_hud_frame_start(void)
  * F12 capture, as stderr lines). */
 static void fg_hud_mv_dump(const D3D12DrawRecord* draws, u32 nd)
 {
+    if (s_fgd_on && (s_fg_ready || s_f3_ready))   /* RFOM_FG_DIAG: this present's matching counts */
+        for (u32 d = 0; d < nd && d < MAX_DRAWS; d++)
+            if (draws[d].fsr == 1) s_fgdf.m[draws[d].fsr_mt < 6 ? draws[d].fsr_mt : 0]++;
     if (!s_fg_hmv_pend) return;
     u32 c[6] = {0}, ns = 0;
     for (u32 d = 0; d < nd && d < MAX_DRAWS; d++)
