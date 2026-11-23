@@ -182,10 +182,17 @@ function Show-DiskUsage([string]$Port) {
 # Setup generates the game code once and reuses it; an update that changes the generator (its scripts, the port's
 # hooks, the lifter in ps3recomp\tools) has to generate it again. The generator's input files are found by
 # following the regen script's imports and the script/json names it mentions, plus everything in tools\hooks.
+# A port whose SPU half is its own script (R3: tools\r3_spu.py) keeps two hashes in the stamp ("v2"): one for the
+# PPU code (recompiled\, 10-25 minutes to generate and most of the build) and one for the SPU code (project\spu\,
+# about a minute), so a change to the SPU half only regenerates (and rebuilds) the SPU code.
 $script:GenStampName = '.generator_inputs'
+# Python tools of the SPU half only: regen_common.py names them (spu_post, for R2), but the PPU code never uses them.
+$script:GenSpuToolPattern = '^spu_'
 
-function Get-GenInputFiles([string]$Port, [string]$Script) {
+function Get-GenInputFiles([string]$Port, [string]$Script, [string[]]$Skip = @(), [string]$SkipPattern = '',
+                           [ValidateSet('all', 'nospu', 'spu', 'none')][string]$Hooks = 'all') {
     $dirs = @((Join-Path $Port 'tools'), (Join-Path $Port 'ps3recomp\tools'), (Join-Path $Port 'tools\hooks'))
+    $skipSet = @{}; foreach ($k in $Skip) { if ($k) { $skipSet[$k.ToLowerInvariant()] = 1 } }
     $seen = @{}
     $queue = New-Object System.Collections.Queue
     $first = Join-Path $Port "tools\$Script"
@@ -201,6 +208,8 @@ function Get-GenInputFiles([string]$Port, [string]$Script) {
         }
         foreach ($m in [regex]::Matches($text, '[''"]([\w\-\.]+\.(?:py|json))[''"]')) { $names.Add($m.Groups[1].Value) }
         foreach ($n in $names) {
+            $leaf = (Split-Path -Leaf $n).ToLowerInvariant()
+            if ($skipSet.ContainsKey($leaf) -or ($SkipPattern -and $leaf -match $SkipPattern)) { continue }
             foreach ($d in $dirs) {
                 $p = Join-Path $d $n
                 if (-not $seen.ContainsKey($p.ToLowerInvariant()) -and [IO.File]::Exists($p)) {
@@ -211,23 +220,24 @@ function Get-GenInputFiles([string]$Port, [string]$Script) {
             }
         }
     }
-    $hooks = Join-Path $Port 'tools\hooks'
-    if (Test-Path -LiteralPath $hooks) {
-        Get-ChildItem -LiteralPath $hooks -Recurse -File -Force | Where-Object { $_.Extension -in '.json', '.py', '.c', '.cpp', '.h', '.hpp', '.inc', '.txt' } |
+    $hk = Join-Path $Port 'tools\hooks'
+    if ($Hooks -ne 'none' -and (Test-Path -LiteralPath $hk)) {
+        $spuHk = (Join-Path $hk 'spu').ToLowerInvariant() + '\'
+        Get-ChildItem -LiteralPath $hk -Recurse -File -Force | Where-Object { $_.Extension -in '.json', '.py', '.c', '.cpp', '.h', '.hpp', '.inc', '.txt' } |
+            Where-Object { $inSpu = $_.FullName.ToLowerInvariant().StartsWith($spuHk); $Hooks -eq 'all' -or ($Hooks -eq 'spu' -and $inSpu) -or ($Hooks -eq 'nospu' -and -not $inSpu) } |
             ForEach-Object { $seen[$_.FullName.ToLowerInvariant()] = $_.FullName }
     }
     $seen.Values | Sort-Object { $_.ToLowerInvariant() }
 }
 
-# One hash over the generator's input files (relative names + contents, line endings ignored so a git checkout
-# and a release zip give the same value).
-function Get-GenInputsHash([string]$Port, [string]$Script) {
-    $files = @(Get-GenInputFiles $Port $Script)
-    if (-not $files.Count) { return $null }
+# One hash over a list of files (relative names + contents, line endings ignored so a git checkout and a release
+# zip give the same value).
+function Get-GenFilesHash([string]$Port, [string[]]$Files) {
+    if (-not $Files -or -not $Files.Count) { return $null }
     $sha = [Security.Cryptography.SHA256]::Create()
     $ms = New-Object IO.MemoryStream
     $root = [IO.Path]::GetFullPath($Port).TrimEnd('\') + '\'
-    foreach ($f in $files) {
+    foreach ($f in $Files) {
         $b = [Text.Encoding]::UTF8.GetBytes($f.Substring($root.Length).ToLowerInvariant().Replace('\', '/') + "`n")
         $ms.Write($b, 0, $b.Length)
         $b = [Text.Encoding]::UTF8.GetBytes([IO.File]::ReadAllText($f).Replace("`r`n", "`n") + "`n")
@@ -237,25 +247,112 @@ function Get-GenInputsHash([string]$Port, [string]$Script) {
     -join ($h | ForEach-Object { $_.ToString('x2') })
 }
 
+# The one-hash stamp (ports without a separate SPU script, and the format before the split).
+function Get-GenInputsHash([string]$Port, [string]$Script) { Get-GenFilesHash $Port @(Get-GenInputFiles $Port $Script) }
+
+# The two halves of a split generator: PPU = the regen script and what it uses, without the SPU script, the SPU-only
+# tools and tools\hooks\spu; SPU = the SPU script and what it uses (shared helpers count for both), tools\hooks\spu
+# and the regen script itself (it drives both halves).
+function Get-GenParts([string]$Port, [string]$Script, [string]$SpuScript) {
+    $pf = @(Get-GenInputFiles $Port $Script -Skip @($SpuScript) -SkipPattern $script:GenSpuToolPattern -Hooks nospu)
+    $sf = @(Get-GenInputFiles $Port $SpuScript -Hooks spu)
+    $drv = Join-Path $Port "tools\$Script"
+    if ((Test-Path -LiteralPath $drv) -and -not @($sf | Where-Object { $_ -eq $drv }).Count) { $sf = @($sf + $drv | Sort-Object { $_.ToLowerInvariant() }) }
+    [pscustomobject]@{ PpuFiles = $pf; SpuFiles = $sf; Ppu = (Get-GenFilesHash $Port $pf); Spu = (Get-GenFilesHash $Port $sf) }
+}
+
+# What the stamp says: Format 'none' / 'v1' (Hash) / 'v2' (Ppu, Spu; '-' = that half was being generated and did not finish).
+function Read-GenStamp([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path)) { return [pscustomobject]@{ Format = 'none'; Hash = $null; Ppu = $null; Spu = $null } }
+    $lines = @(Get-Content -LiteralPath $Path -ErrorAction SilentlyContinue)
+    if ($lines.Count -and $lines[0].Trim() -eq 'v2') {
+        $o = [pscustomobject]@{ Format = 'v2'; Hash = $null; Ppu = $null; Spu = $null }
+        foreach ($l in $lines) { if ($l -match '^(ppu|spu)\s+(\S+)') { $o.($Matches[1]) = $Matches[2] } }
+        return $o
+    }
+    [pscustomobject]@{ Format = 'v1'; Hash = $(if ($lines.Count) { $lines[0].Trim() } else { '' }); Ppu = $null; Spu = $null }
+}
+
+# One-hash stamps written by earlier versions, and the split stamp each one is known to equal (tools\gen_stamps_legacy.txt,
+# "<old hash> ppu=<hash>|- spu=<hash>|-"; '-' = that half has to be generated again). Made when the split was introduced,
+# from the generator inputs of each released version: only lines for versions whose PPU code is known to be identical.
+# Ports with one hash: "<old hash> same=<hash>" = that generator writes exactly the same code as the one with <hash>
+# (a change that only touched how it reports progress or writes files), so nothing is generated again.
+function Get-GenLegacyMap([string]$Port) {
+    $map = @{}
+    $f = Join-Path $Port 'tools\gen_stamps_legacy.txt'
+    if (-not (Test-Path -LiteralPath $f)) { return $map }
+    foreach ($l in Get-Content -LiteralPath $f) {
+        if ($l -match '^\s*([0-9a-f]{64})\s+ppu=(\S+)\s+spu=(\S+)') { $map[$Matches[1]] = [pscustomobject]@{ Ppu = $Matches[2]; Spu = $Matches[3]; Same = $null } }
+        elseif ($l -match '^\s*([0-9a-f]{64})\s+same=([0-9a-f]{64})') { $map[$Matches[1]] = [pscustomobject]@{ Ppu = $null; Spu = $null; Same = $Matches[2] } }
+    }
+    $map
+}
+
+# What has to be generated again: Ppu / Spu ($true = generate that half), Why ($null = nothing; 'missing' = no stamp;
+# 'changed' = the generator changed; 'legacy' = a one-hash stamp from an earlier version that is not in the legacy map,
+# so both halves are generated again - files that come out the same keep their date, so the build only compiles what
+# really changed), Legacy ($true when an old one-hash stamp was translated).
+function Get-GenPlan([string]$Port, [string]$Script, [string]$SpuScript = '', [string]$StampDir = 'recompiled') {
+    $st = Read-GenStamp (Join-Path $Port "$StampDir\$($script:GenStampName)")
+    $plan = [pscustomobject]@{ Ppu = $false; Spu = $false; Why = $null; Legacy = $false; Parts = $null }
+    if ($st.Format -eq 'none') { $plan.Ppu = $plan.Spu = $true; $plan.Why = 'missing'; return $plan }
+    if (-not $SpuScript) {
+        $new = Get-GenInputsHash $Port $Script
+        if ($new -and $st.Hash -ne $new) {
+            $m = (Get-GenLegacyMap $Port)[$st.Hash]
+            if ($m -and $m.Same -eq $new) { $plan.Legacy = $true } else { $plan.Ppu = $plan.Spu = $true; $plan.Why = 'changed' }
+        }
+        return $plan
+    }
+    $cur = Get-GenParts $Port $Script $SpuScript
+    $plan.Parts = $cur
+    $old = $st
+    if ($st.Format -eq 'v1') {
+        $m = (Get-GenLegacyMap $Port)[$st.Hash]
+        if (-not $m -or -not $m.Ppu) { $plan.Ppu = $plan.Spu = $true; $plan.Why = 'legacy'; return $plan }
+        $old = $m; $plan.Legacy = $true
+    }
+    $plan.Ppu = [bool]($cur.Ppu -and $old.Ppu -ne $cur.Ppu)
+    $plan.Spu = [bool]($cur.Spu -and $old.Spu -ne $cur.Spu)
+    if ($plan.Ppu -or $plan.Spu) { $plan.Why = 'changed' }
+    $plan
+}
+
 # $null when the generated code matches the generator, 'missing' when it was made by a version without the
 # stamp (or the stamp was lost), 'changed' when the generator changed since.
-function Test-GenStale([string]$Port, [string]$Script, [string]$StampDir = 'recompiled') {
-    $stamp = Join-Path $Port "$StampDir\$($script:GenStampName)"
-    if (-not (Test-Path -LiteralPath $stamp)) { return 'missing' }
-    $old = (Get-Content -LiteralPath $stamp -TotalCount 1 -ErrorAction SilentlyContinue)
-    $new = Get-GenInputsHash $Port $Script
-    if (-not $new -or $old -eq $new) { return $null }
+function Test-GenStale([string]$Port, [string]$Script, [string]$StampDir = 'recompiled', [string]$SpuScript = '') {
+    $p = Get-GenPlan $Port $Script $SpuScript $StampDir
+    if (-not ($p.Ppu -or $p.Spu)) { return $null }
+    if ($p.Why -eq 'missing') { return 'missing' }
     'changed'
 }
 
-function Save-GenStamp([string]$Port, [string]$Script, [string]$StampDir = 'recompiled') {
-    $h = Get-GenInputsHash $Port $Script
-    if (-not $h) { return }
-    $files = @(Get-GenInputFiles $Port $Script)
+# -PpuPending / -SpuPending: that half is about to be generated (written as '-', so a run that stops half way
+# generates it again next time); without them the stamp says both halves match the generator.
+function Save-GenStamp([string]$Port, [string]$Script, [string]$StampDir = 'recompiled', [string]$SpuScript = '',
+                       [switch]$PpuPending, [switch]$SpuPending) {
+    $dir = Join-Path $Port $StampDir
+    if (-not (Test-Path -LiteralPath $dir)) { return }
     $root = [IO.Path]::GetFullPath($Port).TrimEnd('\') + '\'
-    $lines = @($h, "# Hash of the code generator's input files when this code was generated (Setup regenerates when it changes):") +
-             @($files | ForEach-Object { '#   ' + $_.Substring($root.Length) })
-    [IO.File]::WriteAllLines((Join-Path $Port "$StampDir\$($script:GenStampName)"), [string[]]$lines)
+    if (-not $SpuScript) {
+        $h = Get-GenInputsHash $Port $Script
+        if (-not $h) { return }
+        $files = @(Get-GenInputFiles $Port $Script)
+        $lines = @($h, "# Hash of the code generator's input files when this code was generated (Setup regenerates when it changes):") +
+                 @($files | ForEach-Object { '#   ' + $_.Substring($root.Length) })
+    } else {
+        $p = Get-GenParts $Port $Script $SpuScript
+        if (-not $p.Ppu -or -not $p.Spu) { return }
+        $pp = if ($PpuPending) { '-' } else { $p.Ppu }
+        $sp = if ($SpuPending) { '-' } else { $p.Spu }
+        $lines = @('v2', "ppu $pp", "spu $sp",
+                   "# Hashes of the code generator's input files when this code was generated; Setup regenerates the PPU code",
+                   "# (recompiled\) or the SPU code (project\spu\) when its half changes. PPU inputs:") +
+                 @($p.PpuFiles | ForEach-Object { '#   ' + $_.Substring($root.Length) }) + @('# SPU inputs:') +
+                 @($p.SpuFiles | ForEach-Object { '#   ' + $_.Substring($root.Length) })
+    }
+    [IO.File]::WriteAllLines((Join-Path $dir $script:GenStampName), [string[]]$lines)
 }
 
 function Remove-GenStamp([string]$Port, [string]$StampDir = 'recompiled') {

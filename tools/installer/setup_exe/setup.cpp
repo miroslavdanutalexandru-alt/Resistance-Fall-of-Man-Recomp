@@ -43,6 +43,7 @@
 #include <cstdarg>
 #include <cwchar>
 #include <cwctype>
+#include <share.h>
 
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
@@ -269,7 +270,7 @@ static void OpenLog(const wchar_t* name) {
         wstring old = path.substr(0, path.size() - 4) + L".old.log";
         MoveFileExW(path.c_str(), old.c_str(), MOVEFILE_REPLACE_EXISTING);
     }
-    _wfopen_s(&g_log, path.c_str(), L"ab");
+    g_log = _wfsopen(path.c_str(), L"ab", _SH_DENYNO);  // shared: the log can be read while Setup runs
 }
 static void LogRaw(const wstring& s) {
     if (!g_log) return;
@@ -1057,6 +1058,11 @@ static int RunSetupOnce(const Choice& c, const Jobs& j, wstring& stopMsg) {
     wstring stepBase;
     ULONGLONG stepT0 = GetTickCount64();
     std::atomic<ULONGLONG> lastOut{GetTickCount64()};
+    // setup.ps1 reports its own progress ("@@SETUP pct=<0..1000> eta=<s> idle=<s> <text>", tools\installer\progress.ps1):
+    // once it does, those lines drive the bar and the detail line instead of the build logs and the fixed step percentages
+    std::atomic<bool> psProgress{false};
+    ULONGLONG psLogged = 0, psShown = 0;
+    SetEnvironmentVariableW(L"PORT_SETUP_PROGRESS", L"1");
     std::thread tail([&] {
         auto logs = BuildLogs();
         Meter meter;
@@ -1109,7 +1115,7 @@ static int RunSetupOnce(const Choice& c, const Jobs& j, wstring& stopMsg) {
             ULONGLONG now = GetTickCount64();
             if (fed) lastFeed = now;
             bool quiet = now - lastOut > 30000 && now - lastFeed > 30000;
-            if (meter.m && now - lastShown > 900) {
+            if (meter.m && now - lastShown > 900 && !psProgress) {
                 SetDetail(meter.Text(), meter.Progress());
                 lastShown = now;
             }
@@ -1142,7 +1148,7 @@ static int RunSetupOnce(const Choice& c, const Jobs& j, wstring& stopMsg) {
                     std::lock_guard<std::mutex> lk(g_ui.mx);
                     g_ui.step = base + L"   (" + clock + L")";
                     if (copyProg >= 0) g_ui.progress = copyProg;
-                    if (quiet && !meter.m)
+                    if (quiet && !meter.m && !psProgress)
                         g_ui.detail = Fmt(L"Still working: no new messages for %d min %02d s. Some steps print nothing for 10+ minutes; this is normal.",
                                           (int)((now - lastOut) / 60000), (int)((now - lastOut) / 1000 % 60));
                     g_ui.dirty = true;
@@ -1158,6 +1164,19 @@ static int RunSetupOnce(const Choice& c, const Jobs& j, wstring& stopMsg) {
     int rc = Run(cmd, [&](const wstring& raw) {
         wstring l = Trim(raw);
         if (l.empty()) return;
+        if (StartsWith(l, L"@@SETUP ")) {
+            int pct = -1, eta = -1, idle = -1, used = 0;
+            if (swscanf_s(l.c_str(), L"@@SETUP pct=%d eta=%d idle=%d %n", &pct, &eta, &idle, &used) >= 3 && used > 0) {
+                psProgress = true;
+                lastOut = GetTickCount64();
+                wstring text = l.substr((size_t)used);
+                ULONGLONG now = GetTickCount64();
+                if (now - psLogged >= 60000) { psLogged = now; LogRaw(L"[progress] " + text); }
+                // the console gets a line every 30 s; the window and the launcher follow every update
+                if (!g_console || g_prepare || now - psShown >= 30000) { psShown = now; SetDetail(text, std::min(1000, std::max(0, pct))); }
+            }
+            return;
+        }
         LogRaw(L"| " + raw);
         lastOut = GetTickCount64();
         if (!g_console) { std::lock_guard<std::mutex> lk(g_ui.mx); g_ui.lines.push_back(l); if (g_ui.lines.size() > 2000) g_ui.lines.pop_front(); Kick(); }
@@ -1168,12 +1187,12 @@ static int RunSetupOnce(const Choice& c, const Jobs& j, wstring& stopMsg) {
             SetStep(s);
             { std::lock_guard<std::mutex> lk(stepMx); stepBase = s; stepT0 = GetTickCount64(); }
             int p = StartsWith(s, L"1/5") ? 50 : StartsWith(s, L"2/5") ? 100 : StartsWith(s, L"3/5") ? 200 : StartsWith(s, L"4/5") ? 230 : StartsWith(s, L"5/5") ? 280 : 20;
-            SetDetail(L"", p);
+            SetDetail(L"", psProgress ? -1 : p);
         } else if (StartsWith(l, L"SETUP STOPPED")) {
             stopMsg = l.substr(l.find(L':') + 1);
         } else if (StartsWith(l, L"SETUP COMPLETE")) {
             complete = true;
-        } else if (l[0] != L'[' && !g_console) {
+        } else if (l[0] != L'[' && !g_console && !psProgress) {
             // the latest message, unless the Ninja progress ("Building ...") is showing
             std::lock_guard<std::mutex> lk(g_ui.mx);
             if (g_ui.detail.empty() || !StartsWith(g_ui.detail, L"Building")) g_ui.detail = l.substr(0, 160);

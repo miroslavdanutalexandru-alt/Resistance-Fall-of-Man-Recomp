@@ -6,7 +6,9 @@ param([Parameter(Mandatory)][string]$BuildDir, [Parameter(Mandatory)][string]$Lo
 $ErrorActionPreference = 'Continue'
 $dir = Split-Path -Parent $Log
 if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir | Out-Null }
-$w = New-Object System.IO.StreamWriter($Log, $false, (New-Object System.Text.UTF8Encoding($false)))
+# shared: Setup and anyone else may read the log while the build runs
+$fs = New-Object System.IO.FileStream($Log, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete))
+$w = New-Object System.IO.StreamWriter($fs, (New-Object System.Text.UTF8Encoding($false)))
 $w.AutoFlush = $true
 $failed = $false
 $cmakeArgs = @('--build', $BuildDir)
