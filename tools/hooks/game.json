@@ -1028,6 +1028,46 @@
 "        ctx->gpr[3] = R_3 = rfom_movie_skip_unseen((uint32_t)R_3, (uint32_t)vm_read32(R_31 + 0x38));   /* unwatched-movie skip */"
 ]
 }
+],
+"func_0029EEC0": [
+{
+"at": 44,
+"ctx": "loc_0029EF10:",
+"rm": [],
+"add": [
+"        rfom_cheat_hurt((uint32_t)R_31, ctx->fpr[0]);   /* cheats: God mode (project/rfom_cheats.cpp) */"
+]
+}
+],
+"func_002A6EB8": [
+{
+"at": 35,
+"ctx": "        ctx->gpr[4] = R_4 = (int64_t)(int32_t)(1);",
+"rm": [],
+"add": [
+"        if (rfom_cheat_item((uint32_t)R_28, (uint32_t)R_29, (int32_t)R_5)) ctx->gpr[5] = R_5 = 0;   /* cheats: Infinite grenades */"
+]
+}
+],
+"func_00339A40": [
+{
+"at": 65,
+"ctx": "        ctx->gpr[0] = R_0 = R_9 - R_0;",
+"rm": [],
+"add": [
+"        if (rfom_cheat_ammo((uint32_t)R_31)) ctx->gpr[0] = R_0 = R_9;   /* cheats: Infinite ammo (project/rfom_cheats.cpp) */"
+]
+}
+],
+"func_00339B84": [
+{
+"at": 40,
+"ctx": "        ctx->gpr[0] = R_0 = R_9 - R_0;",
+"rm": [],
+"add": [
+"        if (rfom_cheat_ammo((uint32_t)R_3)) ctx->gpr[0] = R_0 = R_9;   /* cheats: Infinite ammo, alt fire */"
+]
+}
 ]
 },
 "preamble": [
@@ -1079,7 +1119,10 @@
 "extern \"C\" void rfom_drive_note(uint32_t hero, int kind);",
 "extern \"C\" int rfom_tank_mouse_pre(uint32_t tank, uint32_t hero, double rx);",
 "extern \"C\" void rfom_tank_mouse_apply(uint32_t tank, uint32_t hero, uint32_t toc);",
-"extern \"C\" uint32_t rfom_movie_skip_unseen(uint32_t seen, uint32_t id);   /* RFOM_CUTSCENE_SKIP_ALL (project/rfom_pcextra.cpp) */"
+"extern \"C\" uint32_t rfom_movie_skip_unseen(uint32_t seen, uint32_t id);   /* RFOM_CUTSCENE_SKIP_ALL (project/rfom_pcextra.cpp) */",
+"extern \"C\" void rfom_cheat_hurt(uint32_t obj, double old);   /* cheats (project/rfom_cheats.cpp) */",
+"extern \"C\" int rfom_cheat_ammo(uint32_t weapon);",
+"extern \"C\" int rfom_cheat_item(uint32_t player, uint32_t type, int32_t delta);"
 ],
 "header": [
 {

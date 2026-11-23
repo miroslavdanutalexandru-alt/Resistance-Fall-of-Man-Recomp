@@ -1456,9 +1456,11 @@ static void aim_assist_apply(uint32_t player)
         saved[i].ea = 0;
     }
 }
+extern "C" void rfom_cheats_player(uint32_t player);   /* rfom_cheats.cpp */
 extern "C" void rfom_mouselook_pre(uint32_t player)
 {
     fall_watch(player);   /* v168 */
+    rfom_cheats_player(player);   /* local hero for the cheats; God mode top-up */
     aim_assist_apply(player);
     { static int en = -1; if (en < 0) { const char* e = getenv("RFOM_SCRIPT30"); en = e ? atoi(e) : 1; }
       const int sc = en && player && vm_read8(player + 0x3F07) == 1;
