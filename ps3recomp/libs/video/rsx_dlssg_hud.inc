@@ -46,10 +46,13 @@ static int fg_hud_blend(u32 k, u32* alpha_bits)
     if ((sc == (u32)D3D12_BLEND_SRC_ALPHA || sc == (u32)D3D12_BLEND_ONE) && dc == (u32)D3D12_BLEND_ONE) {
         /* Additive HUD parts (likely the dim unlit segments of the ammo / health digits, glows) used to leave
          * the UI alpha untouched: colour in the layer at alpha 0, which DLSS-G reads as "no UI here", so they
-         * were missing from the generated frames and flickered. RSX_FG_HUD_DIM (default on) gives them
-         * coverage; fg_present rebuilds the colour so the composite still equals the real frame. */
-        const u32 sa = fg_hud_dim() ? (u32)D3D12_BLEND_ONE : (u32)D3D12_BLEND_ZERO;
-        const u32 da = fg_hud_dim() ? (u32)D3D12_BLEND_INV_SRC_ALPHA : (u32)D3D12_BLEND_ONE;
+         * were missing from the generated frames and flickered. RSX_FG_HUD_DIM (default on) gives SRC_ALPHA/ONE
+         * draws their src.a as coverage; fg_present rebuilds the colour so the composite still equals the real
+         * frame. Only with the rebuild pass in place (else present copies the layer and generated frames would
+         * darken), and not for ONE/ONE, whose src.a is no coverage (old alpha kept). */
+        const int cov = sc == (u32)D3D12_BLEND_SRC_ALPHA && s_fg_dim_pso && fg_hud_dim();
+        const u32 sa = cov ? (u32)D3D12_BLEND_ONE : (u32)D3D12_BLEND_ZERO;
+        const u32 da = cov ? (u32)D3D12_BLEND_INV_SRC_ALPHA : (u32)D3D12_BLEND_ONE;
         *alpha_bits = (sa << 11) | (da << 16) | ((u32)D3D12_BLEND_OP_ADD << 24);
         return 1;
     }

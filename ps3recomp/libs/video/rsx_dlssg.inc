@@ -9,10 +9,11 @@
  *                     generated frames then interpolate the HUD together with the scene.
  *   RFOM_FG_HUDDBG    1: show the HUD-less image the generator gets | 2: show the separated UI layer over grey.
  *                     Works whenever DLSS runs, also with frame generation off or unsupported.
- *   RSX_FG_HUD_DIM    1 (default): additive HUD draws (the dim unlit digit segments / bullet ticks of the ammo
- *                     and health display) get alpha in the UI layer, and the layer's colour is rebuilt from the
- *                     real frame (ui.rgb = frame - (1 - ui.a) * hudless) | 0: old layer (additive parts at
- *                     alpha 0, missing from generated frames).
+ *   RSX_FG_HUD_DIM    1 (default): SRC_ALPHA/ONE additive HUD draws (the dim unlit digit segments / bullet ticks
+ *                     of the ammo and health display) get src.a as alpha in the UI layer, and the layer's colour
+ *                     is rebuilt from the real frame (ui.rgb = frame - (1 - ui.a) * hudless; ONE/ONE draws keep
+ *                     the old alpha; without the rebuild pass the old layer is used) | 0: old layer (additive
+ *                     parts at alpha 0, missing from generated frames).
  *   RFOM_FG_HUDLOG    N (default 0, diagnostic): log every display-buffer draw of N frames with DLSS inputs
  *                     ("[FG-HUD]": HUD or why not, run state, blend / depth state, textures).
  *   RFOM_FG_UNSURE_PAUSE 1 (default): with the HUD split on, 3 consecutive frames whose HUD could not be
@@ -308,7 +309,7 @@ static const char s_fg_dim_hlsl[] =
     "struct V { float4 p : SV_Position; float2 uv : TEXCOORD0; };\n"
     "V vs(uint id : SV_VertexID) { V o; float2 uv = float2((id << 1) & 2, id & 2);\n"
     "  o.uv = uv; o.p = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1); return o; }\n"
-    "float4 ps(V i) : SV_Target { float4 u = t1.Sample(s0, i.uv); if (u.a <= 0.0) return (float4)0;\n"
+    "float4 ps(V i) : SV_Target { float4 u = t1.Sample(s0, i.uv); if (u.a <= 0.0) return u;\n"
     "  float3 h = t0.Sample(s0, i.uv).rgb, f = t2.Sample(s0, i.uv).rgb;\n"
     "  return float4(max(f - (1.0 - u.a) * h, 0.0), u.a); }\n";
 
