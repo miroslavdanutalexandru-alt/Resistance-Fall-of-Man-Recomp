@@ -63,6 +63,43 @@ int main(void)
         }
     }
 
+    /* movie LFC: 30 fps -> 2 presents per frame (60/s) wherever the screen can show them */
+    CHECK(rfom_movie_lfc_count(29.97, 165.0, -1) == 2);
+    CHECK(rfom_movie_lfc_count(29.97, 144.0, -1) == 2);
+    CHECK(rfom_movie_lfc_count(30.0, 75.0, -1) == 2);
+    CHECK(rfom_movie_lfc_count(29.97, 50.0, -1) == 1);    /* 60/s is above a 50 Hz screen */
+    CHECK(rfom_movie_lfc_count(24.0, 165.0, -1) == 2);    /* 48/s */
+    CHECK(rfom_movie_lfc_count(15.0, 165.0, -1) == 4);
+    CHECK(rfom_movie_lfc_count(60.0, 165.0, -1) == 1);    /* already in range */
+    CHECK(rfom_movie_lfc_count(0.0, 165.0, -1) == 1);
+    CHECK(rfom_movie_lfc_count(29.97, 0.0, -1) == 1);
+    CHECK(rfom_movie_lfc_count(29.97, 165.0, 0) == 1);    /* RFOM_MOVIE_LFC=0 */
+    CHECK(rfom_movie_lfc_count(29.97, 165.0, 3) == 3);    /* RFOM_MOVIE_LFC=3 */
+    CHECK(rfom_movie_lfc_count(29.97, 165.0, 99) == RFOM_MOVIE_LFC_MAX);
+
+    /* period estimate: first gap taken as is, outliers left out, converges */
+    {
+        double e = rfom_movie_period_update(0.0, 33367.0);
+        CHECK(e == 33367.0);
+        CHECK(rfom_movie_period_update(e, 250000.0) == e);   /* pause */
+        CHECK(rfom_movie_period_update(e, 3000.0) == e);     /* two presents back to back */
+        CHECK(rfom_movie_period_update(0.0, 500000.0) == 0.0);
+        for (int i = 0; i < 200; i++) e = rfom_movie_period_update(e, (i & 1) ? 41700.0 : 41716.0);
+        CHECK(e > 41600.0 && e < 41800.0);                  /* 23.976 fps */
+    }
+
+    /* repeat timing: the midpoint of a 33.37 ms frame, dropped when half a slot late */
+    {
+        const double p = 33367.0;
+        CHECK(rfom_movie_lfc_due(1000000, 1000000 + 16000, p, 2, 1) == 0);
+        CHECK(rfom_movie_lfc_due(1000000, 1000000 + 16684, p, 2, 1) == 1);
+        CHECK(rfom_movie_lfc_due(1000000, 1000000 + 16684 + 8000, p, 2, 1) == 1);
+        CHECK(rfom_movie_lfc_due(1000000, 1000000 + 16684 + 8500, p, 2, 1) == -1);
+        CHECK(rfom_movie_lfc_due(1000000, 1000000 + 16684, p, 2, 2) == -1);   /* only k-1 repeats */
+        CHECK(rfom_movie_lfc_due(1000000, 1000000 + 16684, p, 1, 1) == -1);
+        CHECK(rfom_movie_lfc_due(0, 22245, p, 3, 2) == 1);                    /* 2/3 of the frame */
+    }
+
     if (fails) { fprintf(stderr, "movie_pace_test: %d failure(s)\n", fails); return 1; }
     printf("movie_pace_test: all passed\n");
     return 0;
