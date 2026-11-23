@@ -1570,7 +1570,7 @@ static const struct { const char* key; int cat; } kCatOf[] = {
     { "gyro", CAT_CONTROLS }, { "gyrosens", CAT_CONTROLS }, { "gyroinvy", CAT_CONTROLS }, { "gyrospace", CAT_CONTROLS },
     { "lightbar", CAT_CONTROLS }, { "nswap", CAT_CONTROLS }, { "rumble", CAT_CONTROLS }, { "enterbtn", CAT_CONTROLS },
     { "padbg", CAT_CONTROLS }, { "outerdz", CAT_CONTROLS }, { "antidz", CAT_CONTROLS }, { "trigdz", CAT_CONTROLS },
-    { "turnboost", CAT_CONTROLS }, { "crouchmode", CAT_CONTROLS },
+    { "turnboost", CAT_CONTROLS }, { "crouchmode", CAT_CONTROLS }, { "aimassist", CAT_CONTROLS },
     { "volume", CAT_AUDIO }, { "audio_mono", CAT_AUDIO }, { "language", CAT_AUDIO },
 };
 static std::string row_key(int g)
@@ -1648,7 +1648,7 @@ static const struct { const char* key; const char* name; } kShort[] = {
     { "lightbar", "LIGHT BAR" }, { "nswap", "NINTENDO LAYOUT" }, { "rumble", "VIBRATION" },
     { "enterbtn", "CONFIRM BUTTON" }, { "padbg", "PAD IN BACKGROUND" }, { "outerdz", "OUTER DEADZONE" },
     { "antidz", "ANTI-DEADZONE" }, { "trigdz", "TRIGGER DEADZONE" }, { "turnboost", "TURN BOOST" },
-    { "crouchmode", "CROUCH" }, { "volume", "MASTER VOLUME" }, { "audio_mono", "MONO AUDIO" },
+    { "crouchmode", "CROUCH" }, { "aimassist", "AIM ASSIST" }, { "volume", "MASTER VOLUME" }, { "audio_mono", "MONO AUDIO" },
     { "language", "LANGUAGE" },
 };
 /* the game's menu font: plain ASCII, upper case like the game's own labels */

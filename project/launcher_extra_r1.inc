@@ -177,10 +177,11 @@ static void lx_register()
            { {"On  (PS3 original)", ""}, {"Off  (fixed difficulty)", "0"} });
     // "MORE MOUSE OPTIONS" options
     lx_add(7, "aimassist", "Aim assist",
-           "The game's aim assist: the view slows down over an enemy and is pulled toward it. Auto turns it off "
-           "while you play with keyboard & mouse and keeps it with a controller (in split-screen only for the "
-           "keyboard & mouse player). On: always, as on PS3. Off: never, also with a controller.", "RFOM_AIM_ASSIST",
-           { {"Auto  (off with mouse, on with controller)", ""}, {"On", "1"}, {"Off", "0"} });
+           "The game's aim assist: your aim slows down when it passes over an enemy and is pulled toward it. Auto turns "
+           "it off while you play with keyboard & mouse and keeps it with a controller (in split-screen only the "
+           "keyboard & mouse player loses it). On: always, as on PS3. Off: never, also with a controller. "
+           "Also in game: F10 > More PC Options, or F9 (changes at once).", "PORT_AIM_ASSIST",
+           { {"Auto (off with mouse, on with controller)", ""}, {"On", "on"}, {"Off", "off"} });
     lx_add(7, "grab_mouse", "Shake off grabs with the mouse",
            "When an enemy grabs you, shaking the mouse breaks free (scaled so vigorous shaking matches shaking both "
            "sticks). Pros: works with keyboard & mouse, where the movement keys barely counted. Cons: none; Off uses "
