@@ -31,4 +31,35 @@ static inline int rfom_movie_vsync_default(double per_us, int tearing)
     return (tearing && per_us > 0.0 && !rfom_movie_lock_k(per_us)) ? 0 : 1;
 }
 
+/* Vblank lock phase (main.cpp): the synthetic tick is placed lead us after a real
+ * vblank and only moved when it drifts more than band us from there. lead +- band
+ * stays inside one refresh at any rate: 1500 +- 1000 us up to 375 Hz (60/120/240 Hz
+ * unchanged), then 3p/8 +- p/4 = [p/8, 5p/8] (420/480 Hz). */
+static inline long long rfom_movie_phase_lead_us(long long p)
+{
+    const long long s = p * 3 / 8;
+    return s < 1500 ? s : 1500;
+}
+static inline long long rfom_movie_phase_band_us(long long p)
+{
+    const long long s = p / 4;
+    return s < 1000 ? s : 1000;
+}
+
+/* Amount to subtract from next_tick (0 = inside the band). since_vblank_us = time
+ * from the last real vblank to now, p = refresh period. The shift is the phase
+ * error in (-p/2, p/2], never whole periods (a due tick must not be pushed back a
+ * refresh). */
+static inline long long rfom_movie_phase_shift(long long next_tick, long long now,
+                                               long long since_vblank_us, long long p)
+{
+    if (p <= 0) p = 1;
+    const long long ph = ((since_vblank_us % p) + p) % p;
+    const long long tgt = now - ph + rfom_movie_phase_lead_us(p);
+    long long off = ((next_tick - tgt) % p + p) % p;
+    if (off > p / 2) off -= p;
+    const long long band = rfom_movie_phase_band_us(p);
+    return (off > band || off < -band) ? off : 0;
+}
+
 #endif

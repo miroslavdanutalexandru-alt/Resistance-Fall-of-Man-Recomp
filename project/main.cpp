@@ -353,18 +353,10 @@ static DWORD WINAPI frame_clock(LPVOID)
                                           k ? "locked" : "not a 60 Hz multiple, frame clock free-runs"); } }
                             if (k) {
                                 vb_us = (long long)(k * per_us + 0.5);
-                                /* next tick 1.5 ms after a real vblank */
+                                /* next tick shortly after a real vblank (rfom_movie_phase_shift) */
                                 LARGE_INTEGER qn; QueryPerformanceCounter(&qn);
                                 const long long since = (long long)((double)(qn.QuadPart - (LONGLONG)ti.qpcVBlank) * 1e6 / (double)qf.QuadPart);
-                                long long p = (long long)per_us; if (p <= 0) p = 1;
-                                const long long ph = ((since % p) + p) % p;
-                                /* phase error of next_tick against "vblank + 1.5 ms", in
-                                 * (-p/2, p/2]: shift by it, never by whole periods (a due
-                                 * tick must not be pushed back a refresh) */
-                                const long long tgt = now - ph + 1500;
-                                long long off = ((next_tick - tgt) % p + p) % p;
-                                if (off > p / 2) off -= p;
-                                if (off > 1000 || off < -1000) next_tick -= off;
+                                next_tick -= rfom_movie_phase_shift(next_tick, now, since, (long long)per_us);
                             }
                         }
                     }
