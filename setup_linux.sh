@@ -16,6 +16,10 @@
 # Needs: python3 (3.8+, with venv), cmake, ninja, LLVM 22+ (clang, lld, llvm: clang-cl, lld-link, llvm-rc),
 #        curl, tar; 7-Zip (7z/7zz) for UDF disc images. About 25 GB free space.
 set -euo pipefail
+ORIG_PWD="$PWD"
+# paths given on the command line / typed in are relative to where you ran the script, not the port folder
+abs_path() { case "$1" in '') echo '' ;; '~') echo "$HOME" ;; '~/'*) echo "$HOME/${1#\~/}" ;; /*) echo "$1" ;; *) echo "$ORIG_PWD/$1" ;; esac; }
+[ -n "${PORT_XWIN_DIR:-}" ] && PORT_XWIN_DIR="$(abs_path "$PORT_XWIN_DIR")"
 cd "$(dirname "$0")"
 PORT="$(pwd)"
 
@@ -49,6 +53,7 @@ while [ $# -gt 0 ]; do
         *) echo "Unknown option: $1 (see ./setup_linux.sh --help)"; exit 2 ;;
     esac
 done
+GAME="$(abs_path "$GAME")"; FFZIP="$(abs_path "$FFZIP")"
 [ -n "${RFOM_REGEN:-}" ] && [ "${RFOM_REGEN}" != 0 ] && FORCE_REGEN=1
 
 step() { echo; echo "== $*"; }
@@ -133,7 +138,9 @@ if ! python3 -c 'import Crypto' 2>/dev/null; then
 fi
 
 # Microsoft's C runtime + Windows SDK (the Windows headers and libraries), downloaded from Microsoft with xwin
-export PORT_XWIN_DIR="${PORT_XWIN_DIR:-$PORT/tools_cache/msvc_linux}"
+XWIN_DEFAULT="$PORT/tools_cache/msvc_linux"
+export PORT_XWIN_DIR="${PORT_XWIN_DIR:-$XWIN_DEFAULT}"
+XWIN_MARK="$PORT_XWIN_DIR/.port_xwin_splat"   # written by this script: only such a folder (or the default) is ever deleted
 xwin_ok() { [ -f "$PORT_XWIN_DIR/crt/include/vcruntime.h" ] && [ -f "$PORT_XWIN_DIR/sdk/include/um/windows.h" ] \
             && ls "$PORT_XWIN_DIR"/sdk/lib/um/*/kernel32.lib >/dev/null 2>&1; }
 if ! xwin_ok; then
@@ -154,10 +161,17 @@ if ! xwin_ok; then
             tar -xzf tools_cache/xwin/xwin.tar.gz -C tools_cache/xwin --strip-components=1
             rm -f tools_cache/xwin/xwin.tar.gz
         fi
-        rm -rf "$PORT_XWIN_DIR"
+        if [ "$PORT_XWIN_DIR" = "$XWIN_DEFAULT" ] || [ -f "$XWIN_MARK" ]; then
+            rm -rf "$PORT_XWIN_DIR"
+        elif [ -e "$PORT_XWIN_DIR" ] && [ -n "$(ls -A "$PORT_XWIN_DIR" 2>/dev/null)" ]; then
+            fail "PORT_XWIN_DIR=$PORT_XWIN_DIR is not empty and does not hold a complete MSVC / Windows SDK splat
+   (crt/include/vcruntime.h, sdk/include/um/windows.h, sdk/lib/um/*/kernel32.lib). It is left untouched: point
+   PORT_XWIN_DIR at a complete splat or an empty / new folder, or unset it to use tools_cache/msvc_linux."
+        fi
         "$XW" --accept-license --arch x86_64 --cache-dir tools_cache/xwin_cache splat --output "$PORT_XWIN_DIR" \
             || fail "xwin could not download the MSVC libraries / Windows SDK (see above). Run ./setup_linux.sh again to retry."
         rm -rf tools_cache/xwin_cache
+        echo "xwin splat by setup_linux.sh; this folder may be deleted and downloaded again by it" > "$XWIN_MARK"
         xwin_ok || fail "the MSVC libraries / Windows SDK are incomplete in $PORT_XWIN_DIR."
     fi
 fi
@@ -180,7 +194,7 @@ if ! game_present; then
         echo "   Where is your copy of $GAME_NAME (US disc, $TITLE_ID)? A decrypted .iso, or the folder with PS3_GAME"
         echo "   in it (for example RPCS3's games folder). You can drag it into this window."
         read -r -p "   Path: " GAME
-        GAME="${GAME%\'}"; GAME="${GAME#\'}"; GAME="${GAME%\"}"; GAME="${GAME#\"}"
+        GAME="${GAME%\'}"; GAME="${GAME#\'}"; GAME="${GAME%\"}"; GAME="${GAME#\"}"; GAME="$(abs_path "$GAME")"
         if [ -n "$GAME" ]; then
             rc=0; "$PY" tools/linux/port_linux.py check-game "$PROFILE" "$GAME" || rc=$?
             if [ $rc -eq 2 ]; then

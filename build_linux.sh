@@ -10,6 +10,7 @@
 # Environment: PORT_LLVM_BIN=<folder of clang-cl, lld-link, llvm-rc> (default: PATH, then /usr/lib/llvm-NN/bin),
 #              PORT_XWIN_DIR=<xwin splat folder> (default: tools_cache/msvc_linux).
 set -euo pipefail
+case "${PORT_XWIN_DIR:-/}" in /*) ;; *) PORT_XWIN_DIR="$PWD/$PORT_XWIN_DIR" ;; esac
 cd "$(dirname "$0")"
 PORT="$(pwd)"
 
