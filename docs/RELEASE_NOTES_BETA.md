@@ -16,6 +16,7 @@ This is a **beta**. The campaign has been played up to Cheddar Gorge. Later leve
 - **Frame generation:** less ghosting on the first-person weapon during fast turns (`RSX_DLSS_VIEWMODEL_W`).
 - **Portable build tools:** unpacking xwin / LLVM fixed (issue #16).
 - **Split-screen co-op:** DLSS / FSR / XeSS and frame generation pause while two players are in play and the two views render natively (the upscaler assumes one camera per frame; issue #25, player 1's half black). `RFOM_SPLIT_AA=1` keeps them on. The log now records how the two views are cleared and drawn (`[coop]` lines, `RFOM_SPLIT_LOG`).
+- **Soft, shimmering image with Windows display scaling** (issue #25): with scaling above 100% (common on 4K TVs and laptops) Windows treated the game as an old program and stretched a smaller picture up to the screen, in windowed mode (a 3840x2160 window came out 1264x681) and in borderless fullscreen. The game now draws at the screen's real resolution, the window's inside is exactly the chosen Window size, and moving the window to a monitor with other scaling keeps that size. `RSX_DPI_AWARE=0` restores the old behaviour. A remembered window position from an older version is not reused once (the window opens centred).
 
 ## 0.3.0-beta
 
