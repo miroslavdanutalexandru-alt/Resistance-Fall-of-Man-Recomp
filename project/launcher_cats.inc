@@ -19,7 +19,7 @@ static const CatGroup g_cat[] = {
     { P_UPSCALE,  "ANTI-ALIASING AND UPSCALING",  "fsr upscale dlsspreset sharpen fsr_sharp objmv", nullptr },
     { P_UPSCALE,  "FRAME GENERATION AND LATENCY", "dlss_fg fg_backend reflex latency", nullptr },
     { P_PERF,     "SHADER CACHE",                 "precompile shaderthreads", nullptr },
-    { P_CONTROLS, "MOUSE",                        "@mouse msensy adssens aimhold grab_mouse crosshair xhair_color xhair_size", nullptr },
+    { P_CONTROLS, "MOUSE",                        "@mouse msensy adssens aimhold aimassist grab_mouse crosshair xhair_color xhair_size", nullptr },
     { P_CONTROLS, "CONTROLLER",                   "@padint deadzone curve padbackend padglyphs nswap lightbar "
                                                   "pad_disconnect_pause pad_southpaw p1pad rumble enterbtn padbg outerdz antidz trigdz turnboost crouchmode",
       "Controllers work automatically. Their buttons are set in the game's own Options \xE2\x80\xBA Controls screen." },

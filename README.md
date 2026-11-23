@@ -185,6 +185,7 @@ Set in the launcher (the Display, Graphics, Upscaling & Frame Gen, Controls, Int
 |---|---|---|
 | `PORT_VOLUME` | 100 | Master volume 0-100% on top of the game's own volume options (launcher: Audio; F9). |
 | `PORT_AUDIO_MONO` | 0 | `1`: accessibility mono downmix, every channel to both ears. |
+| `PORT_AIM_ASSIST` | auto | The game's aim assist (aim slows down over an enemy and is pulled toward it). Unset / `auto`: off with keyboard & mouse, on with a controller (in split-screen only the keyboard & mouse player loses it); `on`: always, as on PS3; `off`: never. Launcher: Controls > Mouse > *Aim assist*; F9 (changes at once). `RFOM_AIM_ASSIST` also works; `PORT_AIM_ASSIST` wins. |
 | `PORT_UI_SCALE` | auto | Size of the PC menus (F9 / F10), the F3 overlay and notifications: `75`-`200` (%). Auto enlarges the overlay and notifications on 1440p (125%) and 4K (150%) windows. |
 | `PORT_OVERLAY_GRAPH` | 1 | The F3 overlay draws a graph of the last 120 frame times under its numbers (yellow / red bars = slow frames); `0` hides it. |
 | `RFOM_PAD_GLYPHS=nintendo` | auto | Nintendo (Switch) button prompts: A / B / X / Y letters in the Nintendo positions. Auto picks them for a Switch Pro controller or Joy-Cons. |
@@ -323,7 +324,7 @@ Button: **Reset to defaults** (asks first; also on the Graphics and Upscaling & 
 
 Button: **Rebuild shader cache** (asks first).
 
-**Controls:** key bindings, the mouse (sensitivity, invert, mouse aiming, the free-cursor key, vertical and zoomed sensitivity, zoom mode, shaking off grabs with the mouse (`RFOM_GRAB_MOUSE=0` = off), the extra crosshair), the controller (use / interact button, deadzone, response curve, controller support, button prompts `RFOM_PAD_GLYPHS=\|xbox\|ps`, Nintendo layout, light bar, pause on disconnect, southpaw, player 1 controller `PAD_P1_CONTROLLER=1..4`), gyro, and the controller button remap. See *Controls* above.
+**Controls:** key bindings, the mouse (sensitivity, invert, mouse aiming, the free-cursor key, vertical and zoomed sensitivity, zoom mode, aim assist (`PORT_AIM_ASSIST=on\|off`, unset = Auto), shaking off grabs with the mouse (`RFOM_GRAB_MOUSE=0` = off), the extra crosshair), the controller (use / interact button, deadzone, response curve, controller support, button prompts `RFOM_PAD_GLYPHS=\|xbox\|ps`, Nintendo layout, light bar, pause on disconnect, southpaw, player 1 controller `PAD_P1_CONTROLLER=1..4`), gyro, and the controller button remap. See *Controls* above.
 
 **Audio**
 
