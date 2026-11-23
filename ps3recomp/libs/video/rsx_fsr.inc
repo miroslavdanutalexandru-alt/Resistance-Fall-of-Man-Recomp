@@ -254,6 +254,18 @@ static volatile u32 s_fsr_st_rec, s_fsr_st_match, s_fsr_st_over, s_fsr_st_wait, 
 static volatile u32 s_fsr_st_cam;                 /* draws given camera-only motion (no previous-frame match) */
 static volatile u32 s_fsr_st_amb;                 /* nearest matches refused as ambiguous (RSX_DLSS_MATCH_RATIO) */
 static volatile u32 s_fsr_st_vm;                  /* ...of which kept as view-attached (RSX_DLSS_VIEWMODEL_W) */
+static volatile u32 s_fsr_st_common;              /* would-be ambiguous matches kept: common camera term (RSX_DLSS_MATCH_COMMON) */
+static RfomNnCommon s_fsr_common[FSR_VARY_VS];    /* per program: this frame's common per-instance distance */
+/* RSX_DLSS_MATCH_COMMON (default 1, 0 = off): see rfom_nn_common_hit. Without it, a fast turn made every static
+ * draw of such a program "ambiguous" (the camera term dwarfs the instance differences) and dropped its correct
+ * match for the camera-only split (fsr_cam_prev), which keeps that camera-following row at its current value. */
+static int fsr_match_common(void)
+{
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("RSX_DLSS_MATCH_COMMON"); v = !(e && *e == '0');
+                 fprintf(stderr, "[DLSS] nearest matches sharing their program's camera term: %s (RSX_DLSS_MATCH_COMMON)%c", v ? "kept" : "ambiguity test only", 10); }
+    return v;
+}
 static u32 s_fsr_st_zr;                           /* motion-pass draws with a CLIP_MIN/MAX depth range (render thread) */
 /* RSX_DLSS_MATCH_RATIO (default 0.5, 0 = off): a nearest-by-constants match is kept only when it is at most this
  * fraction of the distance of the nearest distinct other candidate; otherwise the draw is "unmatched" and gets
@@ -717,7 +729,7 @@ static void fsr_record_impl(D3D12DrawRecord* dr, int vs_idx, char* dst, const ch
              * (a doubled block in generated frames). Such draws drop the match and take their own exact camera-only
              * motion (fsr_cam_prev, below), else the camera fill. RSX_DLSS_AMBIG_KEEP=1: keep it as mt 5 instead
              * (camera fill if this frame has a camera, else the guessed match -- r1_fg12; regressed the York doorway). */
-            if (searched && best != 0xFFFFFFFFu && !dr->fsr_mt && bd2 < 3.0e38f) {
+            if (searched && best != 0xFFFFFFFFu && !dr->fsr_mt) {
                 /* the signature also samples the shared rows (camera / projection), whose change since last frame
                  * adds the same term to every candidate's distance; only the per-instance rest is compared */
                 float cshared = 0.0f;
@@ -728,7 +740,15 @@ static void fsr_record_impl(D3D12DrawRecord* dr, int vs_idx, char* dst, const ch
                         for (u32 j = 0; j < 4; j++) { const float df = ps[q * 4 + j] - sig[q * 4 + j]; cshared += df < 0.0f ? -df : df; }
                     }
                 }
-                if (rfom_nn_ambiguous_c(bd, bd2, cshared, ratio)) {
+                int common = 0;   /* RSX_DLSS_MATCH_COMMON: the per-instance distance is the program's camera term */
+                if (vs_idx >= 0 && vs_idx < FSR_VARY_VS && fsr_match_common()) {
+                    const float inst = bd - (cshared < bd ? cshared : bd);
+                    common = rfom_nn_common_hit(&s_fsr_common[vs_idx], fr, inst, 3u);
+                    rfom_nn_common_feed(&s_fsr_common[vs_idx], fr, inst);
+                }
+                if (bd2 < 3.0e38f && rfom_nn_ambiguous_c(bd, bd2, cshared, ratio)) {
+                  if (common) s_fsr_st_common++;
+                  else {
                     static int keep = -1;
                     if (keep < 0) { keep = dlss_env_i("RSX_DLSS_AMBIG_KEEP", 0, 0, 1);
                                     fprintf(stderr, "[DLSS] ambiguous matches: %s%c", keep ? "kept, camera fill (RSX_DLSS_AMBIG_KEEP=1)"
@@ -738,6 +758,7 @@ static void fsr_record_impl(D3D12DrawRecord* dr, int vs_idx, char* dst, const ch
                     if (vmn) s_fsr_st_vm++;
                     const int act = rfom_nn_ambig_action(1, keep, vmn);
                     if (act == 5) dr->fsr_mt = 5; else if (act < 0) best = 0xFFFFFFFFu;
+                  }
                 }
             }
             if (best != 0xFFFFFFFFu) { prev_off = ((u64)pr * s_fsr_slots + best) * FSR_HIST_STRIDE; s_fsr_st_match++;
@@ -2686,9 +2707,9 @@ static void fsr_dispatch(void)
           QueryPerformanceCounter(&q1); QueryPerformanceFrequency(&qf);
           const double tpms = (q0.QuadPart && t1 > t0 && q1.QuadPart > q0.QuadPart) ? (double)(t1 - t0) / ((double)(q1.QuadPart - q0.QuadPart) * 1000.0 / (double)qf.QuadPart) : 0.0;   /* TSC ticks per ms (0 on the first report) */
           q0 = q1; t0 = t1;
-          fprintf(stderr, "[FSR] stats/600: history resets %u (frame gaps %u), scene draws %u, matched to last frame %.1f%%, over slot limit %u, lead waits %u, exact %.1f%%, camera fallback %.1f%%,           ambiguous %.1f%% (view-attached kept %u), depth-range draws %u, record %.3f ms/frame%c",
+          fprintf(stderr, "[FSR] stats/600: history resets %u (frame gaps %u), scene draws %u, matched to last frame %.1f%%, over slot limit %u, lead waits %u, exact %.1f%%, camera fallback %.1f%%,                     ambiguous %.1f%% (view-attached kept %u, common camera term kept %u), depth-range draws %u, record %.3f ms/frame%c",
                   nr, gap, rec, rec ? 100.0 * mt / rec : 0.0, ov, s_fsr_st_wait, rec ? 100.0 * s_fsr_st_exact / rec : 0.0,
-                            rec ? 100.0 * s_fsr_st_cam / rec : 0.0, rec ? 100.0 * s_fsr_st_amb / rec : 0.0, s_fsr_st_vm, s_fsr_st_zr, tpms > 0.0 ? (double)s_fsr_st_tsc / tpms / 600.0 : 0.0, 10);
+                                      rec ? 100.0 * s_fsr_st_cam / rec : 0.0, rec ? 100.0 * s_fsr_st_amb / rec : 0.0, s_fsr_st_vm, s_fsr_st_common, s_fsr_st_zr, tpms > 0.0 ? (double)s_fsr_st_tsc / tpms / 600.0 : 0.0, 10);
           if (s_gt_frames) { fprintf(stderr, "[FSR] GPU/frame (%u frames): motion pass %.3f ms, upscaler %.3f ms%c", s_gt_frames, s_gt_ms[0] / s_gt_frames, s_gt_ms[1] / s_gt_frames, 10);
                              s_gt_ms[0] = s_gt_ms[1] = 0.0; s_gt_frames = 0; }
           /* one line for the next play session: where the camera motion came from */
@@ -2706,7 +2727,7 @@ static void fsr_dispatch(void)
                     md ? 100.0 * s_cf_mt[4] / md : 0.0, md ? 100.0 * s_cf_mt[0] / md : 0.0, rw, rh, w, h, uf, ssao_status(), 10);
             memset(s_cf_st, 0, sizeof s_cf_st); memset(s_cf_mt, 0, sizeof s_cf_mt); memset(s_cf_dep, 0, sizeof s_cf_dep); memset(s_cf_run, 0, sizeof s_cf_run);
             s_cf_cut = s_cf_cand = s_cf_elig = s_cf_tried = s_cf_bad = s_cf_plur = s_cf_med = s_cf_held = s_cf_loose = s_cf_rskip = s_cf_rout = 0; }
-          s_fsr_st_rec = s_fsr_st_match = s_fsr_st_over = s_fsr_st_wait = s_fsr_st_exact = s_fsr_st_cam = s_fsr_st_amb = s_fsr_st_vm = s_fsr_st_zr = 0; s_fsr_st_tsc = 0; nr = gap = 0;
+          s_fsr_st_rec = s_fsr_st_match = s_fsr_st_over = s_fsr_st_wait = s_fsr_st_exact = s_fsr_st_cam = s_fsr_st_amb = s_fsr_st_vm = s_fsr_st_common = s_fsr_st_zr = 0; s_fsr_st_tsc = 0; nr = gap = 0;
       } }
     s_fsr_last_frame = s_fsr_frame_r;
     s_fsr_disp_frame = s_fsr_frame_r; s_fsr_disp_ms = GetTickCount64();
