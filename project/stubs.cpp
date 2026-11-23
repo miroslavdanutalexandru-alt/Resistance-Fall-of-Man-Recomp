@@ -371,11 +371,14 @@ extern "C" void cellGcm_set_waitflip_block(int on);
 extern "C" void* g_kbm_hwnd;           /* cellPad.c: the game window */
 static volatile int s_rf_mode = -2;    /* -2 unset, -1 original, else the fps target */
 static float s_rf_min = 1.0f / 60.0f;  /* min step (s) */
+static double s_rf_fps = 60.0;         /* the RFOM_FPS target (fractional), -1 original */
+static volatile double s_rf_pace = 0.0; /* fixed-refresh pacing's limit (rfom_fps_pacing_set), 0 = none */
 static float s_rf_max = 0.0f;          /* max step floor (s), 0 = the game's own */
 static void rfom_fps_init(void)
 {
     if (s_rf_mode != -2) return;
     int m = 60;
+    double fm = 0.0;   /* fractional RFOM_FPS (e.g. 82.5) */
     const char* e = getenv("RFOM_FPS");
     if (e && *e) {
         if (!_stricmp(e, "orig") || !_stricmp(e, "original") || !_stricmp(e, "off")) m = -1;
@@ -393,7 +396,7 @@ static void rfom_fps_init(void)
             if (m < 30) m = 30;
             fprintf(stderr, "[fps] RFOM_FPS=vrr: %d Hz monitor -> %d fps cap\n", hz, m);
         }
-        else { m = atoi(e); if (m <= 0) m = 240; }
+        else { fm = atof(e); if (!(fm > 0.0)) fm = 240.0; if (fm < 30.0) fm = 30.0; if (fm > 1000.0) fm = 1000.0; m = (int)(fm + 0.5); }
     }
     if (m > 0 && m < 30) m = 30;
     if (m > 1000) m = 1000;
@@ -401,12 +404,14 @@ static void rfom_fps_init(void)
     float mx = x ? (float)atof(x) : 0.0f;
     if (mx < 0.0f) mx = 0.0f;
     if (mx > 0.1f) mx = 0.1f;
-    s_rf_min = m > 0 ? 1.0f / (float)m : 0.0f;
+    if (!(fm > 0.0) || (int)(fm + 0.5) != m) fm = (double)m;
+    s_rf_fps = m > 0 ? fm : -1.0;
+    s_rf_min = m > 0 ? (float)(1.0 / fm) : 0.0f;
     s_rf_max = mx;
     if (m > 60) cellGcm_set_waitflip_block(0);
     s_rf_mode = m;
     if (m < 0) fprintf(stderr, "[fps] RFOM_FPS=orig: the game's own pacing (33 fps, 1/30 steps)\n");
-    else fprintf(stderr, "[fps] target %d fps: min step %.5f s, max step %s%s\n", m, (double)s_rf_min,
+    else fprintf(stderr, "[fps] target %.4g fps: min step %.5f s, max step %s%s\n", fm, (double)s_rf_min,
                  mx > 0.0f ? "raised to " : "the game's", mx > 0.0f ? x : "");
     /* Default stays 60. R2/R3 show stick / jump-to-move faults above ~75 fps
      * (fixed-step code fed variable steps); R1 has had frame-count-timed code
@@ -415,6 +420,28 @@ static void rfom_fps_init(void)
         fprintf(stderr, "[fps] WARNING: frame cap %d fps is above 75 -- the game simulates in steps designed for 30 fps; "
                         "movement, scripted sequences or menus may misbehave. RFOM_FPS=60 is the tested default.\n", m);
     }
+}
+/* RFOM_DISPLAY_SYNC fixed-refresh pacing (rsx_d3d12_backend.c pacing_apply, render thread): the frame
+ * limit becomes refresh / k (/ the frame-generation multiplier), e.g. 55 or 41.25 at 165 Hz; 0 = back
+ * to RFOM_FPS. Not with RFOM_FPS=orig. Above 60 SetWaitFlip stops blocking, as for RFOM_FPS > 60. */
+extern "C" double rfom_fps_target(void)
+{
+    rfom_fps_init();
+    return s_rf_mode < 0 ? -1.0 : s_rf_fps;
+}
+extern "C" void rfom_fps_pacing_set(double fps)
+{
+    rfom_fps_init();
+    if (s_rf_mode < 0) return;
+    if (fps > 1000.0) fps = 1000.0;
+    if (fps > 0.0 && fps < 20.0) fps = 20.0;
+    const double was = s_rf_pace > 0.0 ? s_rf_pace : s_rf_fps;
+    const double eff = fps > 0.0 ? fps : s_rf_fps;
+    s_rf_pace = fps > 0.0 ? fps : 0.0;
+    if (eff == was) return;
+    s_rf_min = (float)(1.0 / eff);
+    if ((eff > 60.5) != (was > 60.5)) cellGcm_set_waitflip_block(eff > 60.5 ? 0 : 1);
+    fprintf(stderr, "[fps] frame limit %.4g fps (%s)\n", eff, fps > 0.0 ? "fixed-refresh pacing" : "RFOM_FPS again");
 }
 /* v170: scripted player sequences (a chapter's opening walk: input locked,
  * the game walks and turns the player) are timed in frames, and at high frame
@@ -553,8 +580,8 @@ static int rfom_frame_wait_impl(uint64_t target, uint32_t last_ea)
       prev = now;
       if (!t0) t0 = now;
       if (now - t0 >= 5ull * 79800000ull && n) {
-          fprintf(stderr, "[fps] 5 s: %u frames, %.1f fps, frame %.2f ms avg, %.2f ms worst (target %d)\n",
-                  n, n * 79800000.0 / (double)(now - t0), sum / n / 79800.0, (double)worst / 79800.0, (int)s_rf_mode);
+          fprintf(stderr, "[fps] 5 s: %u frames, %.1f fps, frame %.2f ms avg, %.2f ms worst (target %.4g)\n",
+                  n, n * 79800000.0 / (double)(now - t0), sum / n / 79800.0, (double)worst / 79800.0, s_rf_pace > 0.0 ? s_rf_pace : s_rf_fps);
           t0 = now; n = 0; sum = 0; worst = 0;
       } }
     return 1;

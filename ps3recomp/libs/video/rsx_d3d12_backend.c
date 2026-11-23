@@ -51,6 +51,7 @@ char* rsx_getenv(const char* name);
 #include <dwmapi.h>     /* RFOM_MOVIE_VSYNC: DwmGetCompositionTimingInfo (display refresh period) */
 #pragma comment(lib, "dwmapi.lib")
 #include "../../../project/rfom_movie_pace.h"   /* movie vsync vs VRR, shared with the vblank lock */
+#include "../../../project/port_display_sync.h"   /* RFOM_DISPLAY_SYNC: is VRR working, fixed-refresh pacing */
 
 /* We need these GUIDs — define them here to avoid uuid.lib dependency.
  * initguid.h only turns DEFINE_GUID into a definition for headers included
@@ -2593,6 +2594,7 @@ static void movie_lfc_present(void)
     s_blit_fv[bi] = v;
     s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain, (UINT)s_lfc_vs,
                                       (s_lfc_vs == 0 && s_tearing && !present_notear()) ? DXGI_PRESENT_ALLOW_TEARING : 0);
+    pds_note_presents(1);
 }
 
 /* Render thread, the timer fired: present the due repeat, or drop it when late / the movie is gone. */
@@ -2663,6 +2665,65 @@ static void present_draw_frame(ID3D12GraphicsCommandList* cl, UINT bi, u32 fi, D
     *rtv_out = rtv; *vp_out = vp;
 }
 
+/* ---- RFOM_DISPLAY_SYNC (project/port_display_sync.h): fixed-refresh pacing ---------------------------
+ * auto (default): a background thread measures whether the screen's refresh follows the presents (VRR /
+ * G-Sync / FreeSync working) and logs "[display] VRR effective: yes/no"; when it is not, the presents
+ * here switch to fixed-refresh pacing. fixed = always; vrr = never (the old behaviour, the measurement is
+ * still logged); off = vrr without the measurement. Fixed-refresh pacing:
+ *  - gameplay: the frame limiter (RFOM_FPS, project/stubs.cpp rfom_fps_pacing_set) is set to refresh / k
+ *    (/ the frame-generation multiplier) and the present to vsync, sync interval k (1 with frame
+ *    generation), so every frame stays on screen for k refreshes (pds_make_plan). RSX_VSYNC=N (N > 0)
+ *    keeps its interval. RFOM_FPS=orig: gameplay untouched (the game's own 30 fps pacing).
+ *  - movies: vsync, interval 1 (no movie LFC repeats; present_blit). */
+void rfom_fps_pacing_set(double fps);   /* project/stubs.cpp (game exe) */
+double rfom_fps_target(void);
+void rfom_fps_pacing_set_default(double fps) { (void)fps; }
+double rfom_fps_target_default(void) { return 60.0; }
+#pragma comment(linker, "/alternatename:rfom_fps_pacing_set=rfom_fps_pacing_set_default")
+#pragma comment(linker, "/alternatename:rfom_fps_target=rfom_fps_target_default")
+static HWND pds_game_hwnd(void) { return s_d3d.hwnd; }
+/* frames shown per present: DLSS-G / FSR 3 frame generation at the last present */
+static int fg_out_mult(void) { return s_fg_on ? s_fg_gen + 1 : s_f3_on ? 2 : 1; }
+
+static void pacing_apply(int movie, int* vs)
+{
+    static int cur = 0, cmult = 0, nlog = 0, said_orig = 0, said_novs = 0;
+    static LONG cgen = -1;
+    static pds_plan cp;
+    if (!pds_fixed()) {
+        if (cur) {
+            cur = 0; rfom_fps_pacing_set(0.0);
+            fprintf(stderr, "[display] fixed-refresh pacing off: frame limit back to RFOM_FPS, presents as set (RSX_VSYNC)%c", 10);
+        }
+        return;
+    }
+    if (movie) return;   /* the movie path in present_blit; the limiter keeps the gameplay plan */
+    const double tgt = rfom_fps_target();
+    if (tgt < 0.0) {   /* RFOM_FPS=orig: the game paces itself (30 fps flips); no refresh / k fits that */
+        if (!said_orig++) fprintf(stderr, "[display] fixed-refresh pacing: not with RFOM_FPS=orig (the game's own 30 fps pacing); movies only%c", 10);
+        return;
+    }
+    const int mult = fg_out_mult();
+    const double hz = pds_hz();
+    if (!(hz > 1.0)) return;
+    if (!cur || mult != cmult || pds_gen() != cgen) {
+        pds_plan p;
+        pds_make_plan(hz, mult, pds_max_real(tgt), 30.0, &p);
+        cgen = pds_gen(); cmult = mult;
+        if (!cur || !pds_plan_same(&p, &cp)) {
+            rfom_fps_pacing_set(p.limiter);
+            if (nlog < 16) {
+                char b[192]; pds_plan_str(&p, b, sizeof b); nlog++;
+                fprintf(stderr, "[display] fixed-refresh pacing: %s%s%c", b, *vs ? " -- RSX_VSYNC keeps its interval" : "", 10);
+            }
+        }
+        cp = p; cur = 1;
+    }
+    if (*vs == 0) *vs = cp.sync;
+    if (mult > 1 && s_fg_on && !s_fg_vs_ok && !said_novs++)
+        fprintf(stderr, "[display] fixed-refresh pacing: DLSS-G can't present with vsync on this system -- generated frames may still judder%c", 10);
+}
+
 static void present_blit(int vs)
 {
     const u32 fi = s_d3d.frame_index;
@@ -2693,8 +2754,10 @@ static void present_blit(int vs)
      * RFOM_MOVIE_VSYNC=0 on such a display) each movie frame is then presented
      * more than once (RFOM_MOVIE_LFC, movie_lfc_after_present). */
     int movie = 0;
-    { static int mv = -2, auto_mv = 1, said = -1, said_n = 0; static ULONGLONG last_q = 0;
+    { static int started = 0; if (!started) { started = 1; pds_start("RFOM_DISPLAY_SYNC", pds_game_hwnd); } }
+    { static int mv = -2, mv_env = 0, auto_mv = 1, said = -1, said_n = 0; static ULONGLONG last_q = 0;
       if (mv == -2) { const char* e = getenv("RFOM_MOVIE_VSYNC"); const char* f = getenv("RFOM_FPS");
+                      mv_env = e != NULL;
                       if (e) { mv = atoi(e); if (mv < 0) mv = 0; }   /* set (even empty) = explicit; 0 / empty / negative = off */
                       else mv = (f && !_stricmp(f, "vrr")) ? 0 : -1;
                       if (mv > 4) mv = 4; }
@@ -2710,10 +2773,18 @@ static void present_blit(int vs)
               auto_mv = rfom_movie_vsync_default(s_movie_per_us, s_tearing && !present_notear());
           }
           const double per_us = s_movie_per_us;
-          const int iv = mv < 0 ? auto_mv : mv;   /* default: follow the display */
-          if (mv && iv != said && said_n < 16) {
+          /* fixed-refresh pacing (RFOM_DISPLAY_SYNC): no VRR to follow the movie, so vsync, interval 1 -- the
+           * VRR path (tearing + LFC repeats) would show the frames for uneven refresh counts; also with
+           * RFOM_FPS=vrr. An explicit RFOM_MOVIE_VSYNC still wins. */
+          const int fixed = pds_fixed() && (mv < 0 || (mv == 0 && !mv_env));
+          const int iv = fixed ? 1 : mv < 0 ? auto_mv : mv;   /* default: follow the display */
+          if ((mv || fixed) && iv != said && said_n < 16) {
               said = iv; said_n++;
-              if (mv > 0)
+              if (fixed)
+                  fprintf(stderr, "[D3D12] movie: vsync present, interval 1 (fixed-refresh pacing: display %.2f Hz without working VRR%s)%c",
+                          per_us > 0.0 ? 1e6 / per_us : 0.0,
+                          per_us > 0.0 && !rfom_movie_lock_k(per_us) ? "; 30 fps can't divide it evenly, this is the least judder" : "", 10);
+              else if (mv > 0)
                   fprintf(stderr, "[D3D12] movie: vsync present, interval %d (RFOM_MOVIE_VSYNC=%d)%c", mv, mv, 10);
               else if (iv)
                   fprintf(stderr, "[D3D12] movie: vsync present, interval 1 (display %.2f Hz, %s; RFOM_MOVIE_VSYNC=0 = no vsync)%c",
@@ -2726,8 +2797,9 @@ static void present_blit(int vs)
                                   "and videos tear, set RFOM_MOVIE_VSYNC=1%c",
                           1e6 / per_us, 10);
           }
-          if (mv) vs = iv;
+          if (mv || fixed) vs = iv;
       } }
+    if (!movie) pacing_apply(0, &vs);
     if (s_sc_wait) WaitForSingleObjectEx(s_sc_wait, 100, TRUE);   /* RFOM_REFLEX: at most one frame queued */
     if (InterlockedExchange(&s_sc_resize, 0)) sc_resize();
     const UINT bi = s_d3d.swap_chain->lpVtbl->GetCurrentBackBufferIndex(s_d3d.swap_chain);
@@ -2824,8 +2896,8 @@ static void present_blit(int vs)
      * late frames instead, like mailbox). Default: tearing allowed, which is also
      * what lets G-Sync / FreeSync follow the frame rate in a borderless window. */
     { const int nt = present_notear();
-      static int said = 0;
-      if (!said) { said = 1;
+      static int said = 0, said_vs = -1;
+      if (said < 8 && vs != said_vs) { said++; said_vs = vs;   /* again when fixed-refresh pacing changes it */
                     fprintf(stderr, "[D3D12] present: %s%c", vs ? "vsync" : (nt || !s_tearing) ? "no vsync, no tearing" : "no vsync, tearing allowed (VRR)", 10); }
       RFX_MARK(RFX_PRESENT_START);
       const double _gp0 = gpt_on() ? gpt_now_ms() : 0.0;
@@ -2835,6 +2907,7 @@ static void present_blit(int vs)
       if (s_fgd_on) { LARGE_INTEGER t1; QueryPerformanceCounter(&t1); fg_diag_frame(tq.QuadPart, t1.QuadPart); }   /* RFOM_FG_DIAG */
       if (_gp0 > 0.0) s_gpt_cpu_sc += gpt_now_ms() - _gp0;
       port_ft_present();   /* frame-time recorder (project/port_frametime.h) */
+      pds_note_presents(fg_out_mult());   /* VRR detection: frames this present shows */
       RFX_MARK(RFX_PRESENT_END);
       movie_lfc_after_present(movie, vs, fi, tq.QuadPart); }
     s_vbb_index = (s_vbb_index + 1) % FRAME_COUNT;
