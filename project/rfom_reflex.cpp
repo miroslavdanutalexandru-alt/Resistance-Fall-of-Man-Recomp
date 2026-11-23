@@ -61,6 +61,9 @@ extern volatile int g_pc_reflex_want;   // RFOM_REFLEX after PORT_LATENCY (0 off
 extern void (*volatile g_pc_fg_marker)(int type, unsigned long long id);
 extern void (*volatile g_pc_fg_sleep)(unsigned long long id);
 extern int (*volatile g_pc_fg_latency)(double* total_ms, double* render_ms, double* gpu_ms);
+// rsx_dlssg.inc, RFOM_FG_DIAG: the sleep below is timed while g_pc_fg_diag is set
+extern volatile int g_pc_fg_diag;
+extern volatile long long g_pc_fg_sleep_us;
 // cellPad.c: port-0 cellPadGetData tick (shared with the key-prompt hot-swap, stubs.cpp)
 void rfom_pad_tick_install(void);
 }
@@ -276,10 +279,16 @@ void rfom_reflex_sim_start(void)
 #endif
     if (!s_mode) return;
     const unsigned long long id = s_sim.load(std::memory_order_relaxed) + 1;
+    LARGE_INTEGER t0 = {}, t1, qf;
+    if (g_pc_fg_diag) QueryPerformanceCounter(&t0);
     if (s_fg) { if (g_pc_fg_sleep) g_pc_fg_sleep(id); }
 #if RFOM_HAVE_NVAPI
     else NvAPI_D3D_Sleep(s_dev);
 #endif
+    if (g_pc_fg_diag && t0.QuadPart) {   // RFOM_FG_DIAG: Reflex sleep time, read (and cleared) by the next present row
+        QueryPerformanceCounter(&t1); QueryPerformanceFrequency(&qf);
+        InterlockedExchangeAdd64(&g_pc_fg_sleep_us, (t1.QuadPart - t0.QuadPart) * 1000000LL / qf.QuadPart);
+    }
     s_sim.store(id, std::memory_order_relaxed);
     s_input_done.store(0, std::memory_order_relaxed);
     marker(SIMULATION_START, id);

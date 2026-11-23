@@ -747,7 +747,7 @@ static void fsr_record_impl(D3D12DrawRecord* dr, int vs_idx, char* dst, const ch
                     rfom_nn_common_feed(&s_fsr_common[vs_idx], fr, inst);
                 }
                 if (bd2 < 3.0e38f && rfom_nn_ambiguous_c(bd, bd2, cshared, ratio)) {
-                  if (common) s_fsr_st_common++;
+                  if (common) { s_fsr_st_common++; s_fgd_common++; }
                   else {
                     static int keep = -1;
                     if (keep < 0) { keep = dlss_env_i("RSX_DLSS_AMBIG_KEEP", 0, 0, 1);
@@ -2329,9 +2329,11 @@ static int cf_init(void)
  * static instance seen), 3 no record data. */
 static int cam_solve_core(u32 fr, u32 n, double (*Ms)[16], const u32* pg, double M[16], int* cut);
 static u32 s_cf_rskip, s_cf_rout;   /* RFOM_DLSS_CAM_REP: candidates left out / programs left out (camera/600) */
+static float s_cf_dsp = -1.0f, s_cf_dmo = -1.0f;   /* RFOM_FG_DIAG: medoid spread / motion of the last solve (-1 = n/a) */
 static int cam_solve(u32 fr, double M[16], float j[2], int* cut)
 {
     *cut = 0;
+    s_cf_dsp = s_cf_dmo = -1.0f;
     const CamFrame* cf = &s_cam[fr % FSR_RING];
     if (cf->tag != fr) return 3;
     MemoryBarrier();
@@ -2415,6 +2417,7 @@ static int cam_solve_core(u32 fr, u32 n, double (*Ms)[16], const u32* pg, double
             if (dlss_cam_med()) {
                 const double rel = dlss_cam_med_rel();
                 const int m = vpcpu_medoid((const double (*)[16])Ms, (int)n, rel > 0.0 ? 0.05 : 0.02, rel > 0.0 ? rel : 1.0 / 3.0, &sp, &mo);
+                s_cf_dsp = (float)sp; s_cf_dmo = mo > 1e8 ? -1.0f : (float)mo;
                 if (m >= 0) {
                     memcpy(M, Ms[m], sizeof Ms[0]); s_cf_med++;
                     if (rel > 0.0 && dlss_cut_on() && vpcpu_is_cut(M, 1.0)) *cut = 1;
@@ -2540,6 +2543,12 @@ static void fsr_dispatch(void)
                        j[0] = 2.0f * jx0 / ((float)w * uf); j[1] = -2.0f * jy0 / ((float)h * uf); }
         s_cf_st[cs]++;
         if (cam_cut) s_cf_cut++;
+        if (s_fgd_on) {   /* RFOM_FG_DIAG: camera state of this frame; motion of the camera actually used */
+            static const double I[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
+            s_fgdf.cam = cs == 1 ? 'S' : cs == 2 ? (hM ? 'H' : 'U') : cs == 0 ? 'N' : 'R';
+            s_fgdf.sp = s_cf_dsp; s_fgdf.mo = s_cf_dmo;
+            if (fg_has_M) { const double d = vpcpu_mdist(fg_M, I); s_fgdf.mo = d > 1e8 ? -1.0f : (float)d; }
+        }
         cam_fill(rw, rh, (float)w * uf, (float)h * uf, fg_has_M ? fg_M : NULL, j[0], j[1]);
     }
     const D3D12_RESOURCE_STATES rd = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
@@ -2574,6 +2583,7 @@ static void fsr_dispatch(void)
     dd.frameTimeDelta = dt;
     dd.preExposure = 1.0f;
     dd.reset = (s_fsr_last_frame == 0 || s_fsr_frame_r != s_fsr_last_frame + 1u) || cam_cut;   /* RFOM_DLSS_CUT: camera cut */
+    unsigned fgd_why = 0;   /* RFOM_FG_DIAG: PORT_DLSS_RESET_* reasons */
     { /* PORT_DLSS_RESET_HITCH_MS (gap > N ms) / PORT_DLSS_RESET_CUTS (render or output size change); both 0 = unchanged */
       static int rq = -1; static pdq_reset_cfg rqc; static u32 prs[4]; static unsigned nlog; static uint32_t pgen;
       if (rq < 0) { rqc.cuts = pdq_env_int("PORT_DLSS_RESET_CUTS", 0); rqc.hitch_ms = pdq_env_float("PORT_DLSS_RESET_HITCH_MS", 0.0f);
@@ -2590,7 +2600,13 @@ static void fsr_dispatch(void)
               fprintf(stderr, "[DLSS] history reset:%s%s (frame gap %.0f ms, %ux%u -> %ux%u)%c", (why & PDQ_RESET_HITCH) ? " hitch" : "",
                       (why & PDQ_RESET_RESOLUTION) ? " resolution" : "", dt_raw, rw, rh, w, h, 10);
           if (why) dd.reset = true;
+          fgd_why = why;
       } }
+    if (s_fgd_on) {
+        s_fgdf.scene = 1; s_fgdf.up = s_fsr_frame_r;
+        s_fgdf.reset |= (u8)(((s_fsr_last_frame == 0 || s_fsr_frame_r != s_fsr_last_frame + 1u) ? FGD_R_GAP : 0) | (cam_cut ? FGD_R_CUT : 0) |
+                             ((fgd_why & PDQ_RESET_HITCH) ? FGD_R_HITCH : 0) | ((fgd_why & PDQ_RESET_RESOLUTION) ? FGD_R_RES : 0));
+    }
     fsr_camera(&dd.cameraNear, &dd.cameraFar, &dd.cameraFovAngleVertical);
     dd.viewSpaceToMetersFactor = 1.0f;
     { const char* e = getenv("RSX_FSR_LINEAR"); dd.flags = (e && atoi(e)) ? 0u : FFX_UPSCALE_FLAG_NON_LINEAR_COLOR_SRGB; }

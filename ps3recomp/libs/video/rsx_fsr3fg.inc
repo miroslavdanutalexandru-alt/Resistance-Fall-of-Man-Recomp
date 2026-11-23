@@ -417,6 +417,12 @@ static void f3_present(const D3D12_VIEWPORT* vp, int split, int* vs)
     const int sp = on && split && f3_heaps();
     if (!s_fgh.tagged) s_f3_ring[i].reset = 1;
     if (sp != s_f3_prev_split || (on && !s_f3_on)) s_f3_ring[i].reset = 1;
+    if (s_fgd_on) {   /* RFOM_FG_DIAG */
+        s_fgdf.on = (u8)on; s_fgdf.n = (u8)(on ? 2 : 1);
+        s_fgdf.reset |= (u8)((!s_fgh.tagged ? FGD_R_UNTAG : 0) | (sp != s_f3_prev_split ? FGD_R_SPLIT : 0) | (on && !s_f3_on ? FGD_R_RESUME : 0));
+        if (!on) s_fgdf.off |= (u8)((!s_fgh.tagged ? FGD_W_INPUTS : 0) | (!s_f3_ctx ? FGD_W_NOCTX : 0) | (!s_app_active ? FGD_W_BG : 0) |
+                                    (IsIconic(s_d3d.hwnd) ? FGD_W_MIN : 0) | (ui_on && !split ? FGD_W_HUD : 0) | (want ? FGD_W_WARM : 0));
+    }
     s_f3_ring[i].split = sp; s_f3_ring[i].hsc = sp ? s_fg_hsc : NULL; s_f3_ring[i].w = s_sc_w; s_f3_ring[i].h = s_sc_h;
     s_f3_prev_split = sp;
     if (on != s_f3_on) {

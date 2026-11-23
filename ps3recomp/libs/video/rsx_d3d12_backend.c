@@ -1644,8 +1644,10 @@ static void d3_winpos_save(HWND hwnd)
     pcx_winpos_format(&p, line, sizeof line);
     if ((f = fopen("window_pos.txt", "w")) != NULL) { fputs(line, f); fclose(f); }
 }
+static void fg_diag_key(UINT msg, WPARAM wp, LPARAM lp);   /* rsx_dlssg.inc, RFOM_FG_DIAG marker key */
 static LRESULT CALLBACK d3d12_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
+    fg_diag_key(msg, wp, lp);
     switch (msg) {
     case WM_SIZE:
         InterlockedExchange(&s_sc_resize, 1);   /* the render thread resizes the swap chain */
@@ -2830,6 +2832,7 @@ static void present_blit(int vs)
       LARGE_INTEGER tq; QueryPerformanceCounter(&tq);
       s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain, (UINT)vs,
                                         (vs == 0 && s_tearing && !nt) ? DXGI_PRESENT_ALLOW_TEARING : 0);
+      if (s_fgd_on) { LARGE_INTEGER t1; QueryPerformanceCounter(&t1); fg_diag_frame(tq.QuadPart, t1.QuadPart); }   /* RFOM_FG_DIAG */
       if (_gp0 > 0.0) s_gpt_cpu_sc += gpt_now_ms() - _gp0;
       port_ft_present();   /* frame-time recorder (project/port_frametime.h) */
       RFX_MARK(RFX_PRESENT_END);
