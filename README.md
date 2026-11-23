@@ -264,7 +264,7 @@ The options are sorted into pages (the same pages as the Resistance 2 / 3 launch
 | 4 | Controls | Key bindings, Mouse, Controller, Gyro, Controller buttons |
 | 5 | Audio | Sound (speaker layout, audio buffer), In the background |
 | 6 | Interface & Notifications | Notifications (achievement pop-ups), Movies (hold to skip, skip hint), Overlays (F3 overlay and its corner), Photo mode and Discord |
-| 7 | Advanced | Start-up and quitting, Gameplay (gore, adaptive difficulty), Mods and textures, Saves (location, backups, **Open save folder**), Updates |
+| 7 | Advanced | Start-up and quitting, Gameplay (gore, adaptive difficulty), Cheats (single player), Mods and textures, Saves (location, backups, **Open save folder**), Updates |
 | 8 | Achievements | Unofficial fan-made achievements read from your save (see *Achievements* under *Trophies*) |
 | 9 | Saves & tools | Save backups, the benchmark |
 | 10 | About | Version, credits and licences, the key list, folder buttons, the project page, **Report a problem**, **Reset all to defaults** |
@@ -358,6 +358,7 @@ Button: **Rebuild shader cache** (asks first).
 | Game language | **Windows language**, English, English (UK), French, German, Italian, Spanish, Dutch, Portuguese, Russian, Polish, Finnish, Swedish, Danish, Norwegian, Japanese, Korean | `PS3_LANG=en\|en-gb\|fr\|de\|...` | The language the game is told the console uses (text and speech your copy has; others fall back to English). Also in F9; takes effect at the next start. |
 | Blood and gore | **Full**, Console region setting | `RFOM_GORE=0` | |
 | Adaptive difficulty | **On (PS3 original)**, Off | `RFOM_DYNDIFF=0` | |
+| Cheats (single player): God mode, Infinite ammo, Infinite grenades, Cheat hotkeys | **Off**, On | `PORT_CHEAT_GODMODE=1`, `PORT_CHEAT_AMMO=1`, `PORT_CHEAT_GRENADES=1`, `PORT_CHEAT_KEYS=1` | Only your hero (and the other local split-screen player); enemies are untouched. Also in F9 (live). With Cheat hotkeys on, **Ctrl+F1** toggles God mode and **Ctrl+F2** ammo and grenades (ignored while F1 / F2 is bound in controls.txt). Once a cheat has been on, trophies are off until the game is restarted; a benchmark run never cheats. Scripted deaths (falls, instant kills) still happen. |
 | Mods folder | **Off**, On | `RFOM_MODS=0\|1\|<folder>` | See *Mods*. |
 | Texture packs | **Off**, Load mods\textures, Dump to texdump | `RSX_TEXPACK=0\|1\|<folder>`, `RSX_TEXDUMP=0\|1\|<folder>` | See *Texture packs*. |
 | HD UI pack | **Off**, On (mods\hd_ui) | `RSX_HD_UI=1\|<folder>` | Experimental. See *HD UI pack*. |

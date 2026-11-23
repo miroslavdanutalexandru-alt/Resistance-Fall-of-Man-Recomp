@@ -212,6 +212,7 @@ add_executable(${PROJECT_NAME}
     rfom_mods.cpp     # RFOM_MODS: mods folder (file overrides)
     rfom_pcfeat.cpp   # F3 performance overlay, toasts
     rfom_trophies.cpp # trophy unlock toasts / Saved Games record (sceNpTrophy hook)
+    rfom_cheats.cpp   # optional single-player cheats (God mode, infinite ammo / grenades)
     rfom_pcextra.cpp  # PC extras: More PC Options, photo mode, movie skip, benchmark, Discord
     rfom_menurows.cpp # R1_MENU_ROWS: Options > PC SETTINGS (pause menu) / PC rows in the game's Audio / Video options (Lua chunk swaps)
     rfom_pctext.cpp   # RFOM_PC_TEXT: console wording -> PC wording

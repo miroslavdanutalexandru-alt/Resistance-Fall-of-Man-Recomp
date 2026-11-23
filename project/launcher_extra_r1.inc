@@ -175,6 +175,21 @@ static void lx_register()
            "more you die there. Pros of On: the original experience, hard spots ease up. Cons: the difficulty you "
            "picked is not what you get; Off keeps it fixed.", "RFOM_DYNDIFF",
            { {"On  (PS3 original)", ""}, {"Off  (fixed difficulty)", "0"} });
+    // rfom_cheats.cpp: optional single-player cheats (also F9 rows; never in a benchmark run)
+    lx_add(6, "cheat_god", "God mode",
+           "Single-player cheat: your health stays full and enemy hits do no damage. Only you (and the other local "
+           "split-screen player); enemies are not affected. Trophies are off until the game is restarted.",
+           "PORT_CHEAT_GODMODE", { {"Off", ""}, {"On", "1"} });
+    lx_add(6, "cheat_ammo", "Infinite ammo",
+           "Single-player cheat: your weapons' magazines never run down. Trophies are off until the game is restarted.",
+           "PORT_CHEAT_AMMO", { {"Off", ""}, {"On", "1"} });
+    lx_add(6, "cheat_grenades", "Infinite grenades",
+           "Single-player cheat: throwing a grenade does not use it up. Trophies are off until the game is restarted.",
+           "PORT_CHEAT_GRENADES", { {"Off", ""}, {"On", "1"} });
+    lx_add(6, "cheat_keys", "Cheat hotkeys",
+           "In the game, Ctrl+F1 toggles God mode and Ctrl+F2 Infinite ammo and grenades. Off: only this page and "
+           "the F9 menu change them.",
+           "PORT_CHEAT_KEYS", { {"Off", ""}, {"On", "1"} });
     // "MORE MOUSE OPTIONS" options
     lx_add(7, "aimassist", "Aim assist",
            "The game's aim assist: your aim slows down when it passes over an enemy and is pulled toward it. Auto turns "
