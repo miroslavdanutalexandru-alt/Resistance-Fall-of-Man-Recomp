@@ -1,7 +1,7 @@
 /* port_display_sync.h -- "Display sync": is VRR (G-Sync / FreeSync) really following the game's
  * presents, and if not, pace so every shown frame stays on screen for the same number of refreshes.
  * Shared by the Resistance ports (R1: ps3recomp/libs/video/rsx_d3d12_backend.c; R2/R3: the RPCS3 Vulkan
- * renderer, VKR2DisplaySync.cpp) -- keep the copies identical. Header-only; include it in ONE source file
+ * renderer, rpcs3/Emu/RSX/VK/VKPresent.cpp) -- keep the copies identical. Header-only; include it in ONE source file
  * (the Win32 part keeps its state in statics). Tests: project/tests/display_sync_test.c.
  *
  * Why: a 120 frames/s stream (60 rendered + 60 generated) or a 60 presents/s movie on a 165 Hz screen
