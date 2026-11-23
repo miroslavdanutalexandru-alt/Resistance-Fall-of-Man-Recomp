@@ -18,8 +18,12 @@
  * windows: >= 70% of the vblank gaps within 6% of the nominal period -> FIXED ("VRR effective: no");
  * <= 20% there and the median gap >= 1.12 periods -> VRR ("yes"). It can only tell while the game shows
  * fewer frames than the refresh rate (< 90% of it): at or above, both look the same (SATURATED, "can't
- * tell"). Fewer than 20 frames/s (paused, loading) = IDLE. The verdict needs 2 matching windows in a
- * row before it changes the pacing (auto mode), and at most PDS_MAX_SWITCHES changes per run.
+ * tell"). Fewer than 20 frames/s (paused, loading) = IDLE. Windows while the game window is not in the
+ * foreground or minimized (the desktop composes the screen then, which turns VRR off) don't count, nor
+ * the window after one (pds_thread). Auto mode switches to fixed-refresh pacing after 3 FIXED windows in
+ * a row and back after 2 VRR windows in a row; any other verdict between breaks the run (pds_decide), so a
+ * VRR user near the refresh rate (SATURATED) is not switched by stray FIXED windows. At most
+ * PDS_MAX_SWITCHES changes per run.
  *
  * Pacing on a fixed refresh (pds_make_plan): the shown frame rate becomes refresh / k for the smallest
  * k at which the rendered rate (shown / frame-generation multiplier) is at most the game's limit
@@ -33,6 +37,8 @@
  *   120 Hz: no FG 60 (interval 2);     FG 2x 60 -> 120.
  *   240 Hz: no FG 60 (interval 4);     FG 2x 60 -> 120 (every 2nd refresh).
  *    60 Hz: no FG 60 (interval 1);     FG 2x 30 -> 60.
+ * No plan (no pacing, the frame limit stays the player's) when even k = 1 would render fewer than 30
+ * frames/s, where the games slow down (60 Hz + FG 3x = 20, 50 Hz + FG 2x = 25).
  * Movies (30 fps): vsync interval 1 -- even on 60/120/240 Hz; on 144 / 165 Hz the pattern alternates
  * 5/5/5/5/4 resp. 5/6 refreshes, the least judder a fixed 144 / 165 Hz screen can show for 29.97 fps. */
 #ifndef PORT_DISPLAY_SYNC_H
@@ -47,6 +53,8 @@ enum { PDS_V_UNKNOWN = 0, PDS_V_VRR = 1, PDS_V_FIXED = 2, PDS_V_SATURATED = 3, P
 enum { PDS_MODE_AUTO = 0, PDS_MODE_VRR = 1, PDS_MODE_FIXED = 2, PDS_MODE_OFF = 3 };
 #define PDS_WINDOW_MS 2000.0
 #define PDS_MAX_SWITCHES 6
+#define PDS_RUN_TO_FIXED 3
+#define PDS_RUN_TO_VRR 2
 #define PDS_MAX_IV 2048
 
 static inline const char* pds_verdict_name(int v)
@@ -99,8 +107,9 @@ static inline int pds_window_verdict(const float* iv, int n, double win_ms, doub
     return PDS_V_UNKNOWN;
 }
 
-/* Hysteresis: a pacing change needs 2 VRR / FIXED windows in a row (other verdicts in between don't
- * break the run), at most PDS_MAX_SWITCHES changes. Returns 1 when ->fixed changed. */
+/* Hysteresis: to fixed-refresh pacing after PDS_RUN_TO_FIXED FIXED windows in a row, back after
+ * PDS_RUN_TO_VRR VRR windows in a row; any other verdict (SATURATED, IDLE, UNKNOWN: not foreground...)
+ * breaks the run. At most PDS_MAX_SWITCHES changes. Returns 1 when ->fixed changed. */
 typedef struct { int mode, fixed, last, streak, switches; } pds_decider;
 static inline void pds_decider_init(pds_decider* d, int mode)
 {
@@ -111,12 +120,13 @@ static inline void pds_decider_init(pds_decider* d, int mode)
 static inline int pds_decide(pds_decider* d, int verdict)
 {
     if (d->mode != PDS_MODE_AUTO) return 0;
-    if (verdict != PDS_V_VRR && verdict != PDS_V_FIXED) return 0;
-    d->streak = verdict == d->last ? d->streak + 1 : 1;
+    const int counts = verdict == PDS_V_VRR || verdict == PDS_V_FIXED;
+    d->streak = !counts ? 0 : verdict == d->last ? d->streak + 1 : 1;
     d->last = verdict;
+    if (!counts) return 0;
     const int want = verdict == PDS_V_FIXED;
-    if (d->streak >= 2 && want != d->fixed && d->switches < PDS_MAX_SWITCHES) {
-        d->fixed = want; d->switches++;
+    if (d->streak >= (want ? PDS_RUN_TO_FIXED : PDS_RUN_TO_VRR) && want != d->fixed && d->switches < PDS_MAX_SWITCHES) {
+        d->fixed = want; d->switches++; d->streak = 0;
         return 1;
     }
     return 0;
@@ -143,7 +153,8 @@ typedef struct {
 
 /* hz = refresh rate (measured), mult = frame-generation multiplier (1 = off), max_real = pds_max_real().
  * The smallest k whose rendered rate is <= max_real; if that falls below min_real (where the game
- * slows down), one k less when that exists. */
+ * slows down), one k less when that exists. Still below min_real (k = 1: hz / mult < min_real, e.g.
+ * 60 Hz + FG 3x) -> no plan: k = 0 (hz and mult filled in for the log), the caller doesn't pace. */
 static inline void pds_make_plan(double hz, int mult, double max_real, double min_real, pds_plan* p)
 {
     memset(p, 0, sizeof *p);
@@ -152,7 +163,9 @@ static inline void pds_make_plan(double hz, int mult, double max_real, double mi
     int k = 1;
     while (k < 16 && hz / k / mult > max_real + 0.01) k++;
     if (k > 1 && hz / k / mult < min_real - 0.01) k--;
-    p->k = k; p->mult = mult; p->hz = hz;
+    p->mult = mult; p->hz = hz;
+    if (hz / k / mult < min_real - 0.01) return;
+    p->k = k;
     p->sync = mult > 1 ? 1 : k;
     p->shown = hz / k;
     p->real = p->shown / mult;
@@ -171,7 +184,10 @@ static inline int pds_plan_same(const pds_plan* a, const pds_plan* b)
  * each frame 2 refreshes (vsync interval 1)" */
 static inline void pds_plan_str(const pds_plan* p, char* out, size_t n)
 {
-    if (p->mult > 1)
+    if (p->k < 1)
+        snprintf(out, n, "%.2f Hz, frame generation %dx: even every refresh would be only %.2f fps rendered, too slow for "
+                         "the game -- not paced (frame limit and vsync as set)", p->hz, p->mult, p->mult > 0 ? p->hz / p->mult : 0.0);
+    else if (p->mult > 1)
         snprintf(out, n, "%.2f Hz, frame generation %dx: %.2f fps rendered -> %.2f shown, each frame %d refresh%s (vsync interval %d)",
                  p->hz, p->mult, p->real, p->shown, p->k, p->k == 1 ? "" : "es", p->sync);
     else
@@ -263,7 +279,7 @@ static DWORD WINAPI pds_thread(LPVOID unused)
     const double qms = 1000.0 / (double)qf.QuadPart;
     HMONITOR mon = NULL;
     pds_kmt_open_t ad; memset(&ad, 0, sizeof ad);
-    int have = 0, ofails = 0, wfails = 0, n = 0, warm = 0, said_unknown = 0, last_logged = -1;
+    int have = 0, ofails = 0, wfails = 0, n = 0, warm = 0, said_unknown = 0, last_logged = -1, away = 0, said_away = 0;
     LONGLONG prev = 0, w0 = 0; LONG p0 = 0;
     for (;;) {
         HWND h = g_pds.hwnd ? g_pds.hwnd() : NULL;
@@ -295,6 +311,12 @@ static DWORD WINAPI pds_thread(LPVOID unused)
             Sleep(20); have = 0; continue;   /* reopen (display reconfigured) */
         }
         wfails = 0;
+        if (h) {   /* minimized, or another program in front: the desktop composes the screen (no VRR) */
+            const HWND fg = GetForegroundWindow();
+            DWORD fpid = 0;
+            if (fg) GetWindowThreadProcessId(fg, &fpid);
+            if (IsIconic(h) || fpid != GetCurrentProcessId()) away = 1;
+        }
         if (prev && n < PDS_MAX_IV) iv[n++] = (float)((double)(t.QuadPart - prev) * qms);
         prev = t.QuadPart;
         g_pds.vb_qpc = t.QuadPart;
@@ -305,7 +327,9 @@ static DWORD WINAPI pds_thread(LPVOID unused)
         const double phz = (double)(p1 - p0) * 1000.0 / el;
         const double per = g_pds.hz_nominal > 0.0 ? 1000.0 / g_pds.hz_nominal : 0.0;
         double fper = 0.0;
-        const int v = warm ? PDS_V_UNKNOWN : pds_window_verdict(iv, n, el, per, phz, &fper);
+        const int v = warm || away ? PDS_V_UNKNOWN : pds_window_verdict(iv, n, el, per, phz, &fper);
+        if (away && !said_away++)
+            fprintf(stderr, "[display] the game window is minimized / not in front: those measuring windows don't count\n");
         if (!warm) {
             int near1 = 0; float med = 0.0f;
             for (int i = 0; i < n; i++) if (iv[i] >= per * 0.94 && iv[i] <= per * 1.06) near1++;
@@ -325,7 +349,7 @@ static DWORD WINAPI pds_thread(LPVOID unused)
                 else
                     fprintf(stderr, "[display] VRR effective: yes -- the refresh follows the frames (median %.2f ms between refreshes, "
                                     "%.1f frames/s, %.2f Hz max)\n", med, phz, g_pds.hz_nominal);
-            } else if (v == PDS_V_UNKNOWN && last_logged < 0 && !said_unknown && phz >= 20.0) {
+            } else if (v == PDS_V_UNKNOWN && !away && last_logged < 0 && !said_unknown && phz >= 20.0) {
                 said_unknown = 1;
                 fprintf(stderr, "[display] VRR effective: unclear so far (%d vblanks, %d at %.2f ms, median %.2f ms, %.1f frames/s)\n",
                         n, near1, per, med, phz);
@@ -333,11 +357,12 @@ static DWORD WINAPI pds_thread(LPVOID unused)
             if (pds_decide(&g_pds.dec, v)) {
                 InterlockedExchange(&g_pds.fixed, g_pds.dec.fixed);
                 InterlockedIncrement(&g_pds.gen);
-                fprintf(stderr, "[display] fixed-refresh pacing %s (%s=auto: %s)\n", g_pds.dec.fixed ? "ON" : "OFF", g_pds.env,
-                        g_pds.dec.fixed ? "VRR is not following the frames" : "VRR follows the frames again");
+                fprintf(stderr, "[display] fixed-refresh pacing %s (%s=auto: %s%s%s)\n", g_pds.dec.fixed ? "ON" : "OFF", g_pds.env,
+                        g_pds.dec.fixed ? "VRR is not following the frames; if G-Sync / FreeSync does work here, set " : "VRR follows the frames again",
+                        g_pds.dec.fixed ? g_pds.env : "", g_pds.dec.fixed ? "=vrr" : "");
             }
         }
-        warm = 0; n = 0; w0 = t.QuadPart; p0 = p1;
+        warm = away; away = 0; n = 0; w0 = t.QuadPart; p0 = p1;   /* the window after one away doesn't count either */
     }
 }
 

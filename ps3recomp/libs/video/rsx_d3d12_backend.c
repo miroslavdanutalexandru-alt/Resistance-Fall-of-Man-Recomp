@@ -2720,7 +2720,7 @@ static void pacing_apply(int movie, int* vs)
         pds_make_plan(hz, mult, pds_max_real(tgt), 30.0, &p);
         cgen = pds_gen(); cmult = mult;
         if (!cur || !pds_plan_same(&p, &cp)) {
-            rfom_fps_pacing_set(p.limiter);
+            rfom_fps_pacing_set(p.k >= 1 ? p.limiter : 0.0);   /* k = 0: too slow even at k = 1, RFOM_FPS stays */
             if (nlog < 16) {
                 char b[192]; pds_plan_str(&p, b, sizeof b); nlog++;
                 fprintf(stderr, "[display] fixed-refresh pacing: %s%s%c", b, *vs ? " -- RSX_VSYNC keeps its interval" : "", 10);
@@ -2729,7 +2729,7 @@ static void pacing_apply(int movie, int* vs)
         cp = p; cur = 1;
         s_pace_pll = p.mult > 1 && p.k >= 2;
     }
-    if (*vs == 0) *vs = cp.sync;
+    if (*vs == 0) *vs = cp.sync;   /* 0 without a plan: presents as set */
     if (mult > 1 && s_fg_on && !s_fg_vs_ok && !said_novs++)
         fprintf(stderr, "[display] fixed-refresh pacing: DLSS-G can't present with vsync on this system -- generated frames may still judder%c", 10);
 }

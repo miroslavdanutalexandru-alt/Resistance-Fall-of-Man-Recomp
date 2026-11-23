@@ -53,20 +53,31 @@ int main(void)
       CHECK(pds_window_verdict(g_iv, n, 2000.0, 1000.0 / 165.0, 120.0, NULL) == PDS_V_UNKNOWN); }
     CHECK(pds_window_verdict(g_iv, 100, 2000.0, 0.0, 120.0, NULL) == PDS_V_UNKNOWN);
 
-    /* hysteresis: 2 matching windows, other verdicts don't break the run, at most PDS_MAX_SWITCHES */
+    /* hysteresis: 3 FIXED in a row to switch on, 2 VRR in a row back; any other verdict breaks the run */
     { pds_decider d; pds_decider_init(&d, PDS_MODE_AUTO);
       CHECK(!d.fixed);
       CHECK(!pds_decide(&d, PDS_V_FIXED));
-      CHECK(!pds_decide(&d, PDS_V_SATURATED));
+      CHECK(!pds_decide(&d, PDS_V_FIXED));
+      CHECK(!pds_decide(&d, PDS_V_SATURATED));   /* broke the run */
+      CHECK(!pds_decide(&d, PDS_V_FIXED));
+      CHECK(!pds_decide(&d, PDS_V_FIXED));
       CHECK(pds_decide(&d, PDS_V_FIXED) && d.fixed);
       CHECK(!pds_decide(&d, PDS_V_FIXED));
       CHECK(!pds_decide(&d, PDS_V_VRR));
       CHECK(!pds_decide(&d, PDS_V_FIXED));   /* broke the VRR run */
+      CHECK(!pds_decide(&d, PDS_V_VRR));
+      CHECK(!pds_decide(&d, PDS_V_IDLE));    /* so does IDLE */
       CHECK(!pds_decide(&d, PDS_V_VRR) && d.fixed);
       CHECK(pds_decide(&d, PDS_V_VRR) && !d.fixed);
       int sw = 2;   /* FIXED, then VRR again */
-      for (int i = 0; i < 40; i++) sw += pds_decide(&d, (i / 2) & 1 ? PDS_V_VRR : PDS_V_FIXED);
+      for (int i = 0; i < 60; i++) sw += pds_decide(&d, (i / 3) & 1 ? PDS_V_VRR : PDS_V_FIXED);
       CHECK(sw == PDS_MAX_SWITCHES); }
+    /* a VRR user near the refresh rate (SATURATED) with stray FIXED windows (alt-tab) is never switched */
+    { pds_decider d; pds_decider_init(&d, PDS_MODE_AUTO);
+      int sw = 0;
+      for (int i = 0; i < 200; i++) sw += pds_decide(&d, i % 5 == 0 || i % 7 == 0 ? PDS_V_FIXED : i % 11 == 0 ? PDS_V_UNKNOWN : PDS_V_SATURATED);
+      for (int i = 0; i < 50; i++) sw += pds_decide(&d, i % 3 == 2 ? PDS_V_SATURATED : PDS_V_FIXED);   /* 2 in a row at most */
+      CHECK(sw == 0 && !d.fixed); }
     { pds_decider d; pds_decider_init(&d, PDS_MODE_FIXED);
       CHECK(d.fixed);
       CHECK(!pds_decide(&d, PDS_V_VRR) && !pds_decide(&d, PDS_V_VRR) && d.fixed); }
@@ -116,6 +127,14 @@ int main(void)
     CHECK(p.k == 1 && NEAR(p.real, 165.0));
     pds_make_plan(165.0, 2, pds_max_real(90.0), 30.0, &p);
     CHECK(p.k == 1 && NEAR(p.real, 82.5));
+    /* even k = 1 too slow for the game: no plan (not paced), hz / mult kept for the log */
+    pds_make_plan(60.0, 3, pds_max_real(60.0), 30.0, &p);   /* 20 fps */
+    CHECK(p.k == 0 && p.mult == 3 && NEAR(p.hz, 60.0));
+    { char b[192]; pds_plan_str(&p, b, sizeof b); CHECK(strstr(b, "not paced") != NULL); }
+    pds_make_plan(50.0, 2, pds_max_real(60.0), 30.0, &p);   /* 25 fps */
+    CHECK(p.k == 0);
+    pds_make_plan(50.0, 1, pds_max_real(30.0), 30.0, &p);   /* 50, the only even rate */
+    CHECK(p.k == 1 && NEAR(p.real, 50.0));
     /* unknown refresh: no plan */
     pds_make_plan(0.0, 1, 75.0, 30.0, &p);
     CHECK(p.k == 0);
