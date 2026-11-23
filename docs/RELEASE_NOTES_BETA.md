@@ -17,6 +17,12 @@ This is a **beta**. The campaign has been played up to Cheddar Gorge. Later leve
 - **Portable build tools:** unpacking xwin / LLVM fixed (issue #16).
 - **Split-screen co-op:** DLSS / FSR / XeSS and frame generation pause while two players are in play and the two views render natively (the upscaler assumes one camera per frame; issue #25, player 1's half black). `RFOM_SPLIT_AA=1` keeps them on. The log now records how the two views are cleared and drawn (`[coop]` lines, `RFOM_SPLIT_LOG`).
 
+### Setup
+- **Progress for every step, with time left.** Generating the game code now reports how far it is (stage by stage, function by function), and building the game shows *game code file X of N*, the file compiling right now and how long it has been at it, and a time-left estimate from how fast this PC really is. The game code files take very different times to compile, so the estimate now uses each file's measured compile time instead of counting build steps (no more "about a minute left" with a quarter of an hour to go). A *still working, last activity N s ago* note tells a slow step apart from a stuck one. One overall bar covers the whole install.
+- **Setup remembers how long each step took** (`logs\setup_timings.json`, and a summary in `logs\setup_script.log`) and uses it for the next estimates. `logs\setup.log` and the build logs can now be opened while Setup is running.
+- **Faster updates.** When an update changes the code generator, files that come out the same as before are left untouched, so the build only recompiles what really changed. This version's changes to the code generator only add progress reporting, so an install whose game code is up to date with the previous version keeps it: no generating again after this update.
+- **Add the optional upscaler / Frame Generation SDKs after installing**: run `Setup.bat -GetSdks` (or run `Setup.exe` again with the SDK box ticked). It downloads the DLSS / XeSS / Streamline / FSR 3 Frame Generation files Setup can fetch and rebuilds the port with them.
+
 ## 0.3.0-beta
 
 The first big update after the setup hotfixes: performance and stability work, tank controls, many new PC options and rendering fixes. Unzip it over your existing port folder (or use the launcher's new in-place updater next time) and run Setup; it only rebuilds what changed. Your settings, saves and game copy are kept.

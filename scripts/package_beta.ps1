@@ -150,12 +150,12 @@ if (Test-Path -LiteralPath $versionFile) {
 
 # ---------------------------------------------------------------- required files
 $required = @('README.md', 'LICENSE', 'THIRD_PARTY_NOTICES.md', 'VERSION', 'Setup.bat', 'setup.ps1', 'run.bat',
-              'docs\RELEASE_NOTES_BETA.md', 'docs\REPORTING.md', 'docs\INSTALL.md', 'tools\installer\prereqs.ps1', 'tools\installer\gamefiles.ps1',
+              'docs\RELEASE_NOTES_BETA.md', 'docs\REPORTING.md', 'docs\INSTALL.md', 'tools\installer\prereqs.ps1', 'tools\installer\gamefiles.ps1', 'tools\installer\progress.ps1',
               'tools\installer\build_installer.ps1', 'tools\installer\port.iss', 'tools\installer\port_common.iss',
               'tools\build_doctor.ps1', 'tools\fix_timestamps.ps1', 'tools\update.ps1')
 foreach ($f in $required) { if (-not (Test-Path -LiteralPath (Join-Path $Repo $f))) { Fail "$f missing" } }
 # The release zip is a git archive of HEAD: a required file that exists here but is not committed would be missing
-# from it (setup.ps1 dot-sources tools\build_doctor.ps1 and tools\installer\gamefiles.ps1).
+# from it (setup.ps1 dot-sources tools\build_doctor.ps1, tools\installer\gamefiles.ps1 and tools\installer\progress.ps1).
 $headFiles = @(& git -C $Repo -c core.quotepath=off ls-tree -r --name-only HEAD 2>$null)
 foreach ($f in $required) { if ((Test-Path -LiteralPath (Join-Path $Repo $f)) -and ($headFiles -notcontains $f.Replace('\', '/'))) { Fail "$f is not committed: the release zip (git archive of HEAD) would not have it" } }
 foreach ($f in @('docs\INSTALL.md')) { if (-not (Test-Path -LiteralPath (Join-Path $Repo $f))) { Warn "$f missing (the setup work adds it)" } }

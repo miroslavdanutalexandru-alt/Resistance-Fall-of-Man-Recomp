@@ -1,0 +1,5 @@
+# Generator stamps written by earlier Setup versions and the generator they are known to write exactly the same
+# code as ("same=<current hash>"), so updating does not generate the game code again for a change that only
+# touched how the generator reports progress or writes its files.
+# Before progress reporting (0.3.0-beta.1 and the main branch up to it):
+a6dc5e50e48c1effe858224a9cf5da8599e0b16d69c5e1144f0fd6d33d75f41f same=73c17ecaa54a0f298ecb88ee3a1956ba4246418b1be49a55163de155b60985aa
