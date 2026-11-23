@@ -92,7 +92,39 @@ void SlLog(sl::LogType type, const char* msg)
     while (n && (msg[n - 1] == '\n' || msg[n - 1] == '\r')) n--;
     if (n > sizeof b - 1) n = sizeof b - 1;
     memcpy(b, msg, n); b[n] = 0;
-    Log("Streamline %s: %s", type == sl::LogType::eError ? "error" : "warning", b);
+    // Some messages repeat every frame (RSYNC "Inconsistency detected" when the NVIDIA profile forces VSync:
+    // ~3 per frame, tens of thousands per session). Compare them without the leading [time][streamline]
+    // [level][tid][elapsed] tags; log the first, then one line per 1000 repeats or 10 s with the count.
+    const char* key = b;
+    while (*key == '[') { const char* e = strchr(key, ']'); if (!e) break; key = e + 1; }
+    struct Rep { std::string key; unsigned long long last_ms; unsigned skipped, use; };
+    static Rep reps[16];
+    static unsigned use_clock;
+    static std::mutex mu;
+    unsigned skipped = 0;
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        const unsigned long long now = GetTickCount64();
+        Rep* r = nullptr;
+        Rep* lru = &reps[0];
+        for (Rep& x : reps) {
+            if (x.use && x.key == key) { r = &x; break; }
+            if (x.use < lru->use) lru = &x;
+        }
+        if (r) {
+            r->use = ++use_clock;
+            if (r->skipped + 1 < 1000 && now - r->last_ms < 10000) { r->skipped++; return; }
+            skipped = r->skipped;
+            r->skipped = 0;
+            r->last_ms = now;
+        } else {
+            lru->key = key; lru->last_ms = now; lru->skipped = 0; lru->use = ++use_clock;
+        }
+    }
+    if (skipped)
+        Log("Streamline %s: %s (%u identical messages not logged)", type == sl::LogType::eError ? "error" : "warning", b, skipped);
+    else
+        Log("Streamline %s: %s", type == sl::LogType::eError ? "error" : "warning", b);
 }
 
 sl::FrameToken* Token(unsigned long long id)

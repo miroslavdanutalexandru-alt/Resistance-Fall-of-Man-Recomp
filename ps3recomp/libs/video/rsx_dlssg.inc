@@ -15,7 +15,9 @@
  *                     the old alpha; without the rebuild pass the old layer is used) | 0: old layer (additive
  *                     parts at alpha 0, missing from generated frames).
  *   RFOM_FG_HUDLOG    N (default 0, diagnostic): log every display-buffer draw of N frames with DLSS inputs
- *                     ("[FG-HUD]": HUD or why not, run state, blend / depth state, textures).
+ *                     ("[FG-HUD]": HUD or why not, run state, blend / depth state, textures), starting when frame
+ *                     generation is on, or at upscaler frame RFOM_FG_HUDLOG_AT. Ctrl+Shift+F2 logs N (3) frames
+ *                     again at any time, plus the scene's per-draw motion matching ("[FG-MV]").
  *   RFOM_FG_UNSURE_PAUSE 1 (default): with the HUD split on, 3 consecutive frames whose HUD could not be
  *                     separated pause generation (for at least 15 frames) | 0: generate anyway.
  *   RFOM_DLSSG_MENU_DETECT unset: DLSS-G menu detection off while the HUD split runs, on otherwise (HDR,
