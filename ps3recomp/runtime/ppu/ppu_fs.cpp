@@ -142,12 +142,14 @@ static void guest_strcpy(char* dst, uint32_t gaddr, size_t cap)
 }
 
 /* Defined in runtime/syscalls/sys_fs.c -- shared by all three path
- * translators. (extern "C" is ill-formed at block scope.) */
-extern "C" void ps3_vfs_ps3game_fallback(char* path, size_t cap);
+ * translators. (extern "C" is ill-formed at block scope.) reading: the caller
+ * only reads the path, so a mods override may stand in for it. */
+extern "C" void ps3_vfs_ps3game_fallback_ex(char* path, size_t cap, int reading);
 
 /* Translate a guest path to a host path under ppu_vfs_root. Known PS3 mount
- * prefixes are stripped; the rest is appended to the root. */
-static void host_path(char* out, size_t cap, const char* guest)
+ * prefixes are stripped; the rest is appended to the root. reading: see above
+ * -- false for anything that writes, creates, truncates or deletes. */
+static void host_path(char* out, size_t cap, const char* guest, bool reading)
 {
     const char* rel = guest;
     /* /dev_hdd0 overlays the installed game-update dir (a disc title patched to
@@ -218,7 +220,7 @@ static void host_path(char* out, size_t cap, const char* guest)
     if (rel == guest && guest[0] == '/') rel = guest + 1;   /* strip leading '/' */
     snprintf(out, cap, "%s/%s", ppu_vfs_root, rel);
     for (char* p = out; *p; p++) if (*p == '\\') *p = '/';
-    ps3_vfs_ps3game_fallback(out, cap);
+    ps3_vfs_ps3game_fallback_ex(out, cap, reading ? 1 : 0);
 }
 
 /* ---- fd / dir handle table ----
@@ -323,7 +325,11 @@ static void cellFsOpen(ppu_context* ctx)
     guest_strcpy(gpath, (uint32_t)ctx->gpr[3], sizeof gpath);
     uint32_t flags  = (uint32_t)ctx->gpr[4];
     uint32_t fd_ptr = (uint32_t)ctx->gpr[5];
-    host_path(hpath, sizeof hpath, gpath);
+    /* only a plain read-only open may be served by a mods override: the game's
+     * own copies (disc -> /dev_hdd0 data install) must land in the real file */
+    const bool read_only = (flags & 0x3) == CELL_FS_O_RDONLY &&
+        !(flags & (CELL_FS_O_CREAT | CELL_FS_O_EXCL | CELL_FS_O_TRUNC | CELL_FS_O_APPEND));
+    host_path(hpath, sizeof hpath, gpath, read_only);
 
     /* NPDRM: see the note in sys_fs.c -- an EDAT is decrypted once into a cache
      * file and that is opened in its place. */
@@ -431,7 +437,7 @@ static void cellFsSdataOpen(ppu_context* ctx)
     char gpath[1024], hpath[1100];
     guest_strcpy(gpath, (uint32_t)ctx->gpr[3], sizeof gpath);
     uint32_t fd_ptr = (uint32_t)ctx->gpr[5];
-    host_path(hpath, sizeof hpath, gpath);
+    host_path(hpath, sizeof hpath, gpath, true);   /* opened O_RDONLY below */
 
     /* Same NPDRM step cellFsOpen does: an encrypted container is decrypted once
      * into a cache file and that is opened in its place. This used to be a
@@ -730,7 +736,7 @@ static void cellFsStat(ppu_context* ctx)
     char gpath[1024], hpath[1100];
     guest_strcpy(gpath, (uint32_t)ctx->gpr[3], sizeof gpath);
     uint32_t sb = (uint32_t)ctx->gpr[4];
-    host_path(hpath, sizeof hpath, gpath);
+    host_path(hpath, sizeof hpath, gpath, true);
     fs_stat64_t st;
     if (FS_STAT64(hpath, &st) != 0) {
         if (FS_DBG_ENV("PS3_FSLOG")) fprintf(stderr, "[fs] stat '%s' -> ENOENT\n", gpath);
@@ -779,7 +785,7 @@ static void cellFsOpendir(ppu_context* ctx)
     char gpath[1024], hpath[1100];
     guest_strcpy(gpath, (uint32_t)ctx->gpr[3], sizeof gpath);
     uint32_t fd_ptr = (uint32_t)ctx->gpr[4];
-    host_path(hpath, sizeof hpath, gpath);
+    host_path(hpath, sizeof hpath, gpath, true);
     DIR* d = opendir(hpath);
     if (FS_DBG_ENV("PS3_FSLOG")) fprintf(stderr, "[fs] opendir '%s' -> %s\n", gpath, d ? "OK" : "ENOENT");
     if (!d) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOENT; return; }
@@ -907,7 +913,7 @@ static void cellFsMkdir(ppu_context* ctx)
 {
     char gpath[1024], hpath[1100];
     guest_strcpy(gpath, (uint32_t)ctx->gpr[3], sizeof gpath);
-    host_path(hpath, sizeof hpath, gpath);
+    host_path(hpath, sizeof hpath, gpath, false);
     int r = host_mkdir_p(hpath);
     if (FS_DBG_ENV("PS3_FSLOG")) fprintf(stderr, "[fs] mkdir '%s' -> '%s' (%s)\n", gpath, hpath, r == 0 ? "OK" : "FAIL");
     ctx->gpr[3] = CELL_OK;   /* existing dir is benign for boot */

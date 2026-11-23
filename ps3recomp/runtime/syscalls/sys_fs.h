@@ -109,8 +109,18 @@ extern sys_fs_dir_info g_sys_fs_dirs[SYS_FS_DIR_MAX];
 /* Configurable root directory for path mapping */
 extern char g_sys_fs_root[512];
 
-/* Path translation: convert PS3 path to host path */
+/* Path translation: convert PS3 path to host path. _read: the caller only reads
+ * the path (open without write/create/truncate/append, stat, opendir), so a
+ * mods override may stand in for it; anything that writes uses the plain one. */
 void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_size);
+void sys_fs_translate_path_read(const char* ps3_path, char* host_path, int host_path_size);
+
+/* Shared tail of the three path translators (sys_fs, cellFs, ppu_fs): the
+ * PS3_GAME fallback, then the port's override hook with reading = 0 / 1.
+ * ps3_vfs_ps3game_fallback is reading = 0. */
+void ps3_vfs_ps3game_fallback_ex(char* path, size_t cap, int reading);
+/* 1 = open flags that only read (no write access, create, excl, trunc, append). */
+int ps3_vfs_open_is_read_only(uint32_t flags);
 
 /* Syscall handlers */
 int64_t sys_fs_open(ppu_context* ctx);

@@ -147,12 +147,31 @@ extern __attribute__((weak)) const char* cellGame_get_hdd_title_id(void);
 
 static void ps3_vfs_ps3game_fallback_impl(char* path, size_t cap);
 /* Port hook (project/rfom_mods.cpp, RFOM_MODS): may replace the resolved host
- * path with a file from the mods folder. Runs after every translation. */
-void (*volatile g_vfs_override_hook)(char* path, size_t cap) = NULL;
-void ps3_vfs_ps3game_fallback(char* path, size_t cap)
+ * path with a file from the mods folder (rfom_pcextra.cpp also watches the paths).
+ * Runs after every translation. `writing` is 0 only when the caller just reads
+ * the path (an open without write access, create, truncate or append; stat;
+ * opendir) -- anything else (writes, mkdir,
+ * rename, unlink, truncate, free space...) passes 1, and a mod must leave such a
+ * path alone: the game's first-start data copy (disc -> /dev_hdd0) opened its
+ * destination for writing, was handed the mods' patched archive and overwrote it. */
+void (*volatile g_vfs_override_hook)(char* path, size_t cap, int writing) = NULL;
+void ps3_vfs_ps3game_fallback_ex(char* path, size_t cap, int reading)
 {
     ps3_vfs_ps3game_fallback_impl(path, cap);
-    if (g_vfs_override_hook && path && *path) g_vfs_override_hook(path, cap);
+    if (g_vfs_override_hook && path && *path) g_vfs_override_hook(path, cap, !reading);
+}
+void ps3_vfs_ps3game_fallback(char* path, size_t cap)
+{
+    ps3_vfs_ps3game_fallback_ex(path, cap, 0);
+}
+/* An open that only reads: no write access and none of create / exclusive /
+ * truncate / append. Both spellings of those bits are refused -- the PS3's
+ * (000100 create, 000200 excl, 001000 trunc, 002000 append, as cellFs.h and
+ * ppu_fs.cpp use) and sys_fs.h's (0x100, 0x200, 0x400, 0x2000) -- so a flag
+ * this layer misreads never counts as read-only. */
+int ps3_vfs_open_is_read_only(uint32_t flags)
+{
+    return (flags & 3u) == 0 && (flags & (0x40u | 0x80u | 0x100u | 0x200u | 0x400u | 0x2000u)) == 0;
 }
 static void ps3_vfs_ps3game_fallback_impl(char* path, size_t cap)
 {
@@ -210,7 +229,7 @@ static void ps3_vfs_ps3game_fallback_impl(char* path, size_t cap)
     snprintf(path, cap, "%s", alt);
 }
 
-void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_size)
+static void sys_fs_translate(const char* ps3_path, char* host_path, int host_path_size, int reading)
 {
     /* Lazily adopt PS3_VFS_ROOT if the root is still the default ".", so this
      * sys_fs layer points at the same place as the cellFs layer (ppu_vfs_root). */
@@ -360,7 +379,19 @@ void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_
         if (stat(alt2, &st) == 0)
             snprintf(host_path, (size_t)host_path_size, "%s", alt2);
     }
-    ps3_vfs_ps3game_fallback(host_path, (size_t)host_path_size);
+    ps3_vfs_ps3game_fallback_ex(host_path, (size_t)host_path_size, reading);
+}
+
+/* For a path the caller writes, creates, renames, deletes... : never a mods override. */
+void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_size)
+{
+    sys_fs_translate(ps3_path, host_path, host_path_size, 0);
+}
+
+/* For a path the caller only reads (see ps3_vfs_ps3game_fallback_ex). */
+void sys_fs_translate_path_read(const char* ps3_path, char* host_path, int host_path_size)
+{
+    sys_fs_translate(ps3_path, host_path, host_path_size, 1);
 }
 
 /* ---------------------------------------------------------------------------
@@ -384,7 +415,8 @@ int64_t sys_fs_open(ppu_context* ctx)
 
     const char* ps3_path = (const char*)vm_to_host(path_addr);
     char host_path[1024];
-    sys_fs_translate_path(ps3_path, host_path, sizeof(host_path));
+    if (ps3_vfs_open_is_read_only((uint32_t)flags)) sys_fs_translate_path_read(ps3_path, host_path, sizeof(host_path));
+    else sys_fs_translate_path(ps3_path, host_path, sizeof(host_path));
 
     { extern char* getenv(const char*); if (getenv("FLOW_TITLEOPEN") && ps3_path && strstr(ps3_path, "Titles")) {
         size_t _l = strlen(ps3_path);
@@ -829,7 +861,7 @@ int64_t sys_fs_stat(ppu_context* ctx)
 
     const char* ps3_path = (const char*)vm_to_host(path_addr);
     char host_path[1024];
-    sys_fs_translate_path(ps3_path, host_path, sizeof(host_path));
+    sys_fs_translate_path_read(ps3_path, host_path, sizeof(host_path));
 
     struct stat st;
 #ifdef _WIN32
@@ -892,7 +924,7 @@ int64_t sys_fs_opendir(ppu_context* ctx)
 
     const char* ps3_path = (const char*)vm_to_host(path_addr);
     char host_path[1024];
-    sys_fs_translate_path(ps3_path, host_path, sizeof(host_path));
+    sys_fs_translate_path_read(ps3_path, host_path, sizeof(host_path));
 
     int slot = -1;
     sys_fs_dir_lock();
