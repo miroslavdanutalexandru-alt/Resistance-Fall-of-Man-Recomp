@@ -442,6 +442,10 @@ int main(void)
         vm_write16(POLLFD + 4, SYS_NET_POLLIN);
         vm_write16(POLLFD + 6, 0);
         assert(C3("socketpoll", POLLFD, 1, 1000) == 1 && (vm_read16(POLLFD + 6) & SYS_NET_POLLIN));
+        /* A peek sees the answer and leaves it for the real read. */
+        memset(vm_base + BUF, 0, 512);
+        assert(call("recvfrom", d, BUF, 512, SYS_NET_MSG_PEEK, 0, 0) == (int64_t)ql + 16);
+        assert(vm_base[BUF] == 0xBE && vm_base[BUF + 1] == 0xEF);
         memset(vm_base + BUF, 0, 512);
         vm_write32(LEN, 16);
         int32_t n = (int32_t)call("recvfrom", d, BUF, 512, 0, ADDR_B, LEN);

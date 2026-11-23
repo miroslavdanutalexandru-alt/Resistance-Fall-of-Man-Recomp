@@ -8,6 +8,7 @@
 #include "sceNp.h"
 #include "../../runtime/ppu/ppu_context.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 #include <time.h>
@@ -237,8 +238,11 @@ s32 sceNpManagerGetStatus(s32* status)
      * parameters straight through as guest values, so dereferencing one
      * writes to whatever host address shares that number. Same trap as
      * cellGcmSys had. Tokyo Jungle calls this during its online init. */
-    /* Signed in when there is a psnr server to be signed in to. */
-    s32 st = np_psnr_enabled() ? SCE_NP_MANAGER_STATUS_ONLINE : SCE_NP_MANAGER_STATUS_OFFLINE;
+    /* Signed in whenever the run is online (PS3_NET_ONLINE), psnr server or
+     * not: a title with its own backend (Medius) only goes online once the
+     * NP manager says it is signed in, and never talks to psnr. */
+    s32 st = getenv("PS3_NET_ONLINE") ? SCE_NP_MANAGER_STATUS_ONLINE
+                                      : SCE_NP_MANAGER_STATUS_OFFLINE;
     vm_write32((uint32_t)(uintptr_t)status, (uint32_t)st);
     { static s32 last = -2;
       if (st != last) printf("[sceNp] ManagerGetStatus() -> %s\n", st < 0 ? "OFFLINE" : "ONLINE");
@@ -255,7 +259,7 @@ s32 sceNpManagerRegisterCallback(SceNpManagerCallback callback, void* arg)
     printf("[sceNp] ManagerRegisterCallback()\n");
     /* Online: tell the title it is signed in, as the console does once the
      * manager reaches ONLINE. Delivered on its next cellSysutilCheckCallback. */
-    if (np_psnr_enabled() && callback) {
+    if (getenv("PS3_NET_ONLINE") && callback) {
         const u64 args[8] = { (u64)(u32)SCE_NP_MANAGER_STATUS_ONLINE, 0,
                               (u64)(u32)(uintptr_t)arg, 0, 0, 0, 0, 0 };
         cellSysutilQueueGuestCallbackArgs((u32)(uintptr_t)callback, args);
@@ -447,7 +451,9 @@ static void np_ticket_ensure(void)
 /* GetTicket(buffer, bufferSize*): *bufferSize is output only -- it is the
  * ticket's size, not the buffer's capacity. Resistance: Fall of Man passes a
  * buffer with *bufferSize = 0 and reads the ticket from it, so refusing a
- * "too small" buffer breaks it. A NULL buffer asks for the size alone. */
+ * "too small" buffer breaks it. Ignoring the value is on purpose and matches
+ * RPCS3, whose sceNpManagerGetTicket overwrites *bufferSize with the ticket's
+ * size before its size check. A NULL buffer asks for the size alone. */
 static s32 np_ticket_get(u32 buf_ea, u32 size_ea)
 {
     if (!s_np_initialized) return SCE_NP_ERROR_NOT_INITIALIZED;
@@ -527,9 +533,12 @@ static void h_np_get_ticket_param(ppu_context* ctx)
 extern void ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context*));
 
 /* Called from ppu_sysprx_register(): the generated NID table has no entry for
- * these, and they must be in place before the title's first call. */
+ * these, and they must be in place before the title's first call. Online
+ * (PS3_NET_ONLINE) only: offline, the NIDs stay unregistered and the calls
+ * behave exactly as before (CELL_OK, nothing written). */
 void np_register_ctx(void)
 {
+    if (!getenv("PS3_NET_ONLINE")) return;
     ps3_hle_register_ctx(0x7E2FEF28u, "sceNpManagerRequestTicket",  h_np_request_ticket);
     ps3_hle_register_ctx(0x0968AA36u, "sceNpManagerGetTicket",      h_np_get_ticket);
     ps3_hle_register_ctx(0x58FA4FCDu, "sceNpManagerGetTicketParam", h_np_get_ticket_param);

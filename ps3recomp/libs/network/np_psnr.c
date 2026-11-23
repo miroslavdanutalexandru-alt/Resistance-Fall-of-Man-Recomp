@@ -82,6 +82,34 @@ void np_psnr_random_id(char out[17])
              k_animal[(x >> 32) % (sizeof k_animal / sizeof *k_animal)]);
 }
 
+/* The random name is saved, so a player keeps one name -- and the account ID
+ * and console identity derived from it -- across launches. */
+static const char* id_file(void)
+{
+    const char* f = getenv("PS3_NP_ID_FILE");
+    return f && *f ? f : "online_id.txt";
+}
+
+static int load_saved_id(char out[17])
+{
+    char line[64] = {0};
+    FILE* f = fopen(id_file(), "r");
+    if (!f) return 0;
+    int ok = fgets(line, sizeof line, f) != NULL;
+    fclose(f);
+    line[strcspn(line, "\r\n")] = 0;
+    /* Only a file that is exactly a valid ID: anything else is replaced. */
+    return ok && clean_online_id(line, out) && strcmp(out, line) == 0;
+}
+
+static void save_id(const char* id)
+{
+    FILE* f = fopen(id_file(), "w");
+    if (!f) { printf("[psnr] could not save the player name to %s\n", id_file()); return; }
+    fprintf(f, "%s\n", id);
+    fclose(f);
+}
+
 void np_psnr_setup(const char* username, const char* server)
 {
     /* Before anything reads them: the runtime's getenv cache keeps the first
@@ -91,8 +119,12 @@ void np_psnr_setup(const char* username, const char* server)
         set_env("PSNR_SERVER", server);
     }
     /* The first valid one of: --username, PS3_NP_ONLINE_ID, and -- online
-     * only -- a random name (np_psnr_random_id). Never the OS login name: it
-     * would show the player's account name to everyone online. */
+     * only -- the name saved by an earlier run, else a new random one
+     * (np_psnr_random_id), saved for next time. Never the OS login name: it
+     * would show the player's account name to everyone online. Online means
+     * PS3_NET_ONLINE, with or without a psnr server: a title with its own
+     * backend (Medius) needs a name of its own too. */
+    int online = getenv("PS3_NET_ONLINE") != NULL;
     const char* named[2] = { username, getenv("PS3_NP_ONLINE_ID") };
     int found = 0;
     for (int i = 0; i < 2 && !found; i++) {
@@ -103,11 +135,16 @@ void np_psnr_setup(const char* username, const char* server)
                    "starting with a letter)\n", named[i]);
     }
     if (!found) {
-        if (!np_psnr_enabled()) { s_id_state = 2; return; }   /* offline: "PS3Player" */
-        np_psnr_random_id(s_id);
+        if (!online) { s_id_state = 2; return; }   /* offline: "PS3Player" */
+        if (load_saved_id(s_id)) {
+            printf("[psnr] player name from %s\n", id_file());
+        } else {
+            np_psnr_random_id(s_id);
+            save_id(s_id);
+        }
     }
     s_id_state = 1;
-    printf("[psnr] player \"%s\"%s\n", s_id, np_psnr_enabled() ? "" : " (offline)");
+    printf("[psnr] player \"%s\"%s\n", s_id, online ? "" : " (offline)");
 }
 
 const char* np_psnr_identity(void)

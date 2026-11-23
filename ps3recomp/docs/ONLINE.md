@@ -18,15 +18,20 @@ The runtime's command line takes two flags, anywhere after the program name:
 
 The name follows PSN's online ID rules: 3-16 letters, digits, `-` or `_`,
 starting with a letter. Other characters are dropped, and a name that still
-doesn't fit is ignored with a message. With no name set, an online game uses
-a random name such as "ExcitingHippo" (`np_psnr_random_id`), never the OS
-login name. Offline with no name, nothing changes ("PS3Player").
+doesn't fit is ignored with a message. With no name set, an online game
+(`PS3_NET_ONLINE`, with or without a psnr server) uses a random name such as
+"ExcitingHippo" (`np_psnr_random_id`), never the OS login name. The name is
+saved to `PS3_NP_ID_FILE` (default `online_id.txt` in the working directory)
+and reused on later runs, so the player, and the account ID derived from the
+name, stay the same. Edit or delete the file to change it. Offline with no
+name, nothing changes ("PS3Player").
 
 | Variable | What it does |
 |---|---|
-| `PS3_NET_ONLINE=1` | Real host sockets (`libs/network/sysNet.c`), and cellNetCtl reports a connection. |
-| `PSNR_SERVER=host[:port]` | The psnr server. Port 36100 by default. With `PS3_NET_ONLINE`, the NP manager reports ONLINE. |
+| `PS3_NET_ONLINE=1` | Real host sockets (`libs/network/sysNet.c`), cellNetCtl reports a connection, and the NP manager reports ONLINE (signed in). |
+| `PSNR_SERVER=host[:port]` | The psnr server for sceNpMatching2 and sceNpScore. Port 36100 by default. Not needed by titles with their own backend. |
 | `PS3_NP_ONLINE_ID=name` | The player's name, if `--username` isn't given. The name also gives the instance its own console identity: the OpenPSID (`sys_ss_get_open_psid`) and MAC are derived from it. Titles tell consoles apart by these, so two instances with the same name count as one player. Offline with no name, both stay at their old fixed values, so offline saves are untouched. |
+| `PS3_NP_ID_FILE=<file>` | Where the random online name is saved and read back. Default `online_id.txt`. Only used online with no name set. |
 | `PS3_OPEN_PSID=<32 hex>` | Set the OpenPSID outright instead. |
 | `PS3_NET_P2P_PORT=n` | The host port this instance's P2P sockets bind, whatever port the title asks for. Default 3658. psnr hands this port to peers. Two instances on one machine need two ports. |
 | `PS3_NP_SIGNALING_DELAY_MS=n` | How long after a member joins that signaling reports them "established". Default 1000. |

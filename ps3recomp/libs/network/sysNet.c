@@ -753,7 +753,7 @@ int32_t sys_net_bnet_recvfrom(int32_t s, void* buf, uint32_t len, int32_t flags,
         if (dn > len) dn = len;
         memcpy(GUEST_PTR(EA(buf), uint8_t*), sl->dns, dn);
         a = sl->dns_from;
-        sl->dns_len = 0;
+        if (!(flags & SYS_NET_MSG_PEEK)) sl->dns_len = 0;   /* a peek leaves it queued */
         if (net_trace()) trace("recvfrom(dns)", s, (int)dn, &a);
         write_sockaddr(EA(from), EA(fromlen), &a);
         return (int32_t)dn;

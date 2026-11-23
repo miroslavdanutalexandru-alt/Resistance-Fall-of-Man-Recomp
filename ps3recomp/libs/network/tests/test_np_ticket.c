@@ -71,6 +71,15 @@ static s32 call(uint32_t nid, u64 a3, u64 a4, u64 a5, u64 a6, u64 a7, u64 a8)
 enum { NPID = 0x1000, SERVICE = 0x1100, SIZE = 0x1200, TICKET = 0x2000, PARAM = 0x3000,
        CB = 0x8000, CB_ARG = 0x9000 };
 
+static void set_online(int on)
+{
+#ifdef _WIN32
+    _putenv_s("PS3_NET_ONLINE", on ? "1" : "");
+#else
+    if (on) setenv("PS3_NET_ONLINE", "1", 1); else unsetenv("PS3_NET_ONLINE");
+#endif
+}
+
 static int fails;
 #define CHECK(cond) do { if (!(cond)) { printf("FAIL line %d: %s\n", __LINE__, #cond); fails++; } } while (0)
 
@@ -79,6 +88,10 @@ int main(void)
     setvbuf(stdout, NULL, _IONBF, 0);
     vm_base = (uint8_t*)calloc(1, 1u << 20);
     ppu_vm_size = 1u << 20;
+    /* Offline nothing is registered, so the calls behave as before. */
+    np_register_ctx();
+    CHECK(s_nreg == 0);
+    set_online(1);
     np_register_ctx();
     CHECK(s_nreg == 3);
 
@@ -87,6 +100,16 @@ int main(void)
     /* Before sceNpInit: nothing works. */
     CHECK((u32)call(REQUEST_TICKET, NPID, SERVICE, 0, 0, 0, 0) == SCE_NP_ERROR_NOT_INITIALIZED);
     CHECK(sceNpInit(0x100000, NULL) == CELL_OK);
+
+    /* Online is signed in with no psnr server (a Medius title); offline is
+     * not. */
+    CHECK(getenv("PSNR_SERVER") == NULL);
+    CHECK(sceNpManagerGetStatus((s32*)(uintptr_t)PARAM) == CELL_OK);
+    CHECK((s32)vm_read32(PARAM) == SCE_NP_MANAGER_STATUS_ONLINE);
+    set_online(0);
+    CHECK(sceNpManagerGetStatus((s32*)(uintptr_t)PARAM) == CELL_OK);
+    CHECK((s32)vm_read32(PARAM) == SCE_NP_MANAGER_STATUS_OFFLINE);
+    set_online(1);
 
     /* Before any RequestTicket a ticket can already be read, as on a console
      * signed in at boot: Resistance: Fall of Man calls GetTicket with
