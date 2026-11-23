@@ -324,20 +324,22 @@ static void lx_register()
     lx_add(2, "pad_southpaw", "Swap sticks  (southpaw)", "Left stick looks, right stick moves.", "PAD_SOUTHPAW",
            { {"Off", ""}, {"On", "1"} });
     lx_add(2, "p1pad", "Controller to play with",
-           "With several controllers connected, which one is player 1 (in the order Windows connected them). Needs "
+           "With several controllers connected, which one is player 1 (in the order Windows connected them). "
+           "Automatic: the controller you used last (in local co-op: the first one connected). Needs "
            "Controller support = SDL3 (the default); with XInput the first one is used. Pros: "
            "pick your pad without unplugging the others. Cons: the number can change when controllers reconnect.",
            "PAD_P1_CONTROLLER",
-           { {"First connected", ""}, {"Controller 1", "1"}, {"Controller 2", "2"}, {"Controller 3", "3"},
+           { {"Automatic", ""}, {"Controller 1", "1"}, {"Controller 2", "2"}, {"Controller 3", "3"},
              {"Controller 4", "4"} });
     // Local co-op (cellPad.c pad_coop_init): the game's own split-screen; ports 1-3 are the extra controllers
     lx_add(2, "coop", "Local co-op  (split-screen)",
-           "A second controller is player 2: press START on it to join (see the README, \"Local co-op\"). "
-           "Off keeps every extra controller away from the game.",
-           "PAD_COOP", on_def);
+           "On: a second controller can be player 2: press START on it to join (see the README, \"Local "
+           "co-op\"). Off: one player, however many controllers are connected (also when DSX, DS4Windows or "
+           "Steam Input adds a virtual copy of your controller); player 1 is the controller you used last.",
+           "PAD_COOP", { {"Off", "0"}, {"On", "1"} });
     lx_add(2, "p2pad", "Player 2 controller",
-           "Which controller is player 2 in local co-op. Automatic takes the next one found. Needs Controller "
-           "support = SDL3 (the default).",
+           "Which controller is player 2 when Local co-op is On. Automatic takes the next one found. Needs "
+           "Controller support = SDL3 (the default).",
            "PAD_P2_CONTROLLER", { {"Automatic", ""}, {"Controller 1", "1"}, {"Controller 2", "2"},
                                   {"Controller 3", "3"}, {"Controller 4", "4"}, {"Controller 5", "5"},
                                   {"Controller 6", "6"}, {"Controller 7", "7"}, {"Controller 8", "8"} });

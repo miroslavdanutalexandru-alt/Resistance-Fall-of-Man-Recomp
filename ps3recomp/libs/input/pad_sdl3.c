@@ -15,6 +15,7 @@
   #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#pragma comment(lib, "advapi32.lib")   /* RegOpenKeyExA: HidHide check */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -35,6 +36,9 @@ typedef struct {
     int            cand;          /* could be a wrapper's virtual copy of another pad */
     int            recheck;       /* active candidate still being compared */
     int            real_ref;      /* a PlayStation / Nintendo pad (the kind wrappers copy) */
+    int            ghosted;       /* was judged a duplicate: watched for that from then on */
+    Uint64         ghost_ms;      /* last decay of the evidence (PADD_RECHECK_MS) */
+    PadFree        fr;            /* evidence that an ignored pad is used on its own */
     PadPair        pair[PADX_MAX_DEV];
     PadSigHist     hist;
     unsigned       sig;
@@ -123,9 +127,32 @@ static void padx_give_slot(PadDev* d)
         printf("[pad-sdl3] %s: no free controller slot (max %d)\n", d->name, PADX_SLOTS);
     fflush(stdout);
 }
-static int padx_any_real(const PadDev* except)
+/* Can d be checked against s_dev[j]? An active wrapper candidate under
+ * recheck is compared with the real PlayStation / Nintendo pads only; a pad
+ * still waiting (state 0), ignored (2) or once ignored with every pad that is playing. */
+static int padx_is_ref(const PadDev* d, int j)
 {
-    for (int i = 0; i < s_ndev; i++) if (&s_dev[i] != except && s_dev[i].real_ref) return 1;
+    const PadDev* r = &s_dev[j];
+    if (r == d || r->state != 1) return 0;
+    return (d->state == 1 && !d->ghosted) ? r->real_ref : 1;
+}
+static int padx_any_ref(const PadDev* d)
+{
+    for (int j = 0; j < s_ndev; j++) if (padx_is_ref(d, j)) return 1;
+    return 0;
+}
+/* A pad that connects while another one is already playing may be a copy of it
+ * (DSX / DS4Windows / Steam Input / a virtual DualShock 4 next to the real pad):
+ * it waits until it is used on its own. A real PlayStation / Nintendo pad does
+ * not wait behind an Xbox-id pad: that one is rechecked instead (padx_open). */
+static int padx_should_hold(const PadDev* d)
+{
+    for (int j = 0; j < s_ndev; j++) {
+        const PadDev* o = &s_dev[j];
+        if (o == d || o->state != 1) continue;
+        if (d->real_ref && o->cand) continue;
+        return 1;
+    }
     return 0;
 }
 
@@ -161,9 +188,11 @@ static void padx_open(SDL_JoystickID id)
         d->has_accel = SDL_GamepadHasSensor(gp, as[k]);
         break;
     }
-    if (s_dedup && d->cand && padx_any_real(d)) {
-        printf("[pad-sdl3] %s (%04x:%04x) appeared next to a PlayStation/Nintendo pad: "
-               "it joins once it is used on its own (PAD_DEDUP)\n", d->name, d->vid, d->pid);
+    if (s_dedup && padx_should_hold(d)) {
+        printf("[pad-sdl3] %s (%04x:%04x%s) appeared next to a controller that is already playing: "
+               "it joins once it is used on its own (a virtual copy from DSX / DS4Windows / Steam Input "
+               "is ignored; PAD_DEDUP=0 turns this off)\n", d->name, d->vid, d->pid,
+               SDL_GetGamepadSteamHandle(gp) ? ", Steam Input" : "");
         fflush(stdout);
     } else {
         padx_give_slot(d);
@@ -238,29 +267,66 @@ static void padx_read(PadDev* d)
 /* Duplicate detection (see pad_logic.h). */
 static void padx_dedup(void)
 {
-    for (int i = 0; i < s_ndev; i++) if (s_dev[i].real_ref) padd_hist_push(&s_dev[i].hist, s_dev[i].sig);
+    for (int i = 0; i < s_ndev; i++) if (s_dev[i].state == 1) padd_hist_push(&s_dev[i].hist, s_dev[i].sig);
     for (int i = 0; i < s_ndev; i++) {
         PadDev* c = &s_dev[i];
-        if (!c->cand || !(c->state == 0 || (c->state == 1 && c->recheck))) continue;
-        if (!s_dedup || !padx_any_real(c)) {
-            if (c->state == 0) padx_give_slot(c);
-            c->recheck = 0;
+        if (c->state == 2) {   /* a duplicate whose original is gone is a controller again */
+            if (!padx_any_ref(c)) {
+                printf("[pad-sdl3] %s: the controller it copied is gone, using it\n", c->name);
+                c->recheck = 0; c->ghosted = 0; memset(c->pair, 0, sizeof c->pair); memset(&c->fr, 0, sizeof c->fr);
+                padx_give_slot(c);
+                if (s_cfg_gyro) padx_sensors(c, 1);
+                continue;
+            }
+            const Uint64 now = SDL_GetTicks();
+            if (now - c->ghost_ms >= PADD_RECHECK_MS) { padd_free_decay(&c->fr); c->ghost_ms = now; }
+            int neutral = 1, close = 0;
+            for (int j = 0; j < s_ndev; j++) {
+                if (!padx_is_ref(c, j)) continue;
+                if (s_dev[j].sig || !padd_hist_neutral(&s_dev[j].hist)) neutral = 0;
+                if (padd_hist_close(&s_dev[j].hist, c->sig)) close = 1;
+            }
+            if (padd_free_update(&c->fr, c->sig, neutral, close)) {
+                printf("[pad-sdl3] %s is used on its own: not a duplicate after all (still watched)\n", c->name);
+                fflush(stdout);
+                memset(c->pair, 0, sizeof c->pair); memset(&c->fr, 0, sizeof c->fr);
+                c->ghost_ms = now; c->recheck = 1;
+                padx_give_slot(c);
+                if (s_cfg_gyro) padx_sensors(c, 1);
+            }
             continue;
+        }
+        if (!(c->state == 0 || (c->state == 1 && c->recheck))) continue;
+        if (!s_dedup || !padx_any_ref(c)) {
+            if (c->state == 0) padx_give_slot(c);
+            if (!c->ghosted) c->recheck = 0;
+            continue;
+        }
+        /* A once-ignored pad that plays again is watched with more evidence needed
+         * (so a second player doing the same things is not taken for a copy). */
+        const int watched = c->state == 1 && c->ghosted;
+        if (watched && SDL_GetTicks() - c->ghost_ms >= PADD_RECHECK_MS) {
+            for (int j = 0; j < s_ndev; j++) padd_pair_decay(&c->pair[j]);
+            c->ghost_ms = SDL_GetTicks();
         }
         int ghost = 0, distinct = 1;
         for (int j = 0; j < s_ndev; j++) {
-            if (j == i || !s_dev[j].real_ref) continue;
-            const int v = padd_update(&c->pair[j], c->sig, &s_dev[j].hist);
+            if (!padx_is_ref(c, j)) continue;
+            const int min_seen = (c->cand && s_dev[j].real_ref) ? 1 : PADD_MIN_SEEN_ANY;
+            const int v = padd_update(&c->pair[j], c->sig, &s_dev[j].hist, min_seen,
+                                      watched ? 4 * PADD_MIN_MATCH : PADD_MIN_MATCH);
             if (v > 0) ghost = 1;
             if (v >= 0) distinct = 0;
         }
         if (ghost) {
-            printf("[pad-sdl3] %s (%04x:%04x) mirrors a PlayStation/Nintendo pad: ignored as a duplicate "
-                   "(DS4Windows / a virtual pad; PAD_DEDUP=0 keeps it)\n", c->name, c->vid, c->pid);
+            printf("[pad-sdl3] %s (%04x:%04x) mirrors another controller: ignored as a duplicate%s "
+                   "(DSX / DS4Windows / Steam Input virtual pad; PAD_DEDUP=0 keeps it)\n", c->name, c->vid, c->pid,
+                   c->ghosted ? " again" : "");
             fflush(stdout);
+            c->ghosted = 1; c->ghost_ms = SDL_GetTicks(); memset(&c->fr, 0, sizeof c->fr);
             c->state = 2; c->slot = -1; c->recheck = 0;
             if (c->has_gyro) padx_sensors(c, 0);
-        } else if (distinct) {
+        } else if (distinct && !watched) {
             c->recheck = 0;
             if (c->state == 0) padx_give_slot(c);
         }
@@ -326,6 +392,36 @@ static void padx_apply_outputs(void)
     }
 }
 
+/* Diagnostics for "my controller isn't seen": joysticks SDL found but can't use
+ * as a gamepad (no mapping), and things that hide controllers from the game. */
+static void padx_log_joystick(SDL_JoystickID id)
+{
+    static SDL_JoystickID said[32]; static int nsaid = 0;
+    if (SDL_IsGamepad(id)) return;
+    for (int i = 0; i < nsaid; i++) if (said[i] == id) return;
+    if (nsaid < 32) said[nsaid++] = id;
+    const char* nm = SDL_GetJoystickNameForID(id);
+    printf("[pad-sdl3] %s (%04x:%04x) is not a known gamepad layout: not used\n", nm ? nm : "joystick",
+           SDL_GetJoystickVendorForID(id), SDL_GetJoystickProductForID(id));
+    fflush(stdout);
+}
+static void padx_log_hiders(void)
+{
+    static const char* const env[] = { "SDL_GAMECONTROLLER_IGNORE_DEVICES", "SDL_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT",
+        "SDL_JOYSTICK_HIDAPI", "SDL_JOYSTICK_HIDAPI_PS4", "SDL_JOYSTICK_HIDAPI_PS5", "SDL_JOYSTICK_HIDAPI_SWITCH" };
+    for (unsigned k = 0; k < sizeof env / sizeof env[0]; k++) {
+        const char* v = getenv(env[k]);
+        if (v && *v) printf("[pad-sdl3] note: %s=%s is set (Steam / another tool): it can hide controllers\n", env[k], v);
+    }
+    HKEY k;
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "SYSTEM\\CurrentControlSet\\Services\\HidHide", 0, KEY_READ, &k) == ERROR_SUCCESS) {
+        RegCloseKey(k);
+        printf("[pad-sdl3] note: HidHide is installed (DSX / DS4Windows use it): while it hides a controller, "
+               "only the tool's virtual pad is visible\n");
+    }
+    fflush(stdout);
+}
+
 static DWORD WINAPI padx_thread(LPVOID arg)
 {
     (void)arg;
@@ -357,6 +453,10 @@ static DWORD WINAPI padx_thread(LPVOID arg)
       }
       for (int k = 0; ids && k < n; k++) padx_open(ids[k]);
       SDL_free(ids); }
+    { int n = 0; SDL_JoystickID* ids = SDL_GetJoysticks(&n);
+      for (int k = 0; ids && k < n; k++) padx_log_joystick(ids[k]);
+      SDL_free(ids); }
+    padx_log_hiders();
     { const char* v = SDL_GetRevision();
       printf("[pad-sdl3] SDL %d.%d.%d (%s) ready, %d controller(s)\n", SDL_VERSIONNUM_MAJOR(SDL_GetVersion()),
              SDL_VERSIONNUM_MINOR(SDL_GetVersion()), SDL_VERSIONNUM_MICRO(SDL_GetVersion()), v ? v : "", s_ndev);
@@ -370,6 +470,7 @@ static DWORD WINAPI padx_thread(LPVOID arg)
         SDL_PumpEvents();
         while (SDL_PeepEvents(&ev, 1, SDL_GETEVENT, SDL_EVENT_FIRST, SDL_EVENT_LAST) > 0) {
             if (ev.type == SDL_EVENT_GAMEPAD_ADDED) padx_open(ev.gdevice.which);
+            else if (ev.type == SDL_EVENT_JOYSTICK_ADDED) padx_log_joystick(ev.jdevice.which);
             else if (ev.type == SDL_EVENT_GAMEPAD_REMOVED) {
                 for (int i = 0; i < s_ndev; i++) if (s_dev[i].id == ev.gdevice.which) { padx_close_at(i); break; }
             } else if (ev.type == SDL_EVENT_GAMEPAD_SENSOR_UPDATE) padx_on_sensor(&ev.gsensor);

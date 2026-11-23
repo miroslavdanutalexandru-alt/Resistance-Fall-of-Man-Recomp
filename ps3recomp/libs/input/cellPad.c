@@ -1108,31 +1108,57 @@ static void pad_poll_xinput(void)
     if (s_xi_present[0]) pad_port0_post();
 }
 
-/* Local co-op (the game's own split-screen: a controller on port 1-3 presses START to join):
- *   PAD_COOP=0            only port 0 (player 1); extra controllers never reach the game
+/* Local co-op (the game's own split-screen: a controller on port 1-3 presses START to join).
+ * It is off unless asked for: with it off the game sees one player, however many controllers (or a
+ * tool's virtual copies of one) are plugged in, and player 1 is whichever controller was used last.
+ *   PAD_COOP=1            local co-op: extra controllers reach the game on ports 1-3 (also on when
+ *                         PAD_P2_CONTROLLER is set and PAD_COOP isn't set at all); PAD_COOP=0 (the
+ *                         launcher's Off) or empty: always off, only port 0 (player 1)
  *   PAD_P2_CONTROLLER=n   player 2 (port 1) uses controller n (1-8; SDL3, like PAD_P1_CONTROLLER) */
-static int s_coop_init = 0, s_coop_on = 1, s_coop_p2 = -1;
+static int s_coop_init = 0, s_coop_on = 0, s_coop_p2 = -1;
 static void pad_coop_init(void)
 {
     if (s_coop_init) return;
     s_coop_init = 1;
     const char* e;
-    if ((e = getenv("PAD_COOP")) && *e == '0') s_coop_on = 0;
     if ((e = getenv("PAD_P2_CONTROLLER")) && *e >= '1' && *e <= '8') s_coop_p2 = *e - '1';
-    if (!s_coop_on || s_coop_p2 >= 0)
-        printf("[cellPad] local co-op: %s, player 2 = %s%d\n", s_coop_on ? "on" : "off (PAD_COOP=0)",
-               s_coop_on && s_coop_p2 >= 0 ? "controller " : "none / automatic ", s_coop_on && s_coop_p2 >= 0 ? s_coop_p2 + 1 : 0);
+    if ((e = getenv("PAD_COOP"))) s_coop_on = *e && *e != '0';   /* the launcher writes 0 / 1 */
+    else s_coop_on = s_coop_p2 >= 0;
+    if (!s_coop_on) s_coop_p2 = -1;
+    if (s_coop_on)
+        printf("[cellPad] local co-op: on, player 2 = %s%d\n",
+               s_coop_p2 >= 0 ? "controller " : "next controller ", s_coop_p2 >= 0 ? s_coop_p2 + 1 : 0);
+    else
+        printf("[cellPad] local co-op: off (PAD_COOP=1 turns it on); player 1 = the controller used last\n");
 }
 static int pad_coop_ports(void) { pad_coop_init(); return s_coop_on ? PAD_MAX_HOST_PORTS : 1; }
 /* Port order of the connected controller slots: player 1 = want (PAD_P1_CONTROLLER) or the first one
  * that is not player 2's, player 2 = p2 (PAD_P2_CONTROLLER), then the rest in connection order.
- * A pinned player 2 stays on port 1: with no controller for player 1, order[0] = -1 (port 0 empty). */
-static void pad_coop_order(const int* conn, int nslots, int want, int p2, int* order, int* n_out)
+ * A pinned player 2 stays on port 1: with no controller for player 1, order[0] = -1 (port 0 empty).
+ * One player (last != NULL, co-op off, no PAD_P1_CONTROLLER): player 1 is the controller used last.
+ * *last keeps it between calls; busy[i] = controller i is being used right now (pad_sdl3_busy). It
+ * moves only to a controller used while the current one is idle, so a mirror pressing the same
+ * buttons as the real pad at the same time never takes it; an unplugged one passes it on. */
+static void pad_coop_order(const int* conn, const int* busy, int nslots, int want, int p2, int* last,
+                           int* order, int* n_out)
 {
     int used[16] = { 0 }, n = 0;
     if (nslots > 16) nslots = 16;
     if (want >= nslots || (want >= 0 && !conn[want])) want = -1;
     if (p2 >= nslots || (p2 >= 0 && !conn[p2]) || p2 == want) p2 = -1;
+    if (last && want < 0) {
+        const int was = (*last >= 0 && *last < nslots && conn[*last]) ? *last : -1;
+        int cur = was;
+        if (busy && (cur < 0 || !busy[cur]))
+            for (int i = 0; i < nslots; i++)
+                if (i != cur && conn[i] && busy[i]) {
+                    cur = i;
+                    if (was >= 0) printf("[cellPad] player 1 <- controller %d (used last)\n", i + 1);
+                    break;
+                }
+        if (cur < 0) for (int i = 0; i < nslots; i++) if (conn[i]) { cur = i; break; }
+        *last = want = cur;
+    }
     if (want < 0) for (int i = 0; i < nslots; i++) if (conn[i] && i != p2) { want = i; break; }
     if (want >= 0) { order[n++] = want; used[want] = 1; }
     else if (p2 >= 0) order[n++] = -1;
@@ -1169,12 +1195,22 @@ static void pad_gyro_poll(void)
     hs->analog_rx = (u8)(rx < 0 ? 0 : rx > 255 ? 255 : rx);
     hs->analog_ry = (u8)(ry < 0 ? 0 : ry > 255 ? 255 : ry);
 }
+/* Is this controller being used right now? A button, a trigger, or a stick pushed past half way
+ * (resting stick drift doesn't count). */
+static int pad_sdl3_busy(const PadxState* s)
+{
+    if (!s->connected) return 0;
+    if (s->buttons || s->lt > 64 || s->rt > 64) return 1;
+    const int a[4] = { s->lx, s->ly, s->rx, s->ry };
+    for (int k = 0; k < 4; k++) if (a[k] < -16384 || a[k] > 16384) return 1;
+    return 0;
+}
 /* SDL3: the input thread's snapshot, through the same conversion and remap
  * hook as XInput. Ports take the connected controllers in connection order
- * (port 0 = PAD_P1_CONTROLLER=n if that one is connected). */
+ * (port 0 = PAD_P1_CONTROLLER=n if that one is connected; with co-op off, the one used last). */
 static void pad_poll_sdl3(void)
 {
-    static int conn[PADX_SLOTS], want = -2;
+    static int conn[PADX_SLOTS], want = -2, last = -1;
     if (want == -2) { const char* e = getenv("PAD_P1_CONTROLLER"); want = (e && *e >= '1' && *e <= '8') ? *e - '1' : -1; }
     padx_snapshot(s_sdl_snap);
     for (int i = 0; i < PADX_SLOTS; i++) {
@@ -1184,9 +1220,11 @@ static void pad_poll_sdl3(void)
         conn[i] = c;
     }
     int order[PADX_SLOTS], n = 0;
-    { int cn[PADX_SLOTS];
-      for (int i = 0; i < PADX_SLOTS; i++) cn[i] = s_sdl_snap[i].connected;
-      pad_coop_order(cn, PADX_SLOTS, want, pad_coop_ports() > 1 ? s_coop_p2 : -1, order, &n); }
+    { int cn[PADX_SLOTS], busy[PADX_SLOTS];
+      const int live = pad_bg_input_ok();   /* PAD_BACKGROUND_INPUT: no switching from another window */
+      for (int i = 0; i < PADX_SLOTS; i++) { cn[i] = s_sdl_snap[i].connected; busy[i] = live && pad_sdl3_busy(&s_sdl_snap[i]); }
+      const int single = pad_coop_ports() == 1 && !pad_merge_enabled();
+      pad_coop_order(cn, busy, PADX_SLOTS, want, single ? -1 : s_coop_p2, single ? &last : NULL, order, &n); }
     if (!pad_merge_enabled() && n > pad_coop_ports()) n = pad_coop_ports();
     for (int p = 0; p < PAD_MAX_HOST_PORTS; p++) {
         PadHostState* hs = &s_host_state[p];
@@ -1236,6 +1274,8 @@ static void pad_backend_choose(void)
         }
 #else
         if (e && *e && _stricmp(e, "xinput")) printf("[cellPad] PAD_BACKEND=%s: not in this build; using XInput\n", e);
+        printf("[cellPad] controllers: XInput only (this build has no SDL3: DualShock 4 / DualSense need "
+               "DS4Windows, DSX or Steam Input; ps3recomp/third_party/SDL3 was missing when it was built)\n");
 #endif
         fflush(stdout);
         if (!b) for (int p = 0; p < PAD_MAX_HOST_PORTS; p++) s_port_slot[p] = p;

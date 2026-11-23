@@ -93,7 +93,7 @@ The checks run on your PC only. Nothing is uploaded.
 
 ## Controls
 
-Keyboard and mouse, Xbox controllers, PlayStation pads (DualShock 4, DualSense, DualShock 3 with its driver) and Switch Pro / Joy-Con all work, and you can switch between them at any time. Controllers are read through SDL3 (built in, no extra DLL), so **DS4Windows and Steam Input are no longer needed** (they still work; a virtual Xbox pad they add next to the real controller is ignored as a duplicate). If SDL3 can't start, the port falls back to XInput (`logs\run.log`: `[cellPad] controllers: SDL3` or `SDL3 could not start`).
+Keyboard and mouse, Xbox controllers, PlayStation pads (DualShock 4, DualSense, DualShock 3 with its driver) and Switch Pro / Joy-Con all work, and you can switch between them at any time. Controllers are read through SDL3 (built in, no extra DLL), over USB or Bluetooth, so **DSX, DS4Windows and Steam Input are not needed**, and work best closed: they can hide the real controller from other programs (HidHide) and show only their virtual Xbox pad. If they run anyway and the port sees both the real controller and the tool's virtual copy, the copy is recognised by its mirrored input and ignored, so it doesn't become a ghost player 2 (with local co-op off, the default, a second controller never becomes player 2 anyway). If SDL3 can't start, the port falls back to XInput (`logs\run.log`: `[cellPad] controllers: SDL3` or `SDL3 could not start`; a build made without SDL3 says `controllers: XInput only`). If a controller isn't seen, `logs\run.log` lists every controller SDL3 found (`[pad-sdl3] controller 1: ...`), controllers it can't use, and notes when HidHide or a Steam setting may be hiding one.
 
 - **Button prompts follow the last device you used.** On keyboard and mouse the game shows your key bindings. On an Xbox / XInput controller it shows Xbox buttons that match the real mapping: Cross = **A**, Circle = **B**, Square = **X**, Triangle = **Y**, L1/R1 = **LB/RB**, L2/R2 = **LT/RT**, L3/R3 = **LS/RS**, Select = **View**, Start = **Menu**. The Xbox glyphs are drawn by the port (coloured circles with letters); no Microsoft artwork is used. A PlayStation controller (by its SDL3 type, or with XInput by its USB / Bluetooth ID) keeps the PlayStation symbols. Switch controllers are read by button position (bottom = Cross) and show PlayStation symbols; with *Nintendo button layout = Nintendo style* A (right) confirms and B cancels, and the prompts show the Xbox-style letters. `RFOM_PAD_GLYPHS=auto|xbox|ps` overrides the choice (default `auto`; use it under Steam Input if the real controller type isn't reported).
 - **Controller hot-plug:** controllers are polled every few milliseconds, so plugging one in or pulling it out works at any time without a restart. The log shows `[cellPad] controller N connected` / `disconnected`.
@@ -146,8 +146,8 @@ More input options (launcher → Controls page, written to `settings.bat`; log l
 | Gyro calibration | **On connect**, Off | `PAD_GYRO_CALIBRATE=0` | Off: no 1 s still-calibration. |
 | Light bar | **Player colour** (blue), Off | `PAD_LIGHTBAR=0` | DualShock 4 / DualSense light bar. |
 | Nintendo button layout | **By position**, Nintendo style | `PAD_NINTENDO_SWAP=1` | Switch controllers: A confirms, B cancels. |
-| (none) | **Automatic** (the first connected) | `PAD_P1_CONTROLLER=1..8` | Which controller (SDL3: in connection order) is the player's while it is connected; otherwise the first connected one is used. |
-| (none) | **On** | `PAD_DEDUP=0` | Keep virtual duplicates (Steam Input / DS4Windows / ViGEm) as separate controllers. |
+| (none) | **Automatic** (the one used last) | `PAD_P1_CONTROLLER=1..8` | Which controller (SDL3: in connection order) is the player's while it is connected; otherwise the controller used last (SDL3; with XInput or local co-op on, the first connected one). |
+| (none) | **On** | `PAD_DEDUP=0` | Keep virtual duplicates (DSX / Steam Input / DS4Windows / ViGEm) as separate controllers. With it on, a controller that connects while another one is playing joins once it is used on its own; one that copies several different inputs of the other controller is ignored until several different buttons are pressed on it while the other controller is untouched (and is still watched after that). |
 | (none) | **360** | `PAD_GYRO_STICK_DPS=deg/s` | Gyro speed equal to a full right stick (only when gyro drives the stick). |
 
 ### Keys that always work
@@ -162,13 +162,18 @@ More input options (launcher → Controls page, written to `settings.bat`; log l
 | **Alt + F4** / the window's close button | Also quits cleanly (waits for a save in progress). |
 
 ## Local co-op
-Two players on one PC, split-screen, as on PS3. Main menu → the co-op / split-screen option, then press **START on the second controller** to join. Each controller is a player; the keyboard and mouse belong to player 1.
+Two players on one PC, split-screen, as on PS3. In the launcher, Controls page, set **Local co-op (split-screen)** to **On** (it is off by default, so a second controller, or a virtual copy of your controller made by DSX / DS4Windows / Steam Input, can't start split-screen by itself). Then main menu → the co-op / split-screen option, and press **START on the second controller** to join. Each controller is a player; the keyboard and mouse belong to player 1.
+
+- With local co-op off (the default): one player. Player 1 = the keyboard and mouse plus **the controller you used last**: pick up any connected controller and press a button, and it takes over (Controller support = SDL3, the default; with XInput it is the first controller). The game never sees a second controller.
+- With local co-op on: player 1 = the keyboard and mouse plus the first controller found.
+- `logs\run.log` shows the choice: `[cellPad] local co-op: off ...` / `on, player 2 = ...`, and `[cellPad] player 1 <- controller N (used last)` when another controller takes over.
+- **A real second controller is ignored?** Unplug it and plug it back in; `PAD_DEDUP=0` turns the duplicate check off.
 
 | Option | Values | Variable |
 |---|---|---|
-| Local co-op (split-screen) | **On**, Off | `PAD_COOP=0`: the game sees only player 1. Extra controllers (or duplicate virtual pads from Steam Input / DS4Windows) can't join |
-| Player 1 controller | **Automatic**, Controller 1-8 | `PAD_P1_CONTROLLER=<1..8>`: the controller that is player 1 (needs Controller support = SDL3, numbered in the order they were connected) |
-| Player 2 controller | **Automatic**, Controller 1-8 | `PAD_P2_CONTROLLER=<1..8>`: the controller that is player 2 (numbered as above; needs Controller support = SDL3) |
+| Local co-op (split-screen) | **Off**, On | `PAD_COOP=1`: a second controller can join as player 2. Off (`PAD_COOP=0` or unset): the game sees only player 1, and extra controllers (or duplicate virtual pads from DSX / Steam Input / DS4Windows) can't join. *Player 2 controller* applies when it is On (outside the launcher, with `PAD_COOP` not set at all, setting `PAD_P2_CONTROLLER` turns it on) |
+| Player 1 controller | **Automatic**, Controller 1-8 | `PAD_P1_CONTROLLER=<1..8>`: the controller that is player 1 (needs Controller support = SDL3, numbered in the order they were connected). Automatic = the controller used last (co-op off) or the first one found (co-op on) |
+| Player 2 controller | **Automatic**, Controller 1-8 | `PAD_P2_CONTROLLER=<1..8>`: the controller that is player 2 when Local co-op is On (numbered as above; needs Controller support = SDL3) |
 
 In co-op the mouse turns only player 1's camera, at the same speed as in single player (`RFOM_COOP_ML`). There is no *Player 2 uses keyboard and mouse* option in Resistance: Fall of Man: the port's mouse look writes straight into player 1's camera, so the keyboard can't be player 2. W/S/A/D only drive the Lynx while player 2's camera code isn't running, so not while they are on foot, in the Lynx gunner seat or on a turret (`RFOM_KBM_DRIVE`); E / Shift always work. Online play (PS3: 40 players on Sony's servers, now closed) is not supported.
 
