@@ -143,6 +143,30 @@ static inline int rfom_nn_ambiguous_c(float bd, float bd2, float c, float ratio)
     if (c > bd) c = bd;   /* a not-yet-learned per-instance row counted as shared: never below 0 */
     return rfom_nn_ambiguous(bd - c, bd2 - c, ratio);
 }
+/* Common camera term of a program's nearest matches (RSX_DLSS_MATCH_COMMON). Some programs carry a row that follows
+ * the camera yet differs between their draws (so it is learned as per-instance): while the camera moves, every
+ * static instance then misses its exact-instance match, and its nearest match's per-instance distance is the SAME
+ * value for every draw of the program that frame (log r1_fgdiag_1907: 112 draws of vs 4 at 183.977, 505 of vs 24 at
+ * 0.139054). That uniform term is the camera, not a rival instance: a draw whose per-instance distance repeats the
+ * value already seen on min_n other draws of its program this frame matched itself, so it is not ambiguous. */
+typedef struct { unsigned frame; float x; unsigned n; } RfomNnCommon;
+static inline int rfom_nn_common_same(float a, float b)
+{
+    const float m = a > b ? a : b, d = a > b ? a - b : b - a;
+    return m > 0.0f && d <= 1e-5f * m;
+}
+/* 1 = inst (> 0) equals the common term established by at least min_n earlier draws of this frame. */
+static inline int rfom_nn_common_hit(const RfomNnCommon* s, unsigned fr, float inst, unsigned min_n)
+{
+    return s->frame == fr && s->n >= min_n && inst > 0.0f && rfom_nn_common_same(inst, s->x);
+}
+static inline void rfom_nn_common_feed(RfomNnCommon* s, unsigned fr, float inst)
+{
+    if (!(inst > 0.0f) || !(inst < 3.0e38f)) return;
+    if (s->frame != fr) { s->frame = fr; s->x = inst; s->n = 1; return; }
+    if (rfom_nn_common_same(inst, s->x)) s->n++;
+    else if (s->n <= 1) { s->x = inst; s->n = 1; }
+}
 /* What an ambiguous nearest match becomes. Default (keep = 0): dropped, so the draw takes its own exact camera-only
  * motion (fsr_cam_prev, match type 4), else the camera fill (0). keep = 1 (RSX_DLSS_AMBIG_KEEP, the r1_fg12 path):
  * the match is kept as type 5 (camera fill if the frame has a camera, else that guessed match). Returns the match

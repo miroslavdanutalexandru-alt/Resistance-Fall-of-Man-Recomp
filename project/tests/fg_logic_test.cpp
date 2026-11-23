@@ -506,6 +506,23 @@ static void test_nn_ambiguous()
 	CHECK(rfom_nn_ambig_action(0, 0, 0) == 3 && rfom_nn_ambig_action(0, 1, 0) == 3);
 	// a view-attached piece (carbine) keeps its match: camera-only motion is wrong for it on either path
 	CHECK(rfom_nn_ambig_action(1, 0, 1) == 3 && rfom_nn_ambig_action(1, 1, 1) == 3);
+	// RSX_DLSS_MATCH_COMMON: a camera-following row learned as per-instance puts the same distance on every static
+	// draw of the program (vs 4: 112 x 183.977); from the 4th such draw of the frame on, that match is not a guess
+	{
+		RfomNnCommon cs = {};
+		const float d = 183.977f;
+		CHECK(!rfom_nn_common_hit(&cs, 7u, d, 3u));
+		for (int i = 0; i < 3; ++i) { CHECK(!rfom_nn_common_hit(&cs, 7u, d, 3u)); rfom_nn_common_feed(&cs, 7u, d); }
+		CHECK(rfom_nn_common_hit(&cs, 7u, d, 3u));
+		CHECK(!rfom_nn_common_hit(&cs, 7u, 140.0f, 3u));      // a moving instance at its own distance: still tested
+		rfom_nn_common_feed(&cs, 7u, 140.0f);
+		CHECK(rfom_nn_common_hit(&cs, 7u, d, 3u));             // one outlier does not reset an established term
+		CHECK(!rfom_nn_common_hit(&cs, 8u, d, 3u));            // next frame starts over
+		CHECK(!rfom_nn_common_hit(&cs, 7u, 0.0f, 3u));
+		RfomNnCommon mv = {};                                   // animated instances: all different, never common
+		const float an[] = { 5.39f, 6.36f, 8.10f, 6.16f, 5.97f, 1.17f };
+		for (float x : an) { CHECK(!rfom_nn_common_hit(&mv, 3u, x, 3u)); rfom_nn_common_feed(&mv, 3u, x); }
+	}
 	// view-attached = object origin within thr of the eye (clip x, y, w)
 	CHECK(rfom_viewmodel_near(0.05, -0.2, 0.4, 1.0));
 	CHECK(rfom_viewmodel_near(0.0, 0.0, -0.3, 1.0));      // rooted just behind the eye
