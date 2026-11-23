@@ -633,7 +633,17 @@ if ($CheckOnly) {
     try { Stop-Transcript | Out-Null } catch {}
     exit $(if ($script:Chk.Errors) { 1 } else { 0 })
 }
+# Whether step 4 generates the game code (all of it, or none): 'new', 'forced' (RFOM_REGEN=1), 'changed' / 'missing'
+# (tools\build_doctor.ps1 keeps a hash of the code generator's files in recompiled\.generator_inputs), else nothing.
+$GenScript = 'rfom_regen.py'; $GenDirs = @('recompiled', 'recompiled_game', 'project\spu')
+$GenStages = @('eboot:ppu_analyze', 'eboot:ppu_lift', 'eboot:ppu_emit', 'eboot:ppu_hooks', 'eboot:ppu_copy',
+    'game:ppu_analyze', 'game:ppu_lift', 'game:ppu_emit', 'game:ppu_post', 'game:ppu_hooks', 'game:ppu_copy', 'spu_lift', 'spu_post')
+function Get-RfomGenWhy {
+    if ((-not (Test-Path (Join-Path $Port 'recompiled_game\ppu_recomp.h')) -or -not (Test-Path (Join-Path $Port 'project\spu\pm_wwsjob\spu_recomp.c')))) { 'new' }
+    elseif ($env:RFOM_REGEN) { 'forced' } else { Test-GenStale $Port $GenScript }
+}
 Initialize-SpProgress $Port -Unattended:$Unattended
+if (Get-RfomGenWhy) { Set-SpGenPlan $GenStages -Full } else { Set-SpGenPlan @() }
 if ($GetSdks) {
     # The optional SDKs after the install: download what is missing, then build again. build.bat builds the DLSS and
     # Frame Generation bridges and copies the SDK DLLs whenever their files are there, so the game itself is not
@@ -798,22 +808,21 @@ Info "EBOOT.elf and game.elf: OK (BCUS98107 v1.00)"
 # ---------------------------------------------------------------- 4. game code
 Step "4/5  Generating the game code from your copy"
 # Generated again when it is missing, when forced, or when the code generator (its scripts, hooks and the lifter)
-# changed since it was generated: tools\build_doctor.ps1 keeps a hash of those files in recompiled\.generator_inputs.
-$GenScript = 'rfom_regen.py'; $GenDirs = @('recompiled', 'recompiled_game', 'project\spu')
-$genWhy = if ((-not (Test-Path (Join-Path $Port 'recompiled_game\ppu_recomp.h')) -or -not (Test-Path (Join-Path $Port 'project\spu\pm_wwsjob\spu_recomp.c')))) { 'new' } elseif ($env:RFOM_REGEN) { 'forced' } else { Test-GenStale $Port $GenScript }
+# changed since it was generated (Get-RfomGenWhy, again now: steps 1-3 may have just extracted the game).
+$genWhy = Get-RfomGenWhy
+if ($genWhy) { Set-SpGenPlan $GenStages -Full } else { Set-SpGenPlan @() }
 if ($genWhy) {
     if ($genWhy -eq 'changed') { Info "This version changes the code generator: generating the game code again (10-25 minutes)." }
     elseif ($genWhy -eq 'missing') { Info "Generating the game code again once, so it matches this version's code generator (10-25 minutes)." }
     if ($genWhy -ne 'new') { Info "Files that come out the same keep their date, so the build only compiles what really changed." }
     $genSnap = Save-GenSnapshot $Port $GenDirs
     Remove-GenStamp $Port
-    $code = Invoke-SpRegen $py 'tools\rfom_regen.py --eboot game\EBOOT.elf --game game\game.elf' @('eboot:ppu_analyze', 'eboot:ppu_lift', 'eboot:ppu_emit', 'eboot:ppu_hooks', 'eboot:ppu_copy',
-        'game:ppu_analyze', 'game:ppu_lift', 'game:ppu_emit', 'game:ppu_post', 'game:ppu_hooks', 'game:ppu_copy', 'spu_lift', 'spu_post')
+    $code = Invoke-SpRegen $py 'tools\rfom_regen.py --eboot game\EBOOT.elf --game game\game.elf' $GenStages
     if ($code -ne 0) { Fail "Generating the game code failed (see the messages above)." }
     if ($genSnap.Count) { $g = Restore-GenTimes $Port $GenDirs $genSnap; Info ("Generated files: {0} changed, {1} unchanged." -f $g.Changed, $g.Kept) }
     Save-GenStamp $Port $GenScript
 } else {
-    Set-SpEstimate 'gen' 1; Info "Already generated (set RFOM_REGEN=1 to force)."
+    Info "Already generated (set RFOM_REGEN=1 to force)."
     if ((Get-GenPlan $Port $GenScript).Legacy) { Save-GenStamp $Port $GenScript }   # the earlier version's record, for this version's generator
 }
 
