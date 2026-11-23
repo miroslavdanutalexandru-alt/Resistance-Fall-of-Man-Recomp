@@ -3,7 +3,8 @@
 1. rsx_ssao.inc: the SSAO HLSL is compiled at run time (D3DCompile), so a syntax error would only show in game.
    Every entry point (vs, ps_ao, ps_apply) is compiled here with d3dcompiler_47.dll, as the backend does.
 2. cellPad.c pad_coop_order: which connected controller slot feeds which pad port with PAD_P1_CONTROLLER /
-   PAD_P2_CONTROLLER (local co-op). The function is cut out of cellPad.c and run with a small C driver.
+   PAD_P2_CONTROLLER (local co-op), and with co-op off which controller is player 1 (the one used last,
+   pad_sdl3_busy). The functions are cut out of cellPad.c and run with a small C driver.
 3. cellPad.c pad_bg_neutral (PAD_BACKGROUND_INPUT off): every connected port goes neutral, also when port 0 is
    empty (co-op: a pinned player 2 alone), and both controller polls call it outside the port-0 guard;
    gyro look stops too (test_pad_gyro_bg.py).
@@ -62,15 +63,36 @@ def test_ssao_hlsl():
 DRIVER = r"""
 #include <stdio.h>
 #include <string.h>
+typedef struct { int connected; unsigned short buttons; unsigned char lt, rt; short lx, ly, rx, ry; } PadxState;
+%s
 %s
 static int run(const char* conn_s, int want, int p2, const char* expect)
 {
     int conn[8] = {0}, order[8], n = 0;
     for (int i = 0; conn_s[i]; i++) conn[i] = conn_s[i] == '1';
-    pad_coop_order(conn, 8, want, p2, order, &n);
+    pad_coop_order(conn, NULL, 8, want, p2, NULL, order, &n);
     char got[32] = {0};
     for (int i = 0; i < n; i++) got[i] = order[i] < 0 ? '-' : (char)('1' + order[i]);   /* '-' = port left empty */
     if (strcmp(got, expect)) { printf("FAIL conn=%%s p1=%%d p2=%%d: got '%%s' want '%%s'\n", conn_s, want + 1, p2 + 1, got, expect); return 1; }
+    return 0;
+}
+/* One player (co-op off): busy_s = controllers in use this poll, *last carried between polls. */
+static int run1(const char* conn_s, const char* busy_s, int want, int* last, const char* expect)
+{
+    int conn[8] = {0}, busy[8] = {0}, order[8], n = 0;
+    for (int i = 0; conn_s[i]; i++) conn[i] = conn_s[i] == '1';
+    for (int i = 0; busy_s[i]; i++) busy[i] = busy_s[i] == '1';
+    pad_coop_order(conn, busy, 8, want, -1, last, order, &n);
+    char got[32] = {0};
+    for (int i = 0; i < n; i++) got[i] = order[i] < 0 ? '-' : (char)('1' + order[i]);
+    if (strcmp(got, expect)) { printf("FAIL single conn=%%s busy=%%s: got '%%s' want '%%s'\n", conn_s, busy_s, got, expect); return 1; }
+    return 0;
+}
+static int busy_case(int lx, unsigned short buttons, unsigned char lt, int expect)
+{
+    PadxState s; memset(&s, 0, sizeof s);
+    s.connected = 1; s.lx = (short)lx; s.buttons = buttons; s.lt = lt;
+    if (pad_sdl3_busy(&s) != expect) { printf("FAIL busy lx=%%d buttons=%%u lt=%%u\n", lx, buttons, lt); return 1; }
     return 0;
 }
 int main(void)
@@ -89,6 +111,23 @@ int main(void)
     f += run("10100000",  0,  2, "13");    /* both pinned and connected */
     f += run("01100000", -1,  1, "32");    /* automatic player 1 skips the controller reserved for player 2 */
     f += run("00000000",  0,  1, "");      /* nothing connected */
+    /* One player: player 1 is the controller used last (the caller keeps only port 0). */
+    int last = -1;
+    f += run1("11000000", "00000000", -1, &last, "12");   /* nobody playing yet: the first one */
+    f += run1("11000000", "11000000", -1, &last, "12");   /* both busy at once (a mirror): no switch */
+    f += run1("11000000", "01000000", -1, &last, "21");   /* the other one is used while player 1's is idle */
+    f += run1("11000000", "00000000", -1, &last, "21");   /* idle: it stays */
+    f += run1("11000000", "11000000", -1, &last, "21");   /* mirror again: still no switch */
+    f += run1("11000000", "10000000", -1, &last, "12");   /* back to the first one */
+    f += run1("01000000", "00000000", -1, &last, "2");    /* it is unplugged: the other one takes over */
+    f += run1("11000000", "00000000", -1, &last, "21");   /* plugged back: no change until it is used */
+    last = -1;
+    f += run1("11000000", "01000000",  0, &last, "12");   /* PAD_P1_CONTROLLER pins player 1 */
+    f += busy_case(0, 0, 0, 0);            /* resting */
+    f += busy_case(12000, 0, 0, 0);        /* stick drift / a light touch doesn't count */
+    f += busy_case(-30000, 0, 0, 1);       /* a stick pushed far does */
+    f += busy_case(0, 0x1000, 0, 1);       /* a button */
+    f += busy_case(0, 0, 200, 1);          /* a trigger */
     printf(f ? "coop order: %%d failures\n" : "coop order ok\n", f);
     return f != 0;
 }
@@ -108,6 +147,8 @@ def test_coop_order():
     src = open(CELLPAD, encoding="utf-8", errors="replace").read()
     m = re.search(r"static void pad_coop_order\(.*?\n\}\n", src.replace("\r\n", "\n"), re.S)
     assert m, "pad_coop_order not found in cellPad.c"
+    b = re.search(r"static int pad_sdl3_busy\(.*?\n\}\n", src.replace("\r\n", "\n"), re.S)
+    assert b, "pad_sdl3_busy not found in cellPad.c"
     cc = find_cc()
     if not cc:
         print("SKIP coop order: no C compiler")
@@ -117,7 +158,7 @@ def test_coop_order():
     c = os.path.join(work, "coop.c")
     exe = os.path.join(work, "coop.exe")
     with open(c, "w") as f:
-        f.write(DRIVER % m.group(0))
+        f.write(DRIVER % (m.group(0), b.group(0)))
     if os.path.basename(cc).lower() in ("cl.exe", "clang-cl.exe", "cl", "clang-cl"):
         cmd = [cc, "/nologo", "/W3", c, "/Fe" + exe, "/Fo" + work + os.sep]
     else:
