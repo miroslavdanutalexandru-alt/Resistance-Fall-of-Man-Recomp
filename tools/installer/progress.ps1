@@ -66,10 +66,23 @@ function Read-SpTimings([string]$Path) {
     foreach ($k in 'steps', 'regen', 'build') { if (-not ($o[$k] -is [System.Collections.IDictionary])) { $o[$k] = @{} } }
     $o
 }
+# A number from logs\setup_timings.json: written with the invariant culture ("12.5"); a file written by a build that
+# used the PC's culture ("12,5" on ro-RO and similar) is read too. $null when it is not a number.
+function ConvertTo-SpNumber($Value) {
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [double] -or $Value -is [int] -or $Value -is [long] -or $Value -is [decimal]) { return [double]$Value }
+    $v = 0.0
+    if ([double]::TryParse(([string]$Value).Trim().Replace(',', '.'), [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$v)) { return $v }
+    $null
+}
+# A file's compile time for logs\setup_timings.json: "<seconds> <bytes>", always with a '.' decimal point.
+function Format-SpFileTime([double]$Sec, [double]$Bytes) {
+    [string]::Format([Globalization.CultureInfo]::InvariantCulture, '{0} {1}', [math]::Round($Sec, 1), [long]$Bytes)
+}
 # The value measured last time on this PC, else the default.
 function Get-SpTime([string]$Group, [string]$Key) {
     if ($script:SpOld -and $script:SpOld[$Group] -and $null -ne $script:SpOld[$Group][$Key]) {
-        $v = 0.0; if ([double]::TryParse("$($script:SpOld[$Group][$Key])", [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$v) -and $v -gt 0) { return $v }
+        $v = ConvertTo-SpNumber $script:SpOld[$Group][$Key]; if ($null -ne $v -and $v -gt 0) { return $v }
     }
     if ($Group -eq 'build') { return [double]$script:SpDefaults[$Key] }
     $d = $script:SpDefaults[$Group][$Key]
@@ -337,10 +350,10 @@ function Get-SpCompileTimes([string]$Port, $Pairs) {
     }
     if ($script:SpOld -and $script:SpOld['files'] -is [System.Collections.IDictionary]) {
         foreach ($k in $script:SpOld['files'].Keys) {
-            $v = "$($script:SpOld['files'][$k])" -split '\s+'
-            $s = 0.0; $b = 0.0
-            if ($v.Count -ge 1 -and [double]::TryParse($v[0], [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$s) -and $s -gt 0) {
-                if ($v.Count -ge 2) { [void][double]::TryParse($v[1], [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$b) }
+            $v = ([string]$script:SpOld['files'][$k]).Trim() -split '\s+'   # "<seconds> <bytes>"
+            $s = ConvertTo-SpNumber $v[0]; $b = 0.0
+            if ($null -ne $s -and $s -gt 0) {
+                if ($v.Count -ge 2) { $bv = ConvertTo-SpNumber $v[1]; if ($null -ne $bv) { $b = $bv } }
                 $t[$k.ToLowerInvariant()] = @{ Sec = $s; Bytes = $b }
             }
         }
@@ -606,7 +619,7 @@ function Invoke-SpBuild([string]$Port, [string]$Command, $Pairs, [string]$Rpcs3L
             $n = Read-SpNinjaLog (Join-Path $Port "$($pr[1])\.ninja_log") $pr[0]
             foreach ($k in $n.Keys) {
                 $fp = Join-Path $Port $k
-                if (Test-Path -LiteralPath $fp) { $files[$k] = '{0} {1}' -f [math]::Round($n[$k].Sec, 1), (Get-Item -LiteralPath $fp).Length }
+                if (Test-Path -LiteralPath $fp) { $files[$k] = Format-SpFileTime $n[$k].Sec (Get-Item -LiteralPath $fp).Length }
             }
         }
         if ($files.Count) { $script:SpRun['files'] = $files }

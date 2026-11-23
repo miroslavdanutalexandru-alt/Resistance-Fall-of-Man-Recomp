@@ -128,6 +128,28 @@ $o = Read-SpTimings (Join-Path $logs 'setup_timings.json')
 Check ((Near $o.steps['gen'] 432.1) -and (Near $o.steps['tools'] 12) -and $o.files['recompiled\ppu_recomp_000.cpp']) 'a later run keeps what it did not measure again'
 [IO.File]::WriteAllText((Join-Path $logs 'setup_timings.json'), '{ broken')
 Check ($null -eq (Read-SpTimings (Join-Path $logs 'setup_timings.json'))) 'a broken timings file is ignored'
+# a PC with a comma decimal point (ro-RO): written with '.', and a file written with ',' by an earlier build still reads
+$cul = [Threading.Thread]::CurrentThread.CurrentCulture
+try {
+    [Threading.Thread]::CurrentThread.CurrentCulture = [Globalization.CultureInfo]::GetCultureInfo('ro-RO')
+    Check ((Format-SpFileTime 321.54 1000) -eq '321.5 1000') 'per-file times are written with a ''.'' under ro-RO'
+    $script:SpOld = $null; $script:SpRun = @{ steps = @{ gen = 432.1 }; regen = @{}; build = @{ speed = 1.5 } }
+    $script:SpRun['files'] = @{ 'recompiled\ppu_recomp_000.cpp' = (Format-SpFileTime 321.5 1000) }
+    Save-SpTimings
+    $j = [IO.File]::ReadAllText((Join-Path $logs 'setup_timings.json'))
+    Check ($j -match '432\.1' -and $j -match '321\.5 1000' -and $j -notmatch '432,1|321,5') 'the timings file has ''.'' decimals under ro-RO'
+    Initialize-SpProgress $fp -Unattended
+    $times = Get-SpCompileTimes $fp @(, @('recompiled', 'build'))
+    Check ((Near (Get-SpTime 'steps' 'gen') 432.1) -and (Near $times['recompiled\ppu_recomp_000.cpp'].Sec 321.5)) '... and reads back under ro-RO'
+    [IO.File]::WriteAllText((Join-Path $logs 'setup_timings.json'), '{ "version": 1, "steps": { "gen": "432,1" }, "regen": {}, "build": { "speed": "1,5" }, "files": { "recompiled\\ppu_recomp_000.cpp": "321,5 1000" } }')
+    foreach ($cn in 'ro-RO', 'en-US') {
+        [Threading.Thread]::CurrentThread.CurrentCulture = [Globalization.CultureInfo]::GetCultureInfo($cn)
+        Initialize-SpProgress $fp -Unattended
+        $times = Get-SpCompileTimes $fp @(, @('recompiled', 'build'))
+        Check ((Near (Get-SpTime 'steps' 'gen') 432.1) -and (Near (Get-SpTime 'build' 'speed') 1.5) -and (Near $times['recompiled\ppu_recomp_000.cpp'].Sec 321.5) -and $times['recompiled\ppu_recomp_000.cpp'].Bytes -eq 1000) "a comma-formatted timings file is read ($cn)"
+    }
+} finally { [Threading.Thread]::CurrentThread.CurrentCulture = $cul }
+$script:SpRun = @{ steps = @{}; regen = @{}; build = @{} }
 # the log can be read while Setup writes it (FileShare.ReadWrite on both sides)
 $lf = Join-Path $logs 'build_rpcs3.log'
 $ws = New-Object IO.FileStream($lf, [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite)
