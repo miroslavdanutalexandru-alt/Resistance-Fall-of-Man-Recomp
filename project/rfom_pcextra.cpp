@@ -588,6 +588,7 @@ static void live_trigdz(const std::string& v) { cellpad_set_pad_opt("PAD_TRIGGER
 static void live_turnboost(const std::string& v) { cellpad_set_pad_opt("PAD_TURN_BOOST", v.c_str()); }
 static void live_crouch(const std::string& v) { cellpad_set_pad_opt("PAD_CROUCH_MODE", v.c_str()); }
 extern "C" void rfom_aim_assist_set(const char* v);   /* stubs.cpp (issue #26) */
+extern "C" void rfom_aim_assist_init(void);
 static void live_aimassist(const std::string& v) { rfom_aim_assist_set(v.c_str()); }
 extern "C" void cellaudio_set_pc_mix(int volume_pct, int mono);   /* cellAudio.c; -1 = unchanged */
 static void live_volume(const std::string& v) { cellaudio_set_pc_mix(v.empty() ? 100 : atoi(v.c_str()), -1); }
@@ -708,6 +709,7 @@ static void opts_init(void)
             "turnboost", "PAD_TURN_BOOST", 0, { {L"Off", ""}, {L"90 deg/s", "90"}, {L"180 deg/s", "180"}, {L"270 deg/s", "270"} }, "", live_turnboost);
     opt_add(L"Crouch button (L2 / C)", L"Hold or toggle. Experimental: L2 is also sprint with some layouts.", "crouchmode",
             "PAD_CROUCH_MODE", 0, { {L"As the game", ""}, {L"Toggle", "toggle"}, {L"Hold", "hold"} }, "", live_crouch);
+    rfom_aim_assist_init();   /* normalises PORT_AIM_ASSIST (RFOM_AIM_ASSIST alias, 1 / 0) for the row below */
     opt_add(L"Aim assist", L"The game's aim assist: your aim slows down over an enemy and is pulled toward it. Auto: off "
             L"with keyboard & mouse, on with a controller. On: always, as on PS3. Off: never.", "aimassist",
             "PORT_AIM_ASSIST", 0, { {L"Auto", ""}, {L"On", "on"}, {L"Off", "off"} }, "", live_aimassist);

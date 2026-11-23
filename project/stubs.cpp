@@ -1387,19 +1387,35 @@ static int aim_assist_parse(const char* e)
     if (!_stricmp(e, "off")) return 0;
     return atoi(e) != 0 ? 1 : 0;
 }
-/* NULL / "" = the start-up value: PORT_AIM_ASSIST, else RFOM_AIM_ASSIST, else auto */
+static void aim_assist_log(int m)
+{
+    fprintf(stderr, "[aimassist] aim assist: %s%c", m < 0 ? "auto (off with keyboard & mouse, on with a controller)"
+                                                : m ? "on (as on PS3)" : "off", 10);
+}
+/* Start-up value, once: PORT_AIM_ASSIST, else RFOM_AIM_ASSIST, else auto. PORT_AIM_ASSIST is
+   rewritten to the normalised value ("on" / "off", removed for auto) so the F9 row, which
+   reads PORT_AIM_ASSIST, shows the mode really in use (alias, "1" / "0"). */
+extern "C" void rfom_aim_assist_init(void)
+{
+    static volatile LONG once = 0;
+    if (InterlockedCompareExchange(&once, 1, 0) != 0) return;
+    const char* v = getenv("PORT_AIM_ASSIST");
+    if (!v || !*v) v = getenv("RFOM_AIM_ASSIST");
+    const int m = aim_assist_parse(v);
+    _putenv_s("PORT_AIM_ASSIST", m < 0 ? "" : m ? "on" : "off");
+    if (s_aa_mode == -2) { aim_assist_log(m); s_aa_mode = m; }
+}
+/* live change (F9 row): "" = auto, "on", "off" */
 extern "C" void rfom_aim_assist_set(const char* v)
 {
-    if (!v || !*v) { v = getenv("PORT_AIM_ASSIST"); if (!v || !*v) v = getenv("RFOM_AIM_ASSIST"); }
+    rfom_aim_assist_init();
     const int m = aim_assist_parse(v);
-    if (m != s_aa_mode)
-        fprintf(stderr, "[aimassist] aim assist: %s%c", m < 0 ? "auto (off with keyboard & mouse, on with a controller)"
-                                                    : m ? "on (as on PS3)" : "off", 10);
+    if (m != s_aa_mode) aim_assist_log(m);
     s_aa_mode = m;
 }
 static void aim_assist_apply(uint32_t player)
 {
-    if (s_aa_mode == -2) rfom_aim_assist_set(NULL);
+    if (s_aa_mode == -2) rfom_aim_assist_init();
     const int mode = s_aa_mode;
     if (!player || player >= 0xF0000000u) return;
     const uint32_t ctrl = vm_read32(player + 0x3E90);
