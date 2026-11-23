@@ -2172,7 +2172,7 @@ static int64_t sys_spu_image_open_handler(ppu_context* ctx)
 
     const char* ps3_path = (const char*)(vm_base + path_ea);
     char host_path[1024];
-    sys_fs_translate_path(ps3_path, host_path, sizeof(host_path));
+    sys_fs_translate_path_read(ps3_path, host_path, sizeof(host_path));
 
     FILE* f = fopen(host_path, "rb");
     if (!f) {

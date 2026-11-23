@@ -7,7 +7,9 @@
 //     mods\MyMod\USRDIR\<the game file to replace>
 //
 // A file there is opened in place of the game's own copy, by every file layer of the runtime
-// (cellFs, sys_fs: the g_vfs_override_hook in runtime/syscalls/sys_fs.c). Mods are applied in
+// (cellFs, sys_fs: the g_vfs_override_hook in runtime/syscalls/sys_fs.c), for reading only: an
+// open that writes, creates or truncates, and mkdir / rename / unlink, always get the game's own
+// path (a game copying a file it reads to /dev_hdd0 must not write over the mod file). Mods are applied in
 // alphabetical order of their folder names; when two replace the same file the later one wins.
 // A folder whose name starts with '_' or '-' is skipped (disabled). Only whole files can be
 // replaced (no texture replacement). The overrides are listed in the log at start-up.
@@ -27,7 +29,7 @@
 #include <mutex>
 #include "ps3emu/port_pc_extras.h"   // pcx_mod_rank (order.txt)
 
-extern "C" void (*volatile g_vfs_override_hook)(char* path, size_t cap);   // runtime/syscalls/sys_fs.c
+extern "C" void (*volatile g_vfs_override_hook)(char* path, size_t cap, int writing);   // runtime/syscalls/sys_fs.c
 
 namespace {
 
@@ -108,8 +110,9 @@ const char* game_rel(const char* p)
     return nullptr;
 }
 
-void override_hook(char* path, size_t cap)
+void override_hook(char* path, size_t cap, int writing)
 {
+    if (writing) return;   // writes, creates, truncates, renames, deletes: the game's own file
     if (s_index.empty()) return;
     const char* rel = game_rel(path);
     if (!rel) return;

@@ -943,6 +943,10 @@ void sys_fs_translate_path(const char* ps3_path, char* host, int size)
     (void)ps3_path;
     if (host && size > 0) host[0] = 0;
 }
+void sys_fs_translate_path_read(const char* ps3_path, char* host, int size)
+{
+    sys_fs_translate_path(ps3_path, host, size);
+}
 void sys_process_exit(int32_t status)            { exit((int)status); }
 int32_t sys_process_getpid(void)                 { return 1; }
 

@@ -63,7 +63,7 @@ extern volatile unsigned long long g_pad_inj_until;          /* cellPad.c: injec
 extern volatile uint32_t g_pad_inj_btn, g_pad_inj_sticks, g_pad_inj_clear;
 void cellpad_reload_controls(void);                          /* cellPad.c */
 extern void (*volatile g_port_xi_hook)(int port, void* gamepad);
-extern void (*volatile g_vfs_override_hook)(char* path, size_t cap);   /* sys_fs.c: every path the game opens */
+extern void (*volatile g_vfs_override_hook)(char* path, size_t cap, int writing);   /* sys_fs.c: every path the game opens */
 extern volatile unsigned long long g_rfom_play_ms;           /* cellPad.c / stubs.cpp: on-foot look code last ran */
 uint32_t cellGcm_get_flip_mode(void);                        /* cellGcmSys.c: 2 (VSYNC) while a movie plays */
 void rfpf_toast(const char* title, const char* text, char badge);
@@ -222,11 +222,12 @@ static volatile ULONGLONG s_skip_armed = 0, s_skip_arm_ms = 0, s_skip_used = 0;
 static std::mutex s_lvl_mu;
 static std::string s_level;                /* "" = not known yet */
 static volatile int s_level_gen = 0;
-static void (*s_prev_vfs_hook)(char* path, size_t cap) = NULL;
-static void vfs_hook(char* path, size_t cap)
+static void (*s_prev_vfs_hook)(char* path, size_t cap, int writing) = NULL;
+/* Watches every path, read or write; `writing` only matters to the mods hook it chains to. */
+static void vfs_hook(char* path, size_t cap, int writing)
 {
     std::string p(path ? path : "");
-    if (s_prev_vfs_hook) s_prev_vfs_hook(path, cap);   /* mods (rfom_mods.cpp) */
+    if (s_prev_vfs_hook) s_prev_vfs_hook(path, cap, writing);   /* mods (rfom_mods.cpp): reads only */
     for (auto& c : p) { if (c == '\\') c = '/'; c = (char)tolower((unsigned char)c); }
     if (p.size() > 4 && p.compare(p.size() - 4, 4, ".avi") == 0 && p.find("/movies/") != std::string::npos) {
         if (p.find("_attr") != std::string::npos) return;          /* the title screen's attract loop */
