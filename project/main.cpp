@@ -123,6 +123,7 @@ unsigned cellGcm_flip_request_count(void);
 extern "C" int  spu_sched_effective(void);   /* spu_channels.c: PORT_SPU_SCHED, [native] line */
 #if defined(_WIN32)
 extern "C" int  rsx_d3d12_backend_init(uint32_t w, uint32_t h, const char* title);
+extern "C" void rsx_d3d12_dpi_init(void);
 extern "C" void rsx_d3d12_backend_present(void);
 extern "C" int  rsx_d3d12_backend_pump_messages(void);
 #  define rsx_backend_init    rsx_d3d12_backend_init
@@ -522,6 +523,9 @@ int main(int argc, char** argv)
 
 #ifdef _WIN32
 #pragma comment(lib, "winmm.lib")
+    /* Real pixels under Windows display scaling (issue #25), before any window
+     * or DPI-dependent call; RSX_DPI_AWARE=0 skips it. */
+    rsx_d3d12_dpi_init();
     /* 1 ms timer resolution. The default granularity is about 15.6 ms, which
      * inflates every shorter wait the title makes and throttles the whole
      * thing. POSIX timers are already fine-grained. */

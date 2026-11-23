@@ -1170,6 +1170,74 @@ static DWORD pc_win_style(void)
     if (r < 0) { const char* e = getenv("RSX_RESIZABLE"); r = !(e && *e == '0'); }
     return r ? WS_OVERLAPPEDWINDOW : (WS_OVERLAPPEDWINDOW & ~(DWORD)(WS_THICKFRAME | WS_MAXIMIZEBOX));
 }
+/* Display scaling (issue #25). Without DPI awareness Windows treats the game as a 96-DPI program: at 150% or
+ * 300% scaling it sees a smaller "virtual" desktop (a 4K TV at 300% looks like 1280x720), so the window, and
+ * the swap chain sized from its client area, come out a fraction of the requested size and DWM stretches
+ * them up -- soft, shimmering, even in borderless. Per-monitor v2 awareness gives the window real pixels.
+ * Called first thing in main() (before any window exists) and again from create_window (no-op then).
+ * RSX_DPI_AWARE=0 skips it: the old, Windows-scaled behaviour (or whatever the exe's compatibility
+ * settings ask for). */
+static int s_dpi_state = -1;   /* -1 not yet, 0 off / not aware, 1 system aware, 2 per-monitor, 3 per-monitor v2 */
+void rsx_d3d12_dpi_init(void)
+{
+    typedef BOOL (WINAPI *SetCtxFn)(HANDLE);
+    typedef HANDLE (WINAPI *GetCtxFn)(void);
+    typedef int (WINAPI *AwarenessFn)(HANDLE);
+    typedef BOOL (WINAPI *EqFn)(HANDLE, HANDLE);
+    const char* e;
+    HMODULE u;
+    if (s_dpi_state >= 0) return;
+    e = getenv("RSX_DPI_AWARE");
+    u = GetModuleHandleA("user32.dll");
+    if (!(e && *e == '0') && u) {
+        SetCtxFn set = (SetCtxFn)(void*)GetProcAddress(u, "SetProcessDpiAwarenessContext");
+        if (set) {
+            /* -4 = PER_MONITOR_AWARE_V2 (Windows 10 1703+), -3 = PER_MONITOR_AWARE */
+            if (!set((HANDLE)(INT_PTR)-4)) set((HANDLE)(INT_PTR)-3);
+        } else {
+            SetProcessDPIAware();
+        }
+    }
+    s_dpi_state = IsProcessDPIAware() ? 1 : 0;
+    if (u) {
+        GetCtxFn get = (GetCtxFn)(void*)GetProcAddress(u, "GetThreadDpiAwarenessContext");
+        AwarenessFn aw = (AwarenessFn)(void*)GetProcAddress(u, "GetAwarenessFromDpiAwarenessContext");
+        EqFn eq = (EqFn)(void*)GetProcAddress(u, "AreDpiAwarenessContextsEqual");
+        if (get && aw) {
+            const HANDLE c = get();
+            const int a = aw(c);   /* 0 unaware, 1 system, 2 per-monitor */
+            s_dpi_state = a == 2 ? ((eq && eq(c, (HANDLE)(INT_PTR)-4)) ? 3 : 2) : a == 1 ? 1 : 0;
+        }
+    }
+}
+static UINT pc_dpi_of(HWND hwnd)
+{
+    typedef UINT (WINAPI *DpiWndFn)(HWND);
+    typedef UINT (WINAPI *DpiSysFn)(void);
+    static DpiWndFn wnd = NULL; static DpiSysFn sys = NULL; static int init = 0;
+    UINT d = 0;
+    if (!init) {
+        HMODULE u = GetModuleHandleA("user32.dll");
+        if (u) { wnd = (DpiWndFn)(void*)GetProcAddress(u, "GetDpiForWindow"); sys = (DpiSysFn)(void*)GetProcAddress(u, "GetDpiForSystem"); }
+        init = 1;
+    }
+    if (hwnd && wnd) d = wnd(hwnd);
+    if (!d && sys) d = sys();
+    return d ? d : 96;
+}
+/* Outer window rect for a client rect at a DPI (the frame is thicker at higher scaling). */
+static void pc_adjust_rect(RECT* r, DWORD style, UINT dpi)
+{
+    typedef BOOL (WINAPI *AdjFn)(LPRECT, DWORD, BOOL, DWORD, UINT);
+    static AdjFn adj = NULL; static int init = 0;
+    if (!init) {
+        HMODULE u = GetModuleHandleA("user32.dll");
+        if (u) adj = (AdjFn)(void*)GetProcAddress(u, "AdjustWindowRectExForDpi");
+        init = 1;
+    }
+    if (!(adj && s_dpi_state == 3 && adj(r, style, FALSE, 0, dpi)))
+        AdjustWindowRect(r, style, FALSE);
+}
 static int pc_alt_enter_on(void)
 {
     static int r = -1;
@@ -1582,6 +1650,30 @@ static LRESULT CALLBACK d3d12_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_EXITSIZEMOVE:
         d3_winpos_save(hwnd);
         break;
+    case 0x02E4:   /* WM_GETDPISCALEDSIZE (per-monitor v2): keep the client size in pixels on the new monitor */
+        if (!s_disp_borderless && !IsZoomed(hwnd) && lp) {
+            RECT cr;
+            if (GetClientRect(hwnd, &cr) && cr.right > 0 && cr.bottom > 0) {
+                RECT r = { 0, 0, cr.right, cr.bottom };
+                pc_adjust_rect(&r, (DWORD)GetWindowLongPtrA(hwnd, GWL_STYLE), (UINT)LOWORD(wp));
+                ((SIZE*)lp)->cx = r.right - r.left; ((SIZE*)lp)->cy = r.bottom - r.top;
+                return TRUE;
+            }
+        }
+        break;
+    case 0x02E0: {   /* WM_DPICHANGED: moved to a monitor with other scaling, or the scaling changed */
+        const RECT* s = (const RECT*)lp;
+        if (s_disp_borderless) {
+            MONITORINFO mi; mi.cbSize = sizeof mi;
+            if (GetMonitorInfoA(MonitorFromRect(s, MONITOR_DEFAULTTONEAREST), &mi))
+                SetWindowPos(hwnd, NULL, mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right - mi.rcMonitor.left,
+                             mi.rcMonitor.bottom - mi.rcMonitor.top, SWP_NOZORDER | SWP_NOACTIVATE);
+        } else if (s) {
+            SetWindowPos(hwnd, NULL, s->left, s->top, s->right - s->left, s->bottom - s->top, SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        InterlockedExchange(&s_sc_resize, 1);
+        fprintf(stderr, "[display] display scaling now %u%%%c", (unsigned)LOWORD(wp) * 100u / 96u, 10);
+        return 0; }
     case WM_SYSKEYDOWN:
         if (wp == VK_F10 && !(GetKeyState(VK_CONTROL) & 0x8000)) {   /* F10: quit prompt (Ctrl+F10 is a debug key) */
             if (!(lp & (1 << 30)) && !s_quit_req) InterlockedExchange(&s_quit_req, 1);
@@ -1732,8 +1824,10 @@ static HWND create_window(u32 width, u32 height, const char* title)
     u32 cw = width, ch = height;
     { const char* e = getenv("RSX_WINDOW"); unsigned a = 0, b = 0;
       if (e && sscanf(e, "%ux%u", &a, &b) == 2 && a >= 320 && b >= 200 && a <= 16384 && b <= 16384) { cw = a; ch = b; } }
+    rsx_d3d12_dpi_init();
     RECT wr = {0, 0, (LONG)cw, (LONG)ch};
-    AdjustWindowRect(&wr, pc_win_style(), FALSE);
+    pc_adjust_rect(&wr, pc_win_style(), pc_dpi_of(NULL));
+    int restored = 0;
     /* v200: RSX_MONITOR=<n> -- centre the window on monitor n (1 = primary);
      * borderless fullscreen then uses that monitor too */
     int wx = CW_USEDEFAULT, wy = CW_USEDEFAULT;
@@ -1753,7 +1847,9 @@ static HWND create_window(u32 width, u32 height, const char* title)
       const char* dm = getenv("RSX_DISPLAY"); RECT saved;
       const int start_bl = dm && (!_stricmp(dm, "borderless") || !_stricmp(dm, "fullscreen") || !strcmp(dm, "1"));
       s_winpos_on = !(e && *e == '0');
-      snprintf(s_winpos_key, sizeof s_winpos_key, "%s@%s", sz && *sz ? sz : "-", mo && *mo ? mo : "0");
+      /* "@dpi": rects saved by a DPI-aware run are in real pixels, older ones were in scaled units */
+      snprintf(s_winpos_key, sizeof s_winpos_key, "%s@%s%s", sz && *sz ? sz : "-", mo && *mo ? mo : "0",
+               s_dpi_state > 0 ? "@dpi" : "");
       if (!start_bl && d3_winpos_load(&saved)) {
           /* keep the whole window on the monitor it lands on (resolution, scaling or taskbar may have changed) */
           PcxWinPos fp = { saved.left, saved.top, saved.right - saved.left, saved.bottom - saved.top, "" };
@@ -1762,7 +1858,17 @@ static HWND create_window(u32 width, u32 height, const char* title)
               const int wk[4] = { mi.rcWork.left, mi.rcWork.top, mi.rcWork.right, mi.rcWork.bottom };
               pcx_winpos_fit(&fp, wk);
           }
-          wx = fp.x; wy = fp.y; wr.left = fp.x; wr.top = fp.y; wr.right = fp.x + fp.w; wr.bottom = fp.y + fp.h; } }
+          wx = fp.x; wy = fp.y; wr.left = fp.x; wr.top = fp.y; wr.right = fp.x + fp.w; wr.bottom = fp.y + fp.h;
+          restored = 1; } }
+    /* A window larger than the primary screen's work area (e.g. a 3840x2160 window on a 4K screen): start at the
+     * work area's corner so the title bar is on screen instead of wherever CW_USEDEFAULT cascades it. */
+    if (wx == CW_USEDEFAULT) {
+        RECT work;
+        if (SystemParametersInfoA(SPI_GETWORKAREA, 0, &work, 0) &&
+            (wr.right - wr.left > work.right - work.left || wr.bottom - wr.top > work.bottom - work.top)) {
+            wx = work.left; wy = work.top;
+        }
+    }
 
     /* Keep the display awake (see rsx_null_backend.c). */
     SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED);
@@ -1784,7 +1890,24 @@ static HWND create_window(u32 width, u32 height, const char* title)
             printf("[D3D12] raw mouse input unavailable (%lu)\n", GetLastError());
         /* v133: RSX_DISPLAY=borderless starts in borderless fullscreen. */
         const char* dm = getenv("RSX_DISPLAY");
-        if (dm && (!_stricmp(dm, "borderless") || !_stricmp(dm, "fullscreen") || !strcmp(dm, "1")))
+        const int start_bl = dm && (!_stricmp(dm, "borderless") || !_stricmp(dm, "fullscreen") || !strcmp(dm, "1"));
+        /* The frame was sized for the primary screen's scaling before the window existed; on another monitor
+         * (RSX_MONITOR) it can differ, so set the outer size again from the window's own DPI: the client area is
+         * then exactly the requested size, in real pixels (Windows still shrinks a window larger than the screen). */
+        const UINT dpi = pc_dpi_of(hw);
+        RECT cr = { 0, 0, 0, 0 };
+        GetClientRect(hw, &cr);
+        if (!restored && (cr.right != (LONG)cw || cr.bottom != (LONG)ch)) {
+            RECT r = { 0, 0, (LONG)cw, (LONG)ch };
+            pc_adjust_rect(&r, pc_win_style(), dpi);
+            SetWindowPos(hw, NULL, 0, 0, r.right - r.left, r.bottom - r.top, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+            GetClientRect(hw, &cr);
+        }
+        fprintf(stderr, "[display] window client %ldx%ld (requested %ux%u), display scaling %u%%, DPI awareness: %s%c",
+                cr.right, cr.bottom, cw, ch, dpi * 100u / 96u,
+                s_dpi_state == 3 ? "per-monitor v2" : s_dpi_state == 2 ? "per-monitor" : s_dpi_state == 1 ? "system" :
+                "none (Windows scales the window)", 10);
+        if (start_bl)
             disp_set_borderless(hw, 1);
         pc_claim_foreground(hw);
         { HANDLE th = CreateThread(NULL, 0, pc_quit_thread, NULL, 0, NULL); if (th) CloseHandle(th); }
