@@ -67,7 +67,7 @@ struct Setting {
 
 enum { S_DISPLAY, S_WINDOW, S_FPS, S_VSYNC, S_RES, S_FSR, S_UPSCALE, S_ANISO, S_FILTER, S_SHARPEN,
        S_MONITOR, S_FOCUS, S_MENUFPS, S_QUIT, S_SAVES, S_PADGLYPHS,
-       S_ASPECT, S_PRESENT, S_OVERLAY, S_MODS, S_TEXPACK,
+       S_ASPECT, S_PRESENT, S_DSYNC, S_OVERLAY, S_MODS, S_TEXPACK,
        S_SENSY, S_ADS, S_AIMHOLD, S_DEADZONE, S_CURVE,
        S_PADBACKEND, S_GYRO, S_GYROSENS, S_GYROINVY, S_GYROSPACE, S_GYROCAL, S_LIGHTBAR, S_NSWAP, S_COUNT };
 static const int S_INPUT_FIRST = S_SENSY;   // the Controls page's options (reset with the controls)
@@ -160,6 +160,12 @@ static std::vector<Setting> g_set = {
       "With VSync off: 'Allowed' presents immediately (lowest latency; with G-Sync / FreeSync the screen follows "
       "the frame rate). 'Never' drops late frames instead of tearing.",
       { {"Allowed  (lowest latency, VRR)", "tearing"}, {"Never", "notear"} }, 0 },
+    { "dsync", "Display sync",
+      "How frames are paced for your screen. Auto measures at start whether G-Sync / FreeSync really follows the "
+      "game; if not (VRR off, or not working in a borderless window), it paces for the fixed refresh rate: every frame "
+      "stays on screen equally long (e.g. 55 fps at 165 Hz, or 41 -> 82 fps with frame generation; movies with VSync). "
+      "Fixed refresh always does that; VRR never does (the old behaviour). The log says \"VRR effective: yes/no\".",
+      { {"Auto", "auto"}, {"VRR  (G-Sync / FreeSync)", "vrr"}, {"Fixed refresh", "fixed"} }, 0 },
     { "overlay", "Performance overlay",
       "F3 shows the frame rate, frame time, draws per frame and the CPU time per draw in a corner of the game.",
       { {"Off  (F3 shows it)", ""}, {"On at start  (F3 hides it)", "1"}, {"Disabled  (F3 does nothing)", "0"} }, 0 },
@@ -321,6 +327,7 @@ static bool save_settings()
     fprintf(f, "set \"RFOM_PAD_GLYPHS=%s\"\n", val(S_PADGLYPHS));
     fprintf(f, "set \"RFOM_ASPECT=%s\"\n", val(S_ASPECT));
     fprintf(f, "set \"RFOM_PRESENT=%s\"\n", val(S_PRESENT));
+    fprintf(f, "set \"RFOM_DISPLAY_SYNC=%s\"\n", val(S_DSYNC));
     fprintf(f, "set \"RFOM_OVERLAY=%s\"\n", val(S_OVERLAY));
     fprintf(f, "set \"RFOM_MODS=%s\"\n", val(S_MODS));
     fprintf(f, "set \"PAD_MOUSE_SENS_Y=%s\"\n", val(S_SENSY));
