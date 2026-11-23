@@ -1326,6 +1326,7 @@ extern "C" volatile long g_rfom_split;   /* rsx_fsr.inc: split-screen co-op on (
  * mouse turns the view through the stick. RFOM_COOP_ML=0: the old behaviour. */
 static struct { uint32_t obj; ULONGLONG seen; int score; } s_mlp[4];
 static uint32_t s_ml_owner;
+static int s_ml_owner_scored;   /* s_ml_owner was picked from the stick feed (split screen), not by default */
 /* two or more player objects ran the look code in the last 5 s (split screen) */
 static int ml_coop_recent(void)
 {
@@ -1336,7 +1337,7 @@ static int ml_coop_recent(void)
 static int ml_coop_owner(uint32_t player, float rp, float ry)
 {
     static int en = -1; if (en < 0) { const char* e = getenv("RFOM_COOP_ML"); en = (e && atoi(e) == 0) ? 0 : 1; }
-    if (!en || !player) { s_ml_owner = player; return 1; }
+    if (!en || !player) { s_ml_owner = player; s_ml_owner_scored = 0; return 1; }
     const ULONGLONG now = GetTickCount64();
     int me = -1, old = 0, active = 0;
     for (int i = 0; i < 4; i++) {
@@ -1346,7 +1347,7 @@ static int ml_coop_owner(uint32_t player, float rp, float ry)
     if (me < 0) { me = old; s_mlp[me].obj = player; s_mlp[me].score = 0; }
     s_mlp[me].seen = now;
     for (int i = 0; i < 4; i++) if (s_mlp[i].obj && now - s_mlp[i].seen < 1000) active++;
-    if (active <= 1) { s_ml_owner = player; return 1; }
+    if (active <= 1) { s_ml_owner = player; s_ml_owner_scored = 0; return 1; }
     const int fed = g_ml_fed_rx || g_ml_fed_ry;
     const int mv = fabsf(rp) > 0.02f || fabsf(ry) > 0.02f;
     int sc = s_mlp[me].score;
@@ -1359,6 +1360,7 @@ static int ml_coop_owner(uint32_t player, float rp, float ry)
     if (ow != s_ml_owner) { static int n = 0;
         if (n++ < 20) fprintf(stderr, "[mouselook] split screen: %d players, mouse look %s 0x%08X%c", active, ow ? "drives" : "off (stick) until it follows", ow ? ow : player, 10); }
     s_ml_owner = ow;
+    s_ml_owner_scored = 1;
     return player == ow;
 }
 /* Issue #26: aim assist on/off. Byte +0x74 of a player's controller options
@@ -1392,8 +1394,15 @@ static void aim_assist_apply(uint32_t player)
     int off = 1;
     if (mode < 0) {
         const int kbm = g_rfom_input_kbm != 0 || GetTickCount64() - g_ml_kbm_ms < 500;
-        /* split screen: only the mouse player's controller (unknown yet = leave it) */
-        const int mine = g_rfom_opts_ea ? opts == g_rfom_opts_ea : !g_rfom_split;
+        /* split screen: only the mouse player's controller (unknown yet = leave it).
+           g_rfom_opts_ea is only set with direct mouse look on; with mouse_look = stick
+           the owner ml_coop_owner picked (it runs either way) tells which player it is. */
+        int mine = !g_rfom_split;
+        if (g_rfom_opts_ea) mine = opts == g_rfom_opts_ea;
+        else if (g_rfom_split && s_ml_owner_scored && s_ml_owner && s_ml_owner < 0xF0000000u) {
+            const uint32_t oc = vm_read32(s_ml_owner + 0x3E90);
+            mine = oc && oc < 0xF0000000u && vm_read32(oc + 0x1AC0) == opts;
+        }
         off = kbm && mine;
     }
     static struct { uint32_t ea; uint8_t v; } saved[8];
