@@ -238,6 +238,8 @@ static bool dist_env(const char* name) { char v[4]; return GetEnvironmentVariabl
 // RECOMPLAUNCHER=1 for what it starts) updates its own copies, and an old copy may lack the updater.
 static std::string dist_no_auto_reason()
 {
+    if (g_dist_wine)   // the updater is a Windows PowerShell script; Wine / Proton has no PowerShell
+        return "Under Wine / Proton the updater can't run: update with \"git pull\" and ./setup_linux.sh (README, Linux), or download the new version from the release page.";
     if (GetFileAttributesA(path_of(".git").c_str()) != INVALID_FILE_ATTRIBUTES)
         return "This folder is a git checkout: update it with \"git pull\", then run Setup.bat.";
     if (dist_env("RECOMPLAUNCHER"))
