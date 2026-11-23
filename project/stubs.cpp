@@ -1361,9 +1361,65 @@ static int ml_coop_owner(uint32_t player, float rp, float ry)
     s_ml_owner = ow;
     return player == ow;
 }
+/* Issue #26: aim assist on/off. Byte +0x74 of a player's controller options
+ * block ([[player+0x3E90]+0x1AC0], the 0x78-byte per-controller entries that
+ * func_002B3358 sets up with +0x74 = 1; no game menu shows it and the profile
+ * does not save it) switches the game's aim assist for that player:
+ *   func_002A4D14 (look code) at 0x2A5044 only takes the assist path when it
+ *     is set: the view slows down over a target (factors f28/f30) and is pulled
+ *     toward it (f26/f29), both applied to the look rates at 0x2A5060;
+ *   func_002AB0A8 at 0x2AB208: tracking of that target while strafing;
+ *   func_0029ADF8 (two checks from 0x29B068): the stick response used with it.
+ * Enemies never read it (it is the human players' controller block).
+ * RFOM_AIM_ASSIST: unset / auto = off for the keyboard & mouse player, on for a
+ * controller; 1 = on (as on PS3); 0 = off for every player. The original value
+ * is put back as soon as assist should be on again. */
+extern "C" volatile int g_rfom_input_kbm;   /* cellPad.c: port 0 is the keyboard */
+static void aim_assist_apply(uint32_t player)
+{
+    static int mode = -2;   /* -1 auto, 0 off, 1 on */
+    if (mode == -2) {
+        const char* e = getenv("RFOM_AIM_ASSIST");
+        mode = (!e || !*e || !_stricmp(e, "auto")) ? -1 : (!_stricmp(e, "on") || atoi(e) != 0) ? 1 : 0;
+        fprintf(stderr, "[aimassist] aim assist: %s%c", mode < 0 ? "auto (off with keyboard & mouse, on with a controller)"
+                                                        : mode ? "on (as on PS3)" : "off", 10);
+    }
+    if (mode == 1 || !player || player >= 0xF0000000u) return;
+    const uint32_t ctrl = vm_read32(player + 0x3E90);
+    if (!ctrl || ctrl >= 0xF0000000u) return;
+    const uint32_t opts = vm_read32(ctrl + 0x1AC0);
+    if (!opts || opts >= 0xF0000000u) return;
+    int off = 1;
+    if (mode < 0) {
+        const int kbm = g_rfom_input_kbm != 0 || GetTickCount64() - g_ml_kbm_ms < 500;
+        /* split screen: only the mouse player's controller (unknown yet = leave it) */
+        const int mine = g_rfom_opts_ea ? opts == g_rfom_opts_ea : !g_rfom_split;
+        off = kbm && mine;
+    }
+    static struct { uint32_t ea; uint8_t v; } saved[8];
+    int i = 0;
+    while (i < 8 && saved[i].ea != opts) i++;
+    const uint8_t cur = vm_read8(opts + 0x74);
+    if (off) {
+        if (i == 8) {
+            for (i = 0; i < 8 && saved[i].ea; i++) {}
+            if (i == 8) i = 0;
+            saved[i].ea = opts; saved[i].v = cur;
+            static int n = 0;
+            if (n++ < 40) fprintf(stderr, "[aimassist] off for player 0x%08X (options 0x%08X, was %u)%c", player, opts, cur, 10);
+        }
+        if (cur) vm_write8(opts + 0x74, 0);
+    } else if (i < 8) {
+        vm_write8(opts + 0x74, saved[i].v);
+        static int n = 0;
+        if (n++ < 40) fprintf(stderr, "[aimassist] back on for player 0x%08X (controller)%c", player, 10);
+        saved[i].ea = 0;
+    }
+}
 extern "C" void rfom_mouselook_pre(uint32_t player)
 {
     fall_watch(player);   /* v168 */
+    aim_assist_apply(player);
     { static int en = -1; if (en < 0) { const char* e = getenv("RFOM_SCRIPT30"); en = e ? atoi(e) : 1; }
       const int sc = en && player && vm_read8(player + 0x3F07) == 1;
       if (sc != g_rfom_scripted) { g_rfom_scripted = sc; static int n = 0;

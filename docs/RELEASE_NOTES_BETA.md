@@ -10,6 +10,9 @@ This is a **beta**. The campaign has been played up to Cheddar Gorge. Later leve
 
 ## 0.3.1-beta (unreleased)
 
+### New
+- **Aim assist option (issue #26).** Launcher > Controls > Mouse > **Aim assist**: *Auto* (the default) turns the game's aim assist off while you play with keyboard & mouse and keeps it with a controller; *On* keeps it always, as on PS3; *Off* turns it off for everyone. Aim assist is the slowdown when your aim passes over an enemy and the pull toward it. In split-screen, *Auto* only turns it off for the keyboard & mouse player. Enemies aim as before. `RFOM_AIM_ASSIST=1` / `0` (unset = Auto). *Not yet tested in play; please report how it feels.*
+
 ### Controls
 - **No more split-screen from a second controller or a virtual copy of your controller (reported on Resistance 3, Resistance3Port #36, #37).** With DSX (or DS4Windows / Steam Input) running next to the default SDL3 controller support, the game could see both the real DualSense and the tool's virtual controller and treat them as two players, so pressing START could start split-screen. Now:
   - **Local co-op is off by default.** The game sees one player however many controllers are connected, and player 1 is **the controller you used last** (SDL3): pick up any connected controller and press a button. To play split-screen, set launcher > Controls > **Local co-op (split-screen)** to **On** (`PAD_COOP=1`); a saved *On* from an older version loads as *Off*, so turn it on again. The *Player 2 controller* option applies when it is on. Keyboard and mouse work as before, and split-screen still pauses DLSS / FSR / XeSS (issue #25).
