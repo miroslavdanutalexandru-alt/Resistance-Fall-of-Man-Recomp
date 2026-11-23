@@ -15,6 +15,11 @@ int main(void)
     CHECK(rfom_movie_lock_k(hz(120.0)) == 2);
     CHECK(rfom_movie_lock_k(hz(119.88)) == 2);
     CHECK(rfom_movie_lock_k(hz(240.0)) == 4);
+    CHECK(rfom_movie_lock_k(hz(300.0)) == 5);
+    CHECK(rfom_movie_lock_k(hz(360.0)) == 6);
+    CHECK(rfom_movie_lock_k(hz(480.0)) == 8);
+    CHECK(rfom_movie_lock_k(hz(540.0)) == 0);   /* k = 9: past the range */
+    CHECK(rfom_movie_lock_k(hz(280.0)) == 0);
     CHECK(rfom_movie_lock_k(hz(144.0)) == 0);
     CHECK(rfom_movie_lock_k(hz(165.0)) == 0);
     CHECK(rfom_movie_lock_k(hz(75.0)) == 0);
@@ -25,6 +30,8 @@ int main(void)
     CHECK(rfom_movie_vsync_default(hz(60.0), 1) == 1);
     CHECK(rfom_movie_vsync_default(hz(120.0), 1) == 1);
     CHECK(rfom_movie_vsync_default(hz(240.0), 1) == 1);
+    CHECK(rfom_movie_vsync_default(hz(360.0), 1) == 1);
+    CHECK(rfom_movie_vsync_default(hz(480.0), 1) == 1);
     /* 144 / 165 Hz: VRR when tearing presents work, else vsync as before */
     CHECK(rfom_movie_vsync_default(hz(165.0), 1) == 0);
     CHECK(rfom_movie_vsync_default(hz(144.0), 1) == 0);

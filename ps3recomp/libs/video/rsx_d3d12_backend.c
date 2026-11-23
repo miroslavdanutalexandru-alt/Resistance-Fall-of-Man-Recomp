@@ -2436,26 +2436,32 @@ static void present_blit(int vs)
     const u32 fi = s_d3d.frame_index;
     const double _gw0 = gpt_on() ? gpt_now_ms() : 0.0;
     /* Resistance port: movies run in flip mode 2 (the game asks for VSYNC
-     * flips) at 30 fps. Presenting them with interval 0 + tearing on a
-     * fixed-refresh panel tears every frame and judders whenever the
-     * free-running frame clock drifts across the real vblank. Movies only;
-     * gameplay is unchanged. RFOM_MOVIE_VSYNC=0 restores the old behaviour,
-     * =N picks the sync interval (1-4). Default 0 with RFOM_FPS=vrr; else
-     * 1 on 60/120/240 Hz (the frame clock locks to the real vblank there,
-     * project/main.cpp) or without tearing presents, and 0 + tearing on any
-     * other rate (144, 165 Hz...): vsync there shows the 30 fps frames for
-     * alternating refresh counts (5/6 at 165 Hz = judder), while VRR follows
-     * the steady frame clock (rfom_movie_pace.h). The refresh rate is
-     * re-read every 500 ms while a movie plays (window moved to another
-     * monitor).
+     * flips) at 30 fps. Movies only; gameplay is unchanged.
+     * RFOM_MOVIE_VSYNC unset (default) = by display (rfom_movie_pace.h):
+     *  - refresh rates that show 30 fps evenly (60/120/240/300/360/480 Hz,
+     *    the frame clock locks to the real vblank there, project/main.cpp),
+     *    an unknown rate, or no tearing presents: vsync, interval 1. Interval
+     *    0 + tearing on such a fixed-refresh panel tears every frame and
+     *    judders as the free-running frame clock drifts across the vblank.
+     *  - any other rate (144, 165 Hz...) with tearing presents: the same
+     *    present as gameplay, interval 0 + tearing, so FreeSync / G-Sync
+     *    follows the steady 30 fps clock; vsync there would show the frames
+     *    for alternating refresh counts (5/6 at 165 Hz = judder). A screen
+     *    without VRR then tears in videos as it does in gameplay
+     *    (RFOM_MOVIE_VSYNC=1 forces vsync).
+     *  The refresh rate is re-read every 500 ms while a movie plays (window
+     *  moved to another monitor).
+     * RFOM_MOVIE_VSYNC=N (1-4) forces that sync interval; set to 0, empty or
+     * negative = no forced vsync (the old present). RFOM_FPS=vrr = 0 too.
      * "Movie" = flip mode 2 AND the video decoder fed in the last 500 ms, so
      * boot/loading time in flip mode 2 keeps the old present. Frame
      * generation never runs on these untagged frames, and fg_present still
      * clamps the interval if it ever did. */
     { static int mv = -2, auto_mv = 1, said = -1, said_n = 0; static ULONGLONG last_q = 0; static double per_us = 0.0;
       if (mv == -2) { const char* e = getenv("RFOM_MOVIE_VSYNC"); const char* f = getenv("RFOM_FPS");
-                      mv = (e && *e) ? atoi(e) : (f && !_stricmp(f, "vrr")) ? 0 : -1;
-                      if (mv < -1) mv = 0; if (mv > 4) mv = 4; }
+                      if (e) { mv = atoi(e); if (mv < 0) mv = 0; }   /* set (even empty) = explicit; 0 / empty / negative = off */
+                      else mv = (f && !_stricmp(f, "vrr")) ? 0 : -1;
+                      if (mv > 4) mv = 4; }
       if (mv && vs == 0 && cellGcm_get_flip_mode() == 2 && cellVdec_movie_active(500)) {
           int iv = mv;
           if (mv < 0) {   /* default: follow the display */
@@ -2480,7 +2486,9 @@ static void present_blit(int vs)
                           !(per_us > 0.0) ? "refresh rate unknown"
                           : rfom_movie_lock_k(per_us) ? "shows 30 fps evenly" : "no tearing/VRR presents", 10);
               else
-                  fprintf(stderr, "[D3D12] movie: no vsync, tearing allowed (VRR) (display %.2f Hz does not show 30 fps evenly; RFOM_MOVIE_VSYNC=1 = vsync)%c",
+                  fprintf(stderr, "[D3D12] movie: no vsync, tearing allowed (VRR) -- display %.2f Hz can't show 30 fps evenly, so videos "
+                                  "follow the same present mode as gameplay (smooth with FreeSync/G-Sync); if your screen has no VRR "
+                                  "and videos tear, set RFOM_MOVIE_VSYNC=1%c",
                           1e6 / per_us, 10);
           }
           vs = iv;

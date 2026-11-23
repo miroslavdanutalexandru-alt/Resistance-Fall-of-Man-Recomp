@@ -327,7 +327,7 @@ static DWORD WINAPI frame_clock(LPVOID)
          * video decoder fed in the last 500 ms) phase/period-lock the synthetic
          * vblank to the display's real one (DWM timing), so each 30 fps movie
          * frame (2 ticks) spans an exact integer number of refreshes on 60/120/
-         * 240 Hz panels. Other refresh rates, and gameplay, keep the 59.94 clock
+         * 240/300/360/480 Hz panels. Other refresh rates, and gameplay, keep the 59.94 clock
          * (rfom_movie_pace.h; the movie present then leaves pacing to VRR when
          * tearing presents work). */
         {
