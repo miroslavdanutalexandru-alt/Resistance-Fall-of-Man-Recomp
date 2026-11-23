@@ -56,6 +56,7 @@
 #include <timeapi.h>
 #include <dwmapi.h>     /* RFOM_MOVIE_VBLANK_LOCK: DwmGetCompositionTimingInfo */
 #pragma comment(lib, "dwmapi.lib")
+#include "rfom_movie_pace.h"   /* rfom_movie_lock_k: agrees with the movie present */
 #endif
 
 /* ---------------------------------------------------------------------------
@@ -326,7 +327,9 @@ static DWORD WINAPI frame_clock(LPVOID)
          * video decoder fed in the last 500 ms) phase/period-lock the synthetic
          * vblank to the display's real one (DWM timing), so each 30 fps movie
          * frame (2 ticks) spans an exact integer number of refreshes on 60/120/
-         * 240 Hz panels. Other refresh rates, and gameplay, keep the 59.94 clock. */
+         * 240/300/360/480 Hz panels. Other refresh rates, and gameplay, keep the 59.94 clock
+         * (rfom_movie_pace.h; the movie present then leaves pacing to VRR when
+         * tearing presents work). */
         {
             static int lock = -1; static long long base_vb = 0; static ULONGLONG last_q = 0;
             if (lock < 0) { char b[8]; DWORD n = GetEnvironmentVariableA("RFOM_MOVIE_VBLANK_LOCK", b, sizeof b);
@@ -343,22 +346,17 @@ static DWORD WINAPI frame_clock(LPVOID)
                         LARGE_INTEGER qf; QueryPerformanceFrequency(&qf);
                         if (SUCCEEDED(DwmGetCompositionTimingInfo(NULL, &ti)) && ti.qpcRefreshPeriod && qf.QuadPart) {
                             const double per_us = (double)ti.qpcRefreshPeriod * 1e6 / (double)qf.QuadPart;
-                            const int k = (int)(16683.0 / per_us + 0.5);   /* refreshes per 60 Hz tick */
-                            const double d = k * per_us - 16683.0;
-                            if (k >= 1 && k <= 4 && d > -400.0 && d < 400.0) {
+                            const int k = rfom_movie_lock_k(per_us);   /* refreshes per 60 Hz tick, 0 = none */
+                            { static int said_k = -1;
+                              if (k != said_k) { said_k = k;
+                                  fprintf(stderr, "[rsx] movie vblank lock: display %.2f Hz, %s\n", 1e6 / per_us,
+                                          k ? "locked" : "not a 60 Hz multiple, frame clock free-runs"); } }
+                            if (k) {
                                 vb_us = (long long)(k * per_us + 0.5);
-                                /* next tick 1.5 ms after a real vblank */
+                                /* next tick shortly after a real vblank (rfom_movie_phase_shift) */
                                 LARGE_INTEGER qn; QueryPerformanceCounter(&qn);
                                 const long long since = (long long)((double)(qn.QuadPart - (LONGLONG)ti.qpcVBlank) * 1e6 / (double)qf.QuadPart);
-                                long long p = (long long)per_us; if (p <= 0) p = 1;
-                                const long long ph = ((since % p) + p) % p;
-                                /* phase error of next_tick against "vblank + 1.5 ms", in
-                                 * (-p/2, p/2]: shift by it, never by whole periods (a due
-                                 * tick must not be pushed back a refresh) */
-                                const long long tgt = now - ph + 1500;
-                                long long off = ((next_tick - tgt) % p + p) % p;
-                                if (off > p / 2) off -= p;
-                                if (off > 1000 || off < -1000) next_tick -= off;
+                                next_tick -= rfom_movie_phase_shift(next_tick, now, since, (long long)per_us);
                             }
                         }
                     }

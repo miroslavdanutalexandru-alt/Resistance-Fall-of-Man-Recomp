@@ -19,6 +19,7 @@ This is a **beta**. The campaign has been played up to Cheddar Gorge. Later leve
 
 ### Fixes
 - **Missing HUD / menu highlight on some Windows 10 PCs:** textures whose size isn't a multiple of 4 are decompressed before upload (`RSX_BC_UNALIGNED`, default on).
+- **Intro and cutscene videos no longer stutter on 144 / 165 Hz screens with FreeSync / G-Sync.** Videos play at 30 fps, which a 60, 120, 240 or 360 Hz screen shows evenly, so the game keeps vsync for them there. Other refresh rates can't show 30 fps evenly (at 165 Hz each frame stayed up for 5 or 6 refreshes, which looked like a stutter), so on 144 / 165 Hz screens videos now follow the same present mode as gameplay (smooth with FreeSync / G-Sync). If your screen has no VRR and videos tear, set `RFOM_MOVIE_VSYNC=1`. `RFOM_MOVIE_VSYNC=0` never forces vsync for videos. `logs\run.log` says which mode was picked (`[D3D12] movie:`).
 - **Ultrawide:** the Hor+ stretch no longer drops back to 16:9 a few seconds into gameplay; it stays while 3D scenes are drawn (issue #2; `RFOM_ASPECT_SCENE_HOLD`).
 - **Frame generation:** less ghosting on the first-person weapon during fast turns (`RSX_DLSS_VIEWMODEL_W`).
 - **Portable build tools:** unpacking xwin / LLVM fixed (issue #16).
