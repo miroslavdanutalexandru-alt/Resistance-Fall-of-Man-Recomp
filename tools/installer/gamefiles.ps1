@@ -11,6 +11,7 @@
 #                                  - copies the disc files (mounts an .iso; reads it directly when
 #                                    Windows can't mount it, e.g. under Wine)
 # Disc images are read with a small ISO 9660 reader, so checking an .iso needs no mounting.
+# UDF-only images (no ISO 9660 part) are checked through the drive Windows opens them as (not possible under Wine).
 # PowerShell 5.1 compatible.
 
 Set-StrictMode -Off
@@ -64,6 +65,44 @@ function Open-Iso([string]$Path) {
     return $iso
 }
 function Close-Iso($iso) { if ($iso -and $iso.Stream) { $iso.Stream.Close() } }
+
+# UDF-only images (no ISO 9660 part; some disc dumping tools make these): the reader above can't read them, but
+# Windows can open them as a drive (Mount-GameIso). Wine can't: there, such an image has to be unpacked first.
+function Test-UdfImage([string]$Path) {
+    try { $fs = [IO.File]::Open($Path, 'Open', 'Read', 'ReadWrite') } catch { return $false }
+    try {
+        $buf = New-Object byte[] 2048
+        for ($s = 16; $s -lt 32; $s++) {
+            [void]$fs.Seek([int64]$s * 2048, 'Begin')
+            if ($fs.Read($buf, 0, 2048) -ne 2048) { break }
+            $id = [Text.Encoding]::ASCII.GetString($buf, 1, 5)
+            if ($id -eq 'NSR02' -or $id -eq 'NSR03') { return $true }
+            if ($id -notin 'BEA01', 'BOOT2', 'CD001', 'CDW02', 'TEA01') { break }
+        }
+    } finally { $fs.Close() }
+    return $false
+}
+# Opens an .iso as a drive with Windows. Returns @{ Root = 'X:\'; Mounted = $true when this call mounted it } or
+# $null (no Mount-DiskImage, e.g. under Wine, or Windows could not open it). An image that is already open (for
+# example from Explorer) is used as it is and left open.
+function Mount-GameIso([string]$Path) {
+    if (-not (Get-Command Mount-DiskImage -ErrorAction SilentlyContinue)) { return $null }
+    $Path = [IO.Path]::GetFullPath($Path)
+    $mounted = $false
+    try {
+        if (-not (Get-DiskImage -ImagePath $Path -ErrorAction Stop).Attached) {
+            Mount-DiskImage -ImagePath $Path -StorageType ISO -ErrorAction Stop | Out-Null
+            $mounted = $true
+        }
+        for ($i = 0; $i -lt 20; $i++) {
+            $letter = @((Get-DiskImage -ImagePath $Path | Get-Volume -ErrorAction SilentlyContinue).DriveLetter | Where-Object { $_ }) | Select-Object -First 1
+            if ($letter) { return @{ Root = "${letter}:\"; Mounted = $mounted } }
+            Start-Sleep -Milliseconds 500
+        }
+    } catch {}
+    if ($mounted) { try { Dismount-DiskImage -ImagePath $Path | Out-Null } catch {} }
+    return $null
+}
 
 # Entries of a directory: Name, Dir, Extents (list of @(lba, size)), Size.
 function Get-IsoDir($iso, $dir) {
@@ -301,6 +340,7 @@ function Test-GameIso($Prof, $c, $item) {
     $iso = $null
     try { $iso = Open-Iso $item.FullName } catch {}
     if (-not $iso) {
+        if (Test-UdfImage $item.FullName) { return (Test-GameUdfIso $Prof $c $item) }
         Set-Bad $c 'error' 'ISO_UNREADABLE' "This file is not a readable disc image." "Check that the file was copied or downloaded completely, then pick it again."; return $c
     }
     try {
@@ -330,6 +370,22 @@ function Test-GameIso($Prof, $c, $item) {
     } catch {
         Set-Bad $c 'error' 'ISO_UNREADABLE' "The disc image could not be read ($($_.Exception.Message))." "Check that the file was copied or downloaded completely, then pick it again."
     } finally { Close-Iso $iso }
+    return $c
+}
+
+# A UDF-only .iso: checked like a game folder through the drive Windows opens it as.
+function Test-GameUdfIso($Prof, $c, $item) {
+    $m = Mount-GameIso $item.FullName
+    if (-not $m) {
+        Set-Bad $c 'error' 'ISO_UDF' "This disc image is in the UDF format, which Setup can read only when Windows opens it as a drive, and that did not work here." `
+            "Unpack the image with 7-Zip and pick the folder that contains PS3_GAME, or make an ISO 9660 image of the disc."
+        return $c
+    }
+    try { $f = Test-GameFolder $Prof (New-Check $item.FullName) $m.Root }
+    finally { if ($m.Mounted) { try { Dismount-DiskImage -ImagePath $item.FullName | Out-Null } catch {} } }
+    foreach ($k in 'Status', 'Code', 'Problem', 'Fix', 'Title', 'TitleId', 'Version', 'Bytes') { $c[$k] = $f[$k] }
+    foreach ($n in $f.Notes) { [void]$c.Notes.Add($n) }
+    if ($f.Root -and $f.Root.Length -gt $m.Root.Length) { $c.Sub = $f.Root.Substring($m.Root.Length).TrimEnd('\') }
     return $c
 }
 
@@ -366,19 +422,10 @@ function Copy-GameSource($Prof, $c, [string]$Dest, [switch]$Move) {
         return $null
     }
     # .iso: let Windows open it as a drive and copy from there; read it directly if that is not possible
-    $letter = $null
-    if (Get-Command Mount-DiskImage -ErrorAction SilentlyContinue) {
-        try {
-            Mount-DiskImage -ImagePath $c.Root -StorageType ISO -ErrorAction Stop | Out-Null
-            $script:GfMountedIso = $c.Root
-            for ($i = 0; $i -lt 20 -and -not $letter; $i++) {
-                $letter = (Get-DiskImage -ImagePath $c.Root | Get-Volume -ErrorAction SilentlyContinue).DriveLetter
-                if (-not $letter) { Start-Sleep -Milliseconds 500 }
-            }
-        } catch { $letter = $null }
-    }
-    if ($letter) {
-        $src = "${letter}:\"; if ($c.Sub) { $src = Join-Path $src $c.Sub }
+    $m = Mount-GameIso $c.Root
+    if ($m -and $m.Mounted) { $script:GfMountedIso = $c.Root }
+    if ($m) {
+        $src = $m.Root; if ($c.Sub) { $src = Join-Path $src $c.Sub }
         & robocopy $src $Dest /E /NFL /NDL /NJH /NJS /NP /XD @($script:GfSkipDirs | ForEach-Object { Join-Path $src $_ }) | Out-Null
         $rc = $LASTEXITCODE
         Dismount-GameSource
@@ -391,6 +438,7 @@ function Copy-GameSource($Prof, $c, [string]$Dest, [switch]$Move) {
     $iso = $null
     try {
         $iso = Open-Iso $c.Root
+        if (-not $iso) { return "Windows could not open the disc image as a drive, and it is not an ISO 9660 image Setup can read directly$(if (Test-UdfImage $c.Root) { ' (it is a UDF image: unpack it with 7-Zip and pick the folder with PS3_GAME)' })." }
         $start = if ($c.Sub) { Get-IsoEntry $iso $c.Sub } else { @{ Dir = $true; Extents = @(, @($iso.Root.Lba, $iso.Root.Size)) } }
         $done = [int64]0
         Export-IsoTree $iso $start $Dest ([ref]$done) $c.Bytes $script:GfSkipDirs
@@ -477,12 +525,20 @@ function Quick-Identify($Prof, [string]$p) {
     try {
         if ($p -match '\.iso$') {
             $iso = Open-Iso $p
-            if (-not $iso) { return $null }
-            try {
-                $e = Get-IsoEntry $iso 'PS3_GAME/PARAM.SFO'
-                if (-not $e) { foreach ($t in (Get-IsoDir $iso $iso.Root).Values) { if ($t.Dir) { $e = Get-IsoEntry $iso "$($t.Name)/PS3_GAME/PARAM.SFO"; if ($e) { break } } } }
-                if ($e) { $sfo = Read-Sfo (Read-IsoBytes $iso $e) }
-            } finally { Close-Iso $iso }
+            if (-not $iso -and (Test-UdfImage $p)) {
+                $m = Mount-GameIso $p
+                if (-not $m) { return $null }
+                try { $r = Find-DumpRoot $m.Root; if ($r) { $sfo = Read-Sfo ([IO.File]::ReadAllBytes((Join-Path $r 'PS3_GAME\PARAM.SFO'))) } }
+                finally { if ($m.Mounted) { try { Dismount-DiskImage -ImagePath ([IO.Path]::GetFullPath($p)) | Out-Null } catch {} } }
+            }
+            elseif (-not $iso) { return $null }
+            else {
+                try {
+                    $e = Get-IsoEntry $iso 'PS3_GAME/PARAM.SFO'
+                    if (-not $e) { foreach ($t in (Get-IsoDir $iso $iso.Root).Values) { if ($t.Dir) { $e = Get-IsoEntry $iso "$($t.Name)/PS3_GAME/PARAM.SFO"; if ($e) { break } } } }
+                    if ($e) { $sfo = Read-Sfo (Read-IsoBytes $iso $e) }
+                } finally { Close-Iso $iso }
+            }
         } else {
             $r = Find-DumpRoot $p
             if ($r) { $p = $r; $sfo = Read-Sfo ([IO.File]::ReadAllBytes((Join-Path $r 'PS3_GAME\PARAM.SFO'))) }
