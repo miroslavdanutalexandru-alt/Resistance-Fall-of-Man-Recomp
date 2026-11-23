@@ -424,6 +424,9 @@ static void rfom_fps_init(void)
 /* RFOM_DISPLAY_SYNC fixed-refresh pacing (rsx_d3d12_backend.c pacing_apply, render thread): the frame
  * limit becomes refresh / k (/ the frame-generation multiplier), e.g. 55 or 41.25 at 165 Hz; 0 = back
  * to RFOM_FPS. Not with RFOM_FPS=orig. Above 60 SetWaitFlip stops blocking, as for RFOM_FPS > 60. */
+extern "C" double rfom_pacing_correction_ms(void);   /* rsx_d3d12_backend.c (0 without the renderer) */
+extern "C" double rfom_pacing_correction_ms_default(void) { return 0.0; }
+#pragma comment(linker, "/alternatename:rfom_pacing_correction_ms=rfom_pacing_correction_ms_default")
 extern "C" double rfom_fps_target(void)
 {
     rfom_fps_init();
@@ -541,6 +544,12 @@ static int rfom_frame_wait_impl(uint64_t target, uint32_t last_ea)
     rfx_frame_tick();
     rfom_fps_init();
     if (s_rf_mode < 0) return 0;
+    if (s_rf_pace > 0.0) {   /* fixed-refresh pacing's phase lock (rsx_d3d12_backend.c): presents mid-refresh */
+        double c = rfom_pacing_correction_ms() * 79800.0;
+        const double lim = (double)target * 0.25;
+        if (c > lim) c = lim; else if (c < -lim) c = -lim;
+        target = (uint64_t)((double)target + c);
+    }
     const uint64_t last = vm_read64(last_ea);
     for (;;) {
         const uint64_t now = ppu_timebase_now();

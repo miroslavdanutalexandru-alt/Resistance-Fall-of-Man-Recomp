@@ -2684,6 +2684,15 @@ double rfom_fps_target_default(void) { return 60.0; }
 static HWND pds_game_hwnd(void) { return s_d3d.hwnd; }
 /* frames shown per present: DLSS-G / FSR 3 frame generation at the last present */
 static int fg_out_mult(void) { return s_fg_on ? s_fg_gen + 1 : s_f3_on ? 2 : 1; }
+/* frame generation shown every k-th refresh (k >= 2) at sync interval 1: nothing ties the frames to the
+ * refresh, so the limiter follows the phase lock (pds_note_phase / rfom_pacing_correction_ms) */
+static volatile int s_pace_pll;
+/* project/stubs.cpp rfom_frame_wait_impl, once a game frame: move the next deadline by this (ms) */
+double rfom_pacing_correction_ms(void)
+{
+    const double c = pds_pace_correction_ms();
+    return s_pace_pll ? c : 0.0;
+}
 
 static void pacing_apply(int movie, int* vs)
 {
@@ -2692,7 +2701,7 @@ static void pacing_apply(int movie, int* vs)
     static pds_plan cp;
     if (!pds_fixed()) {
         if (cur) {
-            cur = 0; rfom_fps_pacing_set(0.0);
+            cur = 0; s_pace_pll = 0; rfom_fps_pacing_set(0.0);
             fprintf(stderr, "[display] fixed-refresh pacing off: frame limit back to RFOM_FPS, presents as set (RSX_VSYNC)%c", 10);
         }
         return;
@@ -2718,6 +2727,7 @@ static void pacing_apply(int movie, int* vs)
             }
         }
         cp = p; cur = 1;
+        s_pace_pll = p.mult > 1 && p.k >= 2;
     }
     if (*vs == 0) *vs = cp.sync;
     if (mult > 1 && s_fg_on && !s_fg_vs_ok && !said_novs++)
@@ -2908,6 +2918,7 @@ static void present_blit(int vs)
       if (_gp0 > 0.0) s_gpt_cpu_sc += gpt_now_ms() - _gp0;
       port_ft_present();   /* frame-time recorder (project/port_frametime.h) */
       pds_note_presents(fg_out_mult());   /* VRR detection: frames this present shows */
+      if (s_pace_pll && !movie) pds_note_phase();
       RFX_MARK(RFX_PRESENT_END);
       movie_lfc_after_present(movie, vs, fi, tq.QuadPart); }
     s_vbb_index = (s_vbb_index + 1) % FRAME_COUNT;

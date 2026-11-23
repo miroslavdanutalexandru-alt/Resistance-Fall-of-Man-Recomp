@@ -126,6 +126,12 @@ int main(void)
       char s[192]; pds_plan_str(&a, s, sizeof s);
       CHECK(strstr(s, "41.25 fps rendered -> 82.50 shown") != NULL); }
 
+    /* the phase lock's error: mid-refresh = 0, late in the period > 0, just after a vblank < 0 */
+    CHECK(fabs(pds_phase_err(3.0, 6.0)) < 1e-9);
+    CHECK(fabs(pds_phase_err(4.5, 6.0) - 0.25) < 1e-9);
+    CHECK(fabs(pds_phase_err(0.6, 6.0) + 0.4) < 1e-9);
+    CHECK(fabs(pds_phase_err(13.5, 6.0) + 0.25) < 1e-9);   /* a missed vblank wake: same phase */
+
     if (fails) { fprintf(stderr, "display_sync_test: %d failure(s)\n", fails); return 1; }
     printf("display_sync_test: OK\n");
     return 0;

@@ -179,6 +179,14 @@ static inline void pds_plan_str(const pds_plan* p, char* out, size_t n)
                  p->hz, p->real, p->k, p->k == 1 ? "" : "es", p->sync);
 }
 
+/* Where in the refresh period a present came, as the phase lock's error: -0.5 .. 0.5 periods, 0 = mid-refresh. */
+static inline double pds_phase_err(double since_vblank_ms, double per_ms)
+{
+    double ph = fmod(since_vblank_ms, per_ms) / per_ms - 0.5;   /* -0.5 .. 0.5: 0 = mid-refresh */
+    if (ph < -0.5) ph += 1.0;
+    return ph;
+}
+
 #if defined(_WIN32) && !defined(PDS_LOGIC_ONLY)   /* PDS_LOGIC_ONLY: the host test */
 #include <windows.h>
 
@@ -199,6 +207,9 @@ static struct {
     volatile LONG gen;             /* bumped when fixed / hz change */
     volatile double hz_nominal;    /* the display mode's refresh rate (QueryDisplayConfig, exact) */
     volatile double hz_measured;   /* from FIXED windows, 0 = none yet */
+    volatile LONGLONG vb_qpc;      /* QPC time of the last vblank seen (the measuring thread) */
+    volatile LONG ph_sum, ph_n;    /* present phase errors (1e-4 periods) since pds_pace_correction_ms */
+    double qms;                    /* ms per QPC tick */
     int mode;
     char env[48];
     pds_hwnd_fn hwnd;
@@ -286,6 +297,7 @@ static DWORD WINAPI pds_thread(LPVOID unused)
         wfails = 0;
         if (prev && n < PDS_MAX_IV) iv[n++] = (float)((double)(t.QuadPart - prev) * qms);
         prev = t.QuadPart;
+        g_pds.vb_qpc = t.QuadPart;
         if (!w0) { w0 = t.QuadPart; p0 = g_pds.presents; n = 0; continue; }
         const double el = (double)(t.QuadPart - w0) * qms;
         if (el < PDS_WINDOW_MS) continue;
@@ -339,6 +351,7 @@ static void pds_start(const char* env, pds_hwnd_fn hwnd)
     g_pds.mode = pds_parse_mode(e);
     snprintf(g_pds.env, sizeof g_pds.env, "%s", env);
     g_pds.hwnd = hwnd;
+    { LARGE_INTEGER qf; QueryPerformanceFrequency(&qf); g_pds.qms = 1000.0 / (double)qf.QuadPart; }
     pds_decider_init(&g_pds.dec, g_pds.mode);
     g_pds.fixed = g_pds.dec.fixed;
     fprintf(stderr, "[display] display sync: %s (%s=%s)%s\n", pds_mode_name(g_pds.mode), env, e && *e ? e : "",
@@ -360,6 +373,33 @@ static inline double pds_hz(void)
     const double m = g_pds.hz_measured;
     if (m > 0.0 && fabs(m - g_pds.hz_nominal) < g_pds.hz_nominal * 0.02) return m;
     return g_pds.hz_nominal;
+}
+/* Phase lock for fixed-refresh pacing where nothing else ties the frames to the refresh (Vulkan FIFO, or
+ * frame generation showing every k-th refresh): a frame limit of exactly refresh / k still drifts against
+ * the real refresh by the measurement error, and every refresh period of drift one frame is shown for
+ * k-1 or k+1 refreshes. pds_note_phase at each real present records where in the refresh period it came
+ * (from the measuring thread's last vblank); pds_pace_correction_ms, called by the frame limiter once a
+ * frame, returns how far to move its next deadline (ms, + = later) so the presents settle mid-refresh,
+ * the point farthest from both vblanks. 0 when fixed-refresh pacing is off or nothing was recorded. */
+static inline void pds_note_phase(void)
+{
+    if (!g_pds.fixed) return;
+    const LONGLONG vb = g_pds.vb_qpc;
+    const double hz = pds_hz();
+    if (!vb || !(hz > 1.0) || !(g_pds.qms > 0.0)) return;
+    LARGE_INTEGER t; QueryPerformanceCounter(&t);
+    const double per = 1000.0 / hz, d = (double)(t.QuadPart - vb) * g_pds.qms;
+    if (d < 0.0 || d > per * 16.0) return;   /* the measuring thread stalled / stopped */
+    InterlockedExchangeAdd(&g_pds.ph_sum, (LONG)(pds_phase_err(d, per) * 10000.0));
+    InterlockedIncrement(&g_pds.ph_n);
+}
+static inline double pds_pace_correction_ms(void)
+{
+    const LONG n = InterlockedExchange(&g_pds.ph_n, 0);
+    const LONG s = InterlockedExchange(&g_pds.ph_sum, 0);
+    const double hz = pds_hz();
+    if (n <= 0 || !g_pds.fixed || !(hz > 1.0)) return 0.0;
+    return -((double)s / (double)n / 10000.0) * (1000.0 / hz) * 0.2;
 }
 #endif /* _WIN32 && !PDS_LOGIC_ONLY */
 
