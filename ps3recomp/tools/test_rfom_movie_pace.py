@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """rfom_movie_pace.h: 30 fps movies keep vsync on 60/120/240 Hz and without tearing presents,
-other refresh rates with tearing go to VRR (project/tests/movie_pace_test.c)."""
+other refresh rates with tearing go to VRR, with each frame presented 2x there (movie LFC)
+(project/tests/movie_pace_test.c)."""
 import os
 import shutil
 import subprocess

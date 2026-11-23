@@ -2431,79 +2431,137 @@ static int hud169_on(void)
 
 static int present_notear(void);
 
-static void present_blit(int vs)
+/* ---- RFOM_MOVIE_LFC: movie low-framerate compensation ------------------------------------------
+ * On the VRR movie path (interval 0 + tearing: a display that can't show 30 fps evenly, see
+ * present_blit) the movie presents at 30/s, below the VRR range of most screens (~48 Hz and up). The
+ * driver's own LFC does not always engage (hybrid laptops presenting through the iGPU, forced vsync),
+ * and the panel then shows the frames for uneven refresh counts (5/6 at 165 Hz). So each movie frame
+ * is presented k times (rfom_movie_lfc_count: 2 for 30 fps, 60 presents/s), the repeats evenly spaced
+ * (t0 + i * period / k, period = the measured movie cadence): the RSX render thread waits for its next
+ * batch OR a high-resolution waitable timer, and on the timer blits the last movie frame (its virtual
+ * back buffer is not drawn into until the next flip) plus the OSD to the swap chain and presents it.
+ * Only the render thread touches the swap chain, so nothing else changes. Any real present cancels
+ * pending repeats; the next one schedules its own if it is still a movie frame -- so repeats stop
+ * with the movie's last frame. Not while DLSS-G / FSR 3 FG generates frames (they pace presents
+ * themselves; movies are untagged, so generation is off there anyway), not with RSX_ASYNC=0.
+ * RFOM_MOVIE_LFC unset/empty = auto (only on the VRR movie path, not with the FSR 3 FG swap chain),
+ * 0 = off, N = N presents per movie frame (1-8) whenever a movie presents with interval 0. */
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+/* project/rfom_reflex.cpp (game exe): NVIDIA profile Vertical sync (-1 unknown, 0 app, 1 on, 2 off, 3 other) */
+int rfom_nv_drs_vsync(void);
+int rfom_nv_drs_vsync_default(void) { return -1; }
+#pragma comment(linker, "/alternatename:rfom_nv_drs_vsync=rfom_nv_drs_vsync_default")
+static double s_movie_per_us;          /* display refresh period while a movie plays, 0 = unknown */
+static DWORD s_lfc_rt_tid;             /* the RSX_ASYNC render thread (repeats run there) */
+static HANDLE s_lfc_timer;
+static int s_lfc_left, s_lfc_k, s_lfc_i, s_lfc_vs;
+static u32 s_lfc_fi;
+static ID3D12Resource* s_lfc_res;      /* s_d3d.render_targets[s_lfc_fi] when scheduled (recreated = skip) */
+static LONGLONG s_lfc_t0, s_lfc_prev, s_lfc_qf;
+static double s_lfc_period_us;         /* measured movie frame period, 0 = not yet */
+static unsigned s_lfc_reps, s_lfc_drops, s_lfc_active;
+static int s_f3_on;   /* rsx_fsr3fg.inc (included further down): FSR 3 FG generated a frame at the last present */
+static void present_draw_frame(ID3D12GraphicsCommandList* cl, UINT bi, u32 fi, D3D12_CPU_DESCRIPTOR_HANDLE* rtv,
+                               D3D12_VIEWPORT* vp, float* k);
+
+static DWORD WINAPI movie_lfc_drs_thread(LPVOID p)
 {
-    const u32 fi = s_d3d.frame_index;
-    const double _gw0 = gpt_on() ? gpt_now_ms() : 0.0;
-    /* Resistance port: movies run in flip mode 2 (the game asks for VSYNC
-     * flips) at 30 fps. Movies only; gameplay is unchanged.
-     * RFOM_MOVIE_VSYNC unset (default) = by display (rfom_movie_pace.h):
-     *  - refresh rates that show 30 fps evenly (60/120/240/300/360/480 Hz,
-     *    the frame clock locks to the real vblank there, project/main.cpp),
-     *    an unknown rate, or no tearing presents: vsync, interval 1. Interval
-     *    0 + tearing on such a fixed-refresh panel tears every frame and
-     *    judders as the free-running frame clock drifts across the vblank.
-     *  - any other rate (144, 165 Hz...) with tearing presents: the same
-     *    present as gameplay, interval 0 + tearing, so FreeSync / G-Sync
-     *    follows the steady 30 fps clock; vsync there would show the frames
-     *    for alternating refresh counts (5/6 at 165 Hz = judder). A screen
-     *    without VRR then tears in videos as it does in gameplay
-     *    (RFOM_MOVIE_VSYNC=1 forces vsync).
-     *  The refresh rate is re-read every 500 ms while a movie plays (window
-     *  moved to another monitor).
-     * RFOM_MOVIE_VSYNC=N (1-4) forces that sync interval; set to 0, empty or
-     * negative = no forced vsync (the old present). RFOM_FPS=vrr = 0 too.
-     * "Movie" = flip mode 2 AND the video decoder fed in the last 500 ms, so
-     * boot/loading time in flip mode 2 keeps the old present. Frame
-     * generation never runs on these untagged frames, and fg_present still
-     * clamps the interval if it ever did. */
-    { static int mv = -2, auto_mv = 1, said = -1, said_n = 0; static ULONGLONG last_q = 0; static double per_us = 0.0;
-      if (mv == -2) { const char* e = getenv("RFOM_MOVIE_VSYNC"); const char* f = getenv("RFOM_FPS");
-                      if (e) { mv = atoi(e); if (mv < 0) mv = 0; }   /* set (even empty) = explicit; 0 / empty / negative = off */
-                      else mv = (f && !_stricmp(f, "vrr")) ? 0 : -1;
-                      if (mv > 4) mv = 4; }
-      if (mv && vs == 0 && cellGcm_get_flip_mode() == 2 && cellVdec_movie_active(500)) {
-          int iv = mv;
-          if (mv < 0) {   /* default: follow the display */
-              const ULONGLONG t = GetTickCount64();
-              if (!last_q || t - last_q >= 500) {
-                  last_q = t;
-                  DWM_TIMING_INFO ti; memset(&ti, 0, sizeof ti); ti.cbSize = sizeof ti;
-                  LARGE_INTEGER qf; QueryPerformanceFrequency(&qf);
-                  per_us = (SUCCEEDED(DwmGetCompositionTimingInfo(NULL, &ti)) && ti.qpcRefreshPeriod && qf.QuadPart)
-                         ? (double)ti.qpcRefreshPeriod * 1e6 / (double)qf.QuadPart : 0.0;
-                  auto_mv = rfom_movie_vsync_default(per_us, s_tearing && !present_notear());
-              }
-              iv = auto_mv;
-          }
-          if (iv != said && said_n < 16) {
-              said = iv; said_n++;
-              if (mv > 0)
-                  fprintf(stderr, "[D3D12] movie: vsync present, interval %d (RFOM_MOVIE_VSYNC=%d)%c", mv, mv, 10);
-              else if (iv)
-                  fprintf(stderr, "[D3D12] movie: vsync present, interval 1 (display %.2f Hz, %s; RFOM_MOVIE_VSYNC=0 = no vsync)%c",
-                          per_us > 0.0 ? 1e6 / per_us : 0.0,
-                          !(per_us > 0.0) ? "refresh rate unknown"
-                          : rfom_movie_lock_k(per_us) ? "shows 30 fps evenly" : "no tearing/VRR presents", 10);
-              else
-                  fprintf(stderr, "[D3D12] movie: no vsync, tearing allowed (VRR) -- display %.2f Hz can't show 30 fps evenly, so videos "
-                                  "follow the same present mode as gameplay (smooth with FreeSync/G-Sync); if your screen has no VRR "
-                                  "and videos tear, set RFOM_MOVIE_VSYNC=1%c",
-                          1e6 / per_us, 10);
-          }
-          vs = iv;
-      } }
-    if (s_sc_wait) WaitForSingleObjectEx(s_sc_wait, 100, TRUE);   /* RFOM_REFLEX: at most one frame queued */
-    if (InterlockedExchange(&s_sc_resize, 0)) sc_resize();
+    (void)p;
+    const int v = rfom_nv_drs_vsync();
+    if (v == 1)
+        fprintf(stderr, "[D3D12] movie LFC: the NVIDIA profile forces Vertical sync On. With VRR active that only caps at the "
+                        "refresh rate, so the repeated presents still go out evenly; if VRR is not active for the game window, "
+                        "every present waits for a refresh and videos keep uneven frame times (Vertical sync = 'Use the 3D "
+                        "application setting' rules this out)%c", 10);
+    else if (v >= 0)
+        fprintf(stderr, "[D3D12] movie LFC: NVIDIA profile Vertical sync = %s%c",
+                v == 0 ? "application setting" : v == 2 ? "Off" : "Fast / Adaptive / half rate", 10);
+    return 0;
+}
+
+static void movie_lfc_cancel(void)
+{
+    if (s_lfc_left > 0 && s_lfc_timer) CancelWaitableTimer(s_lfc_timer);
+    s_lfc_left = 0;
+}
+
+static void movie_lfc_arm(void)
+{
+    LARGE_INTEGER now; QueryPerformanceCounter(&now);
+    const double slot = s_lfc_period_us * (double)s_lfc_qf / 1e6 / s_lfc_k;
+    const double rel = (double)s_lfc_t0 + slot * s_lfc_i - (double)now.QuadPart;   /* QPC ticks */
+    LARGE_INTEGER due; due.QuadPart = rel > 0.0 ? -(LONGLONG)(rel * 1e7 / (double)s_lfc_qf) - 1 : -1;
+    if (!SetWaitableTimer(s_lfc_timer, &due, 0, NULL, NULL, FALSE)) s_lfc_left = 0;
+}
+
+/* present_blit, after a real present (tq = QPC just before it): measure the movie cadence, decide k
+ * and schedule this frame's repeats. movie = the frame was a movie frame (see present_blit). */
+static void movie_lfc_after_present(int movie, int vs, u32 fi, LONGLONG tq)
+{
+    static int env = -2, said_k = -1, said_n = 0, said_off = 0;
+    if (!s_lfc_qf) { LARGE_INTEGER f; QueryPerformanceFrequency(&f); s_lfc_qf = f.QuadPart ? f.QuadPart : 1; }
+    if (!movie) {
+        if (s_lfc_active && said_n < 32) { said_n++;
+            fprintf(stderr, "[D3D12] movie LFC: movie ended, %u repeat presents, %u dropped (late)%c", s_lfc_reps, s_lfc_drops, 10); }
+        s_lfc_active = 0; s_lfc_prev = 0; s_lfc_period_us = 0.0; s_lfc_reps = s_lfc_drops = 0; said_k = -1;
+        return;
+    }
+    if (s_lfc_prev) s_lfc_period_us = rfom_movie_period_update(s_lfc_period_us, (double)(tq - s_lfc_prev) * 1e6 / (double)s_lfc_qf);
+    s_lfc_prev = tq;
+    if (env == -2) { const char* e = getenv("RFOM_MOVIE_LFC"); env = (e && *e) ? atoi(e) : -1; if (env < -1) env = 0; }
+    if (vs != 0) return;                        /* vsync movie present: the display shows it evenly */
+    const char* off = NULL;
+    if (env == 0) off = "off (RFOM_MOVIE_LFC=0)";
+    else if (GetCurrentThreadId() != s_lfc_rt_tid) off = "off (needs the render thread, RSX_ASYNC=0)";
+    else if (env < 0) {
+        const double p = s_movie_per_us;
+        if (!(s_tearing && !present_notear() && p > 0.0 && !rfom_movie_lock_k(p))) return;   /* not the VRR movie path */
+        if (s_f3_ready) off = "off (FSR 3 frame generation paces the presents itself; RFOM_MOVIE_LFC=2 forces it)";
+    }
+    if (off) { if (!said_off) { said_off = 1; fprintf(stderr, "[D3D12] movie LFC: %s%c", off, 10); } return; }
+    if (s_fg_on || s_f3_on) return;             /* frame generation running: it owns the present cadence */
+    const double per = s_lfc_period_us > 0.0 ? s_lfc_period_us : RFOM_MOVIE_FRAME_US;
+    const double hz = s_movie_per_us > 0.0 ? 1e6 / s_movie_per_us : 0.0;
+    const int k = rfom_movie_lfc_count(1e6 / per, hz, env);
+    if (k != said_k && said_n < 32) {
+        said_k = k; said_n++;
+        if (k >= 2)
+            fprintf(stderr, "[D3D12] movie LFC: %.2f fps movie, each frame presented %dx (%.1f presents/s, %.2f ms apart) to stay "
+                            "inside the VRR range at %.2f Hz (%s; RFOM_MOVIE_LFC=0 = off, =N = N presents per frame)%c",
+                    1e6 / per, k, k * 1e6 / per, per / k / 1000.0, hz, env > 0 ? "RFOM_MOVIE_LFC" : "auto", 10);
+        else
+            fprintf(stderr, "[D3D12] movie LFC: not needed (%.2f fps movie at %.2f Hz)%c", 1e6 / per, hz, 10);
+        if (k >= 2) { static int drs = 0; if (!drs) { drs = 1; HANDLE th = CreateThread(NULL, 0, movie_lfc_drs_thread, NULL, 0, NULL);
+                                                      if (th) CloseHandle(th); } }
+    }
+    if (k < 2) return;
+    if (!s_lfc_timer) {
+        s_lfc_timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+        if (!s_lfc_timer) s_lfc_timer = CreateWaitableTimerW(NULL, FALSE, NULL);
+        if (!s_lfc_timer) { if (!said_off) { said_off = 1; fprintf(stderr, "[D3D12] movie LFC: off (no waitable timer)%c", 10); }
+                            env = 0; return; }
+    }
+    s_lfc_active = 1;
+    s_lfc_t0 = tq; s_lfc_k = k; s_lfc_i = 1; s_lfc_left = k - 1; s_lfc_fi = fi; s_lfc_vs = vs;
+    s_lfc_res = s_d3d.render_targets[fi];
+    movie_lfc_arm();
+}
+
+/* The repeat: the last movie frame (virtual back buffer s_lfc_fi) and the OSD to the next swap-chain
+ * buffer, presented like the real one (no screenshot, frame-generation tags, latency markers or
+ * frame-time sample: it is not a new frame). */
+static void movie_lfc_present(void)
+{
+    const u32 fi = s_lfc_fi;
+    if (s_sc_wait) WaitForSingleObjectEx(s_sc_wait, 20, TRUE);
     const UINT bi = s_d3d.swap_chain->lpVtbl->GetCurrentBackBufferIndex(s_d3d.swap_chain);
-    if (bi >= FRAME_COUNT || !s_sc_buf[bi]) return;
+    if (bi >= FRAME_COUNT || !s_sc_buf[bi] || !s_d3d.render_targets[fi] || s_d3d.render_targets[fi] != s_lfc_res) return;
     blit_wait(s_blit_fv[bi]);
-    if (_gw0 > 0.0) s_gpt_cpu_sc += gpt_now_ms() - _gw0;
     ID3D12GraphicsCommandList* cl = s_blit_list;
     s_blit_alloc[bi]->lpVtbl->Reset(s_blit_alloc[bi]);
     cl->lpVtbl->Reset(cl, s_blit_alloc[bi], s_blit_pso);
-    if (gpt_on()) gpt_stamp(cl, GPT_BLIT);
-
     D3D12_RESOURCE_BARRIER b[2] = {0};
     b[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     b[0].Transition.pResource = s_d3d.render_targets[fi];
@@ -2514,7 +2572,59 @@ static void present_blit(int vs)
     b[1].Transition.pResource = s_sc_buf[bi];
     b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
     cl->lpVtbl->ResourceBarrier(cl, 2, b);
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv; D3D12_VIEWPORT vp; float k[8];
+    present_draw_frame(cl, bi, fi, &rtv, &vp, k);
+    if (s_osd_ready) osd_draw(cl, bi);
+    b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+    b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+    cl->lpVtbl->ResourceBarrier(cl, 2, b);
+    cl->lpVtbl->Close(cl);
+    ID3D12CommandList* lists[1] = { (ID3D12CommandList*)cl };
+    s_d3d.cmd_queue->lpVtbl->ExecuteCommandLists(s_d3d.cmd_queue, 1, lists);
+    const u64 v = ++s_blit_ctr;
+    s_d3d.cmd_queue->lpVtbl->Signal(s_d3d.cmd_queue, s_blit_fence, v);
+    s_blit_fv[bi] = v;
+    s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain, (UINT)s_lfc_vs,
+                                      (s_lfc_vs == 0 && s_tearing && !present_notear()) ? DXGI_PRESENT_ALLOW_TEARING : 0);
+}
 
+/* Render thread, the timer fired: present the due repeat, or drop it when late / the movie is gone. */
+static void movie_lfc_fire(void)
+{
+    if (s_lfc_left <= 0) return;
+    LARGE_INTEGER now; QueryPerformanceCounter(&now);
+    const int d = rfom_movie_lfc_due(s_lfc_t0, now.QuadPart, s_lfc_period_us > 0.0 ? s_lfc_period_us * (double)s_lfc_qf / 1e6
+                                     : RFOM_MOVIE_FRAME_US * (double)s_lfc_qf / 1e6, s_lfc_k, s_lfc_i);
+    if (d == 0) { movie_lfc_arm(); return; }   /* early wake */
+    if (d < 0 || s_sc_resize || cellGcm_get_flip_mode() != 2 || !cellVdec_movie_active(500)) {
+        if (d < 0) s_lfc_drops++;
+        s_lfc_left = 0; return;
+    }
+    movie_lfc_present();
+    s_lfc_reps++; s_lfc_i++;
+    if (--s_lfc_left > 0) movie_lfc_arm();
+}
+
+/* rt_main: wait for the next batch; meanwhile fire this movie frame's repeats when due. */
+static void movie_lfc_wait(HANDLE go)
+{
+    for (;;) {
+        if (s_lfc_left <= 0 || !s_lfc_timer) { WaitForSingleObject(go, INFINITE); return; }
+        HANDLE h[2] = { go, s_lfc_timer };
+        const DWORD r = WaitForMultipleObjects(2, h, FALSE, INFINITE);
+        if (r == WAIT_OBJECT_0) return;
+        if (r == WAIT_OBJECT_0 + 1) movie_lfc_fire();
+        else s_lfc_left = 0;
+    }
+}
+
+/* The guest frame (virtual back buffer fi) scaled into swap-chain buffer bi, letterboxed to its aspect
+ * (bound as the render target; rtv / vp / k out for the passes after it). */
+static void present_draw_frame(ID3D12GraphicsCommandList* cl, UINT bi, u32 fi, D3D12_CPU_DESCRIPTOR_HANDLE* rtv_out,
+                               D3D12_VIEWPORT* vp_out, float* k)
+{
     D3D12_CPU_DESCRIPTOR_HANDLE rtv;
     s_sc_rtv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_sc_rtv_heap, &rtv);
     rtv.ptr += (SIZE_T)bi * s_sc_rtv_inc;
@@ -2539,13 +2649,105 @@ static void present_blit(int vs)
     D3D12_GPU_DESCRIPTOR_HANDLE g;
     s_blit_srv_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(s_blit_srv_heap, &g);
     g.ptr += (UINT64)fi * s_blit_srv_inc;
-    const float k[8] = { s_blit_sharpen, 1.0f / (float)SC(s_d3d.width), 1.0f / (float)SC(s_d3d.height),
-                         g_pc_hdr_active ? s_hdr_sat : g_pc_gamma,
-                         (float)g_pc_hdr_active, (float)g_pc_cvd_mode, s_hdr_paper, s_hdr_peak };
+    k[0] = s_blit_sharpen; k[1] = 1.0f / (float)SC(s_d3d.width); k[2] = 1.0f / (float)SC(s_d3d.height);
+    k[3] = g_pc_hdr_active ? s_hdr_sat : g_pc_gamma;
+    k[4] = (float)g_pc_hdr_active; k[5] = (float)g_pc_cvd_mode; k[6] = s_hdr_paper; k[7] = s_hdr_peak;
     cl->lpVtbl->SetGraphicsRoot32BitConstants(cl, 0, 8, k, 0);
     cl->lpVtbl->SetGraphicsRootDescriptorTable(cl, 1, g);
     cl->lpVtbl->IASetPrimitiveTopology(cl, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     cl->lpVtbl->DrawInstanced(cl, 3, 1, 0, 0);
+    *rtv_out = rtv; *vp_out = vp;
+}
+
+static void present_blit(int vs)
+{
+    const u32 fi = s_d3d.frame_index;
+    const double _gw0 = gpt_on() ? gpt_now_ms() : 0.0;
+    movie_lfc_cancel();   /* a real present: the previous frame's repeats are over */
+    /* Resistance port: movies run in flip mode 2 (the game asks for VSYNC
+     * flips) at 30 fps. Movies only; gameplay is unchanged.
+     * RFOM_MOVIE_VSYNC unset (default) = by display (rfom_movie_pace.h):
+     *  - refresh rates that show 30 fps evenly (60/120/240/300/360/480 Hz,
+     *    the frame clock locks to the real vblank there, project/main.cpp),
+     *    an unknown rate, or no tearing presents: vsync, interval 1. Interval
+     *    0 + tearing on such a fixed-refresh panel tears every frame and
+     *    judders as the free-running frame clock drifts across the vblank.
+     *  - any other rate (144, 165 Hz...) with tearing presents: the same
+     *    present as gameplay, interval 0 + tearing, so FreeSync / G-Sync
+     *    follows the steady 30 fps clock; vsync there would show the frames
+     *    for alternating refresh counts (5/6 at 165 Hz = judder). A screen
+     *    without VRR then tears in videos as it does in gameplay
+     *    (RFOM_MOVIE_VSYNC=1 forces vsync).
+     *  The refresh rate is re-read every 500 ms while a movie plays (window
+     *  moved to another monitor).
+     * RFOM_MOVIE_VSYNC=N (1-4) forces that sync interval; set to 0, empty or
+     * negative = no forced vsync (the old present). RFOM_FPS=vrr = 0 too.
+     * "Movie" = flip mode 2 AND the video decoder fed in the last 500 ms, so
+     * boot/loading time in flip mode 2 keeps the old present. Frame
+     * generation never runs on these untagged frames, and fg_present still
+     * clamps the interval if it ever did. On the VRR path (and with RFOM_FPS=vrr /
+     * RFOM_MOVIE_VSYNC=0 on such a display) each movie frame is then presented
+     * more than once (RFOM_MOVIE_LFC, movie_lfc_after_present). */
+    int movie = 0;
+    { static int mv = -2, auto_mv = 1, said = -1, said_n = 0; static ULONGLONG last_q = 0;
+      if (mv == -2) { const char* e = getenv("RFOM_MOVIE_VSYNC"); const char* f = getenv("RFOM_FPS");
+                      if (e) { mv = atoi(e); if (mv < 0) mv = 0; }   /* set (even empty) = explicit; 0 / empty / negative = off */
+                      else mv = (f && !_stricmp(f, "vrr")) ? 0 : -1;
+                      if (mv > 4) mv = 4; }
+      if (vs == 0 && cellGcm_get_flip_mode() == 2 && cellVdec_movie_active(500)) {
+          movie = 1;
+          const ULONGLONG t = GetTickCount64();
+          if (!last_q || t - last_q >= 500) {   /* the display's refresh rate (window moved to another monitor) */
+              last_q = t;
+              DWM_TIMING_INFO ti; memset(&ti, 0, sizeof ti); ti.cbSize = sizeof ti;
+              LARGE_INTEGER qf; QueryPerformanceFrequency(&qf);
+              s_movie_per_us = (SUCCEEDED(DwmGetCompositionTimingInfo(NULL, &ti)) && ti.qpcRefreshPeriod && qf.QuadPart)
+                             ? (double)ti.qpcRefreshPeriod * 1e6 / (double)qf.QuadPart : 0.0;
+              auto_mv = rfom_movie_vsync_default(s_movie_per_us, s_tearing && !present_notear());
+          }
+          const double per_us = s_movie_per_us;
+          const int iv = mv < 0 ? auto_mv : mv;   /* default: follow the display */
+          if (mv && iv != said && said_n < 16) {
+              said = iv; said_n++;
+              if (mv > 0)
+                  fprintf(stderr, "[D3D12] movie: vsync present, interval %d (RFOM_MOVIE_VSYNC=%d)%c", mv, mv, 10);
+              else if (iv)
+                  fprintf(stderr, "[D3D12] movie: vsync present, interval 1 (display %.2f Hz, %s; RFOM_MOVIE_VSYNC=0 = no vsync)%c",
+                          per_us > 0.0 ? 1e6 / per_us : 0.0,
+                          !(per_us > 0.0) ? "refresh rate unknown"
+                          : rfom_movie_lock_k(per_us) ? "shows 30 fps evenly" : "no tearing/VRR presents", 10);
+              else
+                  fprintf(stderr, "[D3D12] movie: no vsync, tearing allowed (VRR) -- display %.2f Hz can't show 30 fps evenly, so videos "
+                                  "follow the same present mode as gameplay (smooth with FreeSync/G-Sync); if your screen has no VRR "
+                                  "and videos tear, set RFOM_MOVIE_VSYNC=1%c",
+                          1e6 / per_us, 10);
+          }
+          if (mv) vs = iv;
+      } }
+    if (s_sc_wait) WaitForSingleObjectEx(s_sc_wait, 100, TRUE);   /* RFOM_REFLEX: at most one frame queued */
+    if (InterlockedExchange(&s_sc_resize, 0)) sc_resize();
+    const UINT bi = s_d3d.swap_chain->lpVtbl->GetCurrentBackBufferIndex(s_d3d.swap_chain);
+    if (bi >= FRAME_COUNT || !s_sc_buf[bi]) return;
+    blit_wait(s_blit_fv[bi]);
+    if (_gw0 > 0.0) s_gpt_cpu_sc += gpt_now_ms() - _gw0;
+    ID3D12GraphicsCommandList* cl = s_blit_list;
+    s_blit_alloc[bi]->lpVtbl->Reset(s_blit_alloc[bi]);
+    cl->lpVtbl->Reset(cl, s_blit_alloc[bi], s_blit_pso);
+    if (gpt_on()) gpt_stamp(cl, GPT_BLIT);
+
+    D3D12_RESOURCE_BARRIER b[2] = {0};
+    b[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b[0].Transition.pResource = s_d3d.render_targets[fi];
+    b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+    b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    b[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b[1] = b[0];
+    b[1].Transition.pResource = s_sc_buf[bi];
+    b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    cl->lpVtbl->ResourceBarrier(cl, 2, b);
+
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv; D3D12_VIEWPORT vp; float k[8];
+    present_draw_frame(cl, bi, fi, &rtv, &vp, k);
     fg_photo_blit(cl);   /* photo mode: the HUD-less frame instead (screen and screenshot) */
 
     /* v200 screenshot: copy the finished back buffer to a readback buffer */
@@ -2623,11 +2825,13 @@ static void present_blit(int vs)
                     fprintf(stderr, "[D3D12] present: %s%c", vs ? "vsync" : (nt || !s_tearing) ? "no vsync, no tearing" : "no vsync, tearing allowed (VRR)", 10); }
       RFX_MARK(RFX_PRESENT_START);
       const double _gp0 = gpt_on() ? gpt_now_ms() : 0.0;
+      LARGE_INTEGER tq; QueryPerformanceCounter(&tq);
       s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain, (UINT)vs,
                                         (vs == 0 && s_tearing && !nt) ? DXGI_PRESENT_ALLOW_TEARING : 0);
       if (_gp0 > 0.0) s_gpt_cpu_sc += gpt_now_ms() - _gp0;
       port_ft_present();   /* frame-time recorder (project/port_frametime.h) */
-      RFX_MARK(RFX_PRESENT_END); }
+      RFX_MARK(RFX_PRESENT_END);
+      movie_lfc_after_present(movie, vs, fi, tq.QuadPart); }
     s_vbb_index = (s_vbb_index + 1) % FRAME_COUNT;
 }
 
@@ -13372,8 +13576,9 @@ static DWORD WINAPI rt_main(LPVOID p)
     (void)p;
     t_render_thread = 1;
     s_rsx_render_tid = GetCurrentThreadId();
+    s_lfc_rt_tid = s_rsx_render_tid;
     for (;;) {
-        WaitForSingleObject(s_rt_go, INFINITE);
+        movie_lfc_wait(s_rt_go);   /* WaitForSingleObject(s_rt_go), firing movie repeat presents meanwhile */
         T_DRAWS = s_rt_job.draws; T_DRAWCNT = s_rt_job.count; T_PARITY = s_rt_job.parity;
         s_present_this_frame = s_rt_job.present; s_in_midflush = s_rt_job.midflush;
         s_batch_cont = s_rt_job.cont;

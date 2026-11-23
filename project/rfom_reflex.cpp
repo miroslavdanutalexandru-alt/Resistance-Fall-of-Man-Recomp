@@ -310,4 +310,54 @@ int rfom_reflex_stats(double* total_ms, double* render_ms, double* gpu_ms)
 #endif
 }
 
+// RFOM_MOVIE_LFC (rsx_d3d12_backend.c): the NVIDIA driver profile's Vertical sync setting for this exe
+// (its application profile, else the global one), for run.log: a forced vsync changes how the movie's
+// repeated presents reach the screen. -1 unknown / not NVIDIA, 0 application-controlled, 1 forced On,
+// 2 forced Off, 3 something else (Fast, Adaptive, half rate...). Slow (loads the driver settings): call
+// it off the render thread.
+int rfom_nv_drs_vsync(void)
+{
+#if RFOM_HAVE_NVAPI
+    if (NvAPI_Initialize() != NVAPI_OK) return -1;
+    NvDRSSessionHandle ses = nullptr;
+    if (NvAPI_DRS_CreateSession(&ses) != NVAPI_OK || !ses) return -1;
+    int r = -1;
+    if (NvAPI_DRS_LoadSettings(ses) == NVAPI_OK) {
+        constexpr NvU32 kVsyncId = 0x00A879CF;   // VSYNCMODE_ID (NvApiDriverSettings.h)
+        NVDRS_SETTING s = {};
+        s.version = NVDRS_SETTING_VER;
+        bool found = false;
+        wchar_t path[MAX_PATH] = {};
+        const DWORD n = GetModuleFileNameW(nullptr, path, MAX_PATH);
+        if (n && n < MAX_PATH) {
+            const wchar_t* exe = wcsrchr(path, L'\\');
+            exe = exe ? exe + 1 : path;
+            NvAPI_UnicodeString name = {};
+            for (size_t i = 0; exe[i] && i + 1 < NVAPI_UNICODE_STRING_MAX; i++) name[i] = (NvU16)exe[i];
+            NvDRSProfileHandle prof = nullptr;
+            NVDRS_APPLICATION app = {};
+            app.version = NVDRS_APPLICATION_VER;
+            if (NvAPI_DRS_FindApplicationByName(ses, name, &prof, &app) == NVAPI_OK && prof)
+                found = NvAPI_DRS_GetSetting(ses, prof, kVsyncId, &s) == NVAPI_OK;
+        }
+        if (!found) {
+            NvDRSProfileHandle glob = nullptr;
+            s = {};
+            s.version = NVDRS_SETTING_VER;
+            if (NvAPI_DRS_GetCurrentGlobalProfile(ses, &glob) == NVAPI_OK && glob)
+                found = NvAPI_DRS_GetSetting(ses, glob, kVsyncId, &s) == NVAPI_OK;
+        }
+        if (!found) r = 0;   // not set anywhere: the driver default, application-controlled
+        else {
+            const NvU32 v = s.u32CurrentValue;
+            r = v == 0x60925292u ? 0 : v == 0x47814940u ? 1 : v == 0x08416747u ? 2 : 3;   // PASSIVE / FORCEON / FORCEOFF
+        }
+    }
+    NvAPI_DRS_DestroySession(ses);
+    return r;
+#else
+    return -1;
+#endif
+}
+
 } // extern "C"
