@@ -541,6 +541,21 @@ static void test_camrep()
 	int probes = 0;
 	for (unsigned f = 0; f < 64; ++f) probes += rfom_camrep_probe(0x397F3C37u, f);
 	CHECK(probes == 4);
+	// slow walk (R1 1847): 0.03 off a 0.004 motion is far now (was under the old fixed 0.05)
+	rfom_camrep_t w; std::memset(&w, 0, sizeof w);
+	for (int i = 0; i < 3; ++i) CHECK(rfom_camrep_step(&w, 0.03, 0.004, 0.01) == 0);
+	CHECK(rfom_camrep_step(&w, 0.03, 0.004, 0.01) == 1 && w.out);
+	CHECK(rfom_camrep_step(&w, 0.015, 0.004, 0.01) == 0 && w.score == 8);  // between near and far: no change
+	CHECK(rfom_camrep_step(&w, 0.02, 0.004, 0.01) == 0 && w.score == 8);   // at the far threshold: not far
+	for (int i = 0; i < 4; ++i) rfom_camrep_step(&w, 0.008, 0.004, 0.01);
+	CHECK(w.out && w.score == 4);
+	CHECK(rfom_camrep_step(&w, 0.008, 0.004, 0.01) == -1 && !w.out);        // within the loose vote: back in
+	rfom_camrep_t t; std::memset(&t, 0, sizeof t);
+	for (int i = 0; i < 8; ++i) rfom_camrep_step(&t, 0.03, 0.004, 0.002);  // TOL2 off: floor stays 0.02
+	CHECK(t.out);
+	rfom_camrep_t u; std::memset(&u, 0, sizeof u);
+	for (int i = 0; i < 8; ++i) rfom_camrep_step(&u, 0.045, 0.004, 0.05);  // TOL2 0.05: floor capped at the old 0.05
+	CHECK(!u.out && u.score == 0);
 }
 #endif
 

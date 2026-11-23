@@ -13094,6 +13094,7 @@ static void render_frame_impl(void)
         s_lock_valid = 1;
         s_lock_sx = s_lock_sy = 0.0; s_lock_n = 0;
     }
+    fg_hud_mv_dump(T_DRAWS, T_DRAWCNT);   /* Ctrl+Shift+F2: per-draw motion matching */
     s_dbg_last_draws = T_DRAWCNT;
     if (!t_render_thread) {   /* producer state: the FIFO thread's (render_frame resets it under RSX_ASYNC) */
         s_d3d.vb_offset  = 0; /* reset for next frame */

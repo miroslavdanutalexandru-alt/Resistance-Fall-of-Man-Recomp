@@ -82,13 +82,16 @@ static inline const double* rfom_fgcam_hold(rfom_fgcam_hold_t* h, const double* 
  * for their own reasons and give a camera nowhere near the real one (York logs: programs 397F3C37 / 8F6F6F59,
  * 0.15-10 ndc off). Two such programs took 2 of the 8 candidate slots each on nearly every unsolved frame, so a
  * tight group of 4 good candidates was no majority. Per program, on solved frames: d = its candidate's distance
- * to the solved camera (ndc), motion = the solved camera's own motion. Far (> max(0.05, motion / 2)) counts +2,
- * close (<= max(good, motion / 5)) -1; left out at 8, back in at 3 (it is still probed now and then). Returns
- * 1 when the program was just left out, -1 when just let back in, else 0. */
+ * to the solved camera (ndc), motion = the solved camera's own motion, good = the loose vote's tolerance.
+ * Far (> max(2 * good clamped to 0.02..0.05, motion / 2)) counts +2, close (<= max(good, motion / 5)) -1; left
+ * out at 8, back in at 3 (it is still probed now and then). The far floor was a fixed 0.05: during a slow walk
+ * programs 0.02-0.05 off were never left out yet broke the 0.01 loose vote (R1 1847: 50-frame unsolved streak).
+ * Returns 1 when the program was just left out, -1 when just let back in, else 0. */
 typedef struct { unsigned char score, out; } rfom_camrep_t;
 static inline int rfom_camrep_step(rfom_camrep_t* r, double d, double motion, double good)
 {
-    const double far_t = motion * 0.5 > 0.05 ? motion * 0.5 : 0.05, near_t = motion * 0.2 > good ? motion * 0.2 : good;
+    const double floor_t = good * 2.0 < 0.02 ? 0.02 : good * 2.0 > 0.05 ? 0.05 : good * 2.0;
+    const double far_t = motion * 0.5 > floor_t ? motion * 0.5 : floor_t, near_t = motion * 0.2 > good ? motion * 0.2 : good;
     int s = r->score;
     if (!(d <= far_t)) s += 2;   /* NaN / behind (1e9) count as far */
     else if (d <= near_t && s > 0) s--;
