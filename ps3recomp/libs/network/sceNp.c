@@ -404,7 +404,7 @@ static void np_ticket_build(u32 service_ea)
     for (u32 i = 48; i < NP_TICKET_SIZE; i++) s_np_ticket[i] = (u8)(i * 7 + 0x5A);
 
     memset(s_np_ticket_service, 0, sizeof s_np_ticket_service);
-    for (u32 i = 0; i < sizeof s_np_ticket_service - 1; i++) {
+    for (u32 i = 0; service_ea && i < sizeof s_np_ticket_service - 1; i++) {
         u8 c = vm_read8(service_ea + i);
         if (!c) break;
         s_np_ticket_service[i] = (char)c;
@@ -434,19 +434,30 @@ static s32 np_ticket_request(u32 np_id_ea, u32 service_ea, u32 cookie_ea, u32 co
     return CELL_OK;
 }
 
-/* GetTicket(buffer, bufferSize*): a NULL buffer asks for the size; otherwise
- * *bufferSize is the buffer's capacity and becomes the ticket's size. */
+/* Titles read the ticket before ever requesting one: Resistance: Fall of Man
+ * calls GetTicket and GetTicketParam right after sceNpManagerRegisterCallback,
+ * and only goes on to RequestTicket if that worked. A console signed in at
+ * boot has one by then, so there always is one here: made on first use, with
+ * no service ID until a RequestTicket names one. */
+static void np_ticket_ensure(void)
+{
+    if (!s_np_ticket_ready) np_ticket_build(0);
+}
+
+/* GetTicket(buffer, bufferSize*): *bufferSize is output only -- it is the
+ * ticket's size, not the buffer's capacity. Resistance: Fall of Man passes a
+ * buffer with *bufferSize = 0 and reads the ticket from it, so refusing a
+ * "too small" buffer breaks it. A NULL buffer asks for the size alone. */
 static s32 np_ticket_get(u32 buf_ea, u32 size_ea)
 {
     if (!s_np_initialized) return SCE_NP_ERROR_NOT_INITIALIZED;
     if (!size_ea) return SCE_NP_ERROR_INVALID_ARGUMENT;
-    if (!s_np_ticket_ready) return SCE_NP_ERROR_INVALID_STATE;
-    if (buf_ea) {
-        if (vm_read32(size_ea) < NP_TICKET_SIZE) return SCE_NP_ERROR_INVALID_ARGUMENT;
+    np_ticket_ensure();
+    if (buf_ea)
         for (u32 i = 0; i < NP_TICKET_SIZE; i++)
             vm_write8(buf_ea + i, s_np_ticket[i]);   /* raw bytes, not BE fields */
-    }
     vm_write32(size_ea, NP_TICKET_SIZE);
+    printf("[sceNp] ManagerGetTicket(buf=0x%08X) -> %u bytes\n", buf_ea, (u32)NP_TICKET_SIZE);
     return CELL_OK;
 }
 
@@ -457,9 +468,10 @@ static s32 np_ticket_get_param(s32 id, u32 out_ea)
 {
     if (!s_np_initialized) return SCE_NP_ERROR_NOT_INITIALIZED;
     if (!out_ea) return SCE_NP_ERROR_INVALID_ARGUMENT;
-    if (!s_np_ticket_ready) return SCE_NP_ERROR_INVALID_STATE;
     if (id < SCE_NP_TICKET_PARAM_SERIAL_ID || id > SCE_NP_TICKET_PARAM_SUBJECT_DOB)
         return SCE_NP_ERROR_INVALID_ARGUMENT;
+    np_ticket_ensure();
+    printf("[sceNp] ManagerGetTicketParam(id=%d)\n", id);
 
     for (u32 i = 0; i < 256; i++) vm_write8(out_ea + i, 0);
     const char* online_id = np_psnr_online_id();

@@ -88,10 +88,20 @@ int main(void)
     CHECK((u32)call(REQUEST_TICKET, NPID, SERVICE, 0, 0, 0, 0) == SCE_NP_ERROR_NOT_INITIALIZED);
     CHECK(sceNpInit(0x100000, NULL) == CELL_OK);
 
-    /* No ticket requested yet: there is nothing to read. */
-    vm_write32(SIZE, 0x1000);
-    CHECK((u32)call(GET_TICKET, TICKET, SIZE, 0, 0, 0, 0) == SCE_NP_ERROR_INVALID_STATE);
-    CHECK((u32)call(GET_PARAM, 2, PARAM, 0, 0, 0, 0) == SCE_NP_ERROR_INVALID_STATE);
+    /* Before any RequestTicket a ticket can already be read, as on a console
+     * signed in at boot: Resistance: Fall of Man calls GetTicket with
+     * *bufferSize = 0, then GetTicketParam 6, 9, 2, 3, and only goes online
+     * if those work. It has no service ID yet. */
+    vm_write32(SIZE, 0);
+    CHECK(call(GET_TICKET, TICKET, SIZE, 0, 0, 0, 0) == CELL_OK);
+    CHECK(vm_read32(SIZE) == NP_TICKET_SIZE);
+    CHECK(memcmp(vm_base + TICKET, "PS3RECOMP-NP-TICKET", 19) == 0);
+    CHECK(call(GET_PARAM, SCE_NP_TICKET_PARAM_SUBJECT_REGION, PARAM, 0, 0, 0, 0) == CELL_OK);
+    CHECK(call(GET_PARAM, SCE_NP_TICKET_PARAM_SUBJECT_STATUS, PARAM, 0, 0, 0, 0) == CELL_OK);
+    CHECK(call(GET_PARAM, SCE_NP_TICKET_PARAM_ISSUED_DATE, PARAM, 0, 0, 0, 0) == CELL_OK);
+    CHECK(vm_read64(PARAM) != 0);
+    CHECK(call(GET_PARAM, SCE_NP_TICKET_PARAM_SERVICE_ID, PARAM, 0, 0, 0, 0) == CELL_OK);
+    CHECK(vm_base[PARAM] == 0);
 
     /* A request with no service ID is refused. */
     CHECK((u32)call(REQUEST_TICKET, NPID, 0, 0, 0, 0, 0) == SCE_NP_ERROR_INVALID_ARGUMENT);
@@ -109,18 +119,15 @@ int main(void)
     CHECK(s_queued[0].args[1] == 0);
     CHECK(s_queued[0].args[2] == CB_ARG);
 
-    /* GetTicket: a NULL buffer asks for the size; a short buffer is refused
-     * and left untouched; a big enough one gets the ticket. */
+    /* GetTicket: a NULL buffer asks for the size; *bufferSize is output
+     * only, so whatever it held, the ticket is copied and its size written. */
     vm_write32(SIZE, 0);
     CHECK(call(GET_TICKET, 0, SIZE, 0, 0, 0, 0) == CELL_OK);
     u32 size = vm_read32(SIZE);
     CHECK(size == NP_TICKET_SIZE);
     CHECK((u32)call(GET_TICKET, TICKET, 0, 0, 0, 0, 0) == SCE_NP_ERROR_INVALID_ARGUMENT);
     memset(vm_base + TICKET, 0xA5, 0x400);
-    vm_write32(SIZE, size - 1);
-    CHECK((u32)call(GET_TICKET, TICKET, SIZE, 0, 0, 0, 0) == SCE_NP_ERROR_INVALID_ARGUMENT);
-    CHECK(vm_base[TICKET] == 0xA5);
-    vm_write32(SIZE, 0x400);
+    vm_write32(SIZE, 0);
     CHECK(call(GET_TICKET, TICKET, SIZE, 0, 0, 0, 0) == CELL_OK);
     CHECK(vm_read32(SIZE) == size);
     CHECK(memcmp(vm_base + TICKET, "PS3RECOMP-NP-TICKET", 19) == 0);
@@ -128,7 +135,7 @@ int main(void)
     CHECK(vm_base[TICKET + size] == 0xA5);   /* nothing past the ticket */
 
     /* GetTicketParam. */
-    CHECK((u32)call(GET_PARAM, 2, 0, 0, 0, 0, 0) == SCE_NP_ERROR_INVALID_ARGUMENT);
+    CHECK((u32)call(GET_PARAM, 2, 0, 0, 0, 0, 0) == SCE_NP_ERROR_INVALID_ARGUMENT);   /* NULL out */
     CHECK((u32)call(GET_PARAM, 12, PARAM, 0, 0, 0, 0) == SCE_NP_ERROR_INVALID_ARGUMENT);
     CHECK((u32)call(GET_PARAM, (u64)(s64)-1, PARAM, 0, 0, 0, 0) == SCE_NP_ERROR_INVALID_ARGUMENT);
 
