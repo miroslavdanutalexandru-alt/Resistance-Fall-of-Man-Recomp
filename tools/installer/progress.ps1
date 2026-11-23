@@ -17,6 +17,8 @@ $script:SpLog = $null
 $script:SpOld = $null
 $script:SpRun = @{ steps = @{}; regen = @{}; build = @{} }
 $script:SpSteps = New-Object System.Collections.Specialized.OrderedDictionary
+$script:SpGenStages = @()    # the code generator's stages that run this time (Set-SpGenPlan)
+$script:SpGenFull = $false   # ... and whether that is all of them (only then is the gen step's time kept)
 $script:SpCur = $null
 $script:SpCurStart = $null
 $script:SpCurFrac = 0.0
@@ -93,7 +95,13 @@ function Get-SpTime([string]$Group, [string]$Key) {
 function Save-SpTimings {
     if (-not $script:SpLog) { return }
     $o = if ($script:SpOld) { $script:SpOld } else { @{ steps = @{}; regen = @{}; build = @{} } }
-    foreach ($g in 'steps', 'regen', 'build') { foreach ($k in @($script:SpRun[$g].Keys)) { $o[$g][$k] = [math]::Round([double]$script:SpRun[$g][$k], 3) } }
+    foreach ($g in 'steps', 'regen', 'build') {
+        foreach ($k in @($script:SpRun[$g].Keys)) {
+            # a gen step that generated only a part (or nothing) says nothing about a full run; its stages are kept
+            if ($g -eq 'steps' -and $k -eq 'gen' -and -not $script:SpGenFull) { continue }
+            $o[$g][$k] = [math]::Round([double]$script:SpRun[$g][$k], 3)
+        }
+    }
     if ($script:SpRun['files']) {
         if (-not ($o['files'] -is [System.Collections.IDictionary])) { $o['files'] = @{} }
         foreach ($k in @($script:SpRun['files'].Keys)) { $o['files'][$k] = $script:SpRun['files'][$k] }
@@ -128,6 +136,7 @@ function Test-SpHasRpcs3([string]$Port) {
 function Initialize-SpProgress([string]$Port, [switch]$Unattended) {
     $script:SpPort = $Port
     $script:SpInteractive = -not $Unattended
+    $script:SpGenStages = @(); $script:SpGenFull = $false
     $script:SpLog = Join-Path $Port 'logs\setup_timings.json'
     $script:SpOld = Read-SpTimings $script:SpLog
     foreach ($k in 'check', 'tools', 'game', 'decrypt', 'gen', 'build') { $script:SpSteps[$k] = (Get-SpTime 'steps' $k) }
@@ -143,6 +152,22 @@ function Initialize-SpProgress([string]$Port, [switch]$Unattended) {
     $script:SpSteps['build'] = (Get-SpTime 'steps' 'deps') + (Get-SpTime 'steps' 'rpcs3') + (Get-SpTime 'steps' 'game_build') + (Get-SpTime 'steps' 'finish')
 }
 function Set-SpEstimate([string]$Key, [double]$Sec) { if ($script:SpSteps.Contains($Key)) { $script:SpSteps[$Key] = [math]::Max(1.0, $Sec) } }
+# How long the code generator takes for these stages ("ppu_lift", or "eboot:ppu_lift" for a port that runs a stage
+# more than once): each stage's time measured on this PC, else its default. A stage that runs more than once is
+# measured as the sum of its runs, so it counts once.
+function Get-SpRegenEstimate([string[]]$Stages) {
+    $est = 0.0; $seen = @{}
+    foreach ($s in $Stages) { if ($s) { $base = ($s -split ':')[-1]; if (-not $seen[$base]) { $seen[$base] = 1; $est += Get-SpTime 'regen' $base } } }
+    $est
+}
+# What the code generator will do in step 4, known before it starts: $Stages = the stages that will run (none = the
+# code is up to date), -Full = all of them (a first install, or both halves). The gen step of the overall bar is
+# weighted by these stages only (an update that regenerates only the SPU code takes seconds, not 15 minutes).
+function Set-SpGenPlan([string[]]$Stages, [switch]$Full) {
+    $script:SpGenStages = @($Stages | Where-Object { $_ })
+    $script:SpGenFull = [bool]($Full -and $script:SpGenStages.Count)
+    if ($script:SpGenStages.Count) { Set-SpEstimate 'gen' (Get-SpRegenEstimate $script:SpGenStages) } else { Set-SpEstimate 'gen' 1 }
+}
 # Step key from setup.ps1's step title.
 function Get-SpStepKey([string]$Title) {
     switch -regex ($Title) {
@@ -280,13 +305,28 @@ $script:SpStageText = @{
     ppu_copy = 'Saving the PPU code (only changed files)'; spu_lift = 'Translating the SPU programs'
     spu_jobmods = 'Translating the SPU job modules'; spu_post = 'Optimising the SPU code'; spu_copy = 'Saving the SPU code (only changed files)'
 }
+# The gen step's status line while the generator runs: $St = Invoke-SpRegen's state, $Elapsed = seconds so far.
+# Returns Frac, Eta (-1 = unknown) and Text ("Generating the game code: <what it does now>").
+function Get-SpRegenStatus($St, [double]$Elapsed) {
+    $f = Get-SpRegenFraction $St.Stages $St.State $St.W
+    $eta = -1
+    # early on: the time of the stages that run this time (not of all of them) minus the time so far
+    if ($f -gt 0.03) { $eta = $Elapsed / $f * (1 - $f) } elseif ($St.Est - $Elapsed -gt 0) { $eta = $St.Est - $Elapsed }
+    $name = ($St.Stage -split ':')[-1]
+    $txt = if ($name -and $script:SpStageText[$name]) { $script:SpStageText[$name] } elseif ($name) { $name } else { 'starting' }
+    $cur = $St.State[$St.Stage]
+    if ($cur -and $cur.Total -gt 1 -and $name -ne 'ppu_post') { $txt += (' ({0} / {1})' -f [int]$cur.Done, [int]$cur.Total) }
+    elseif ($cur -and $cur.Total -gt 1) { $txt += (' ({0:0}%)' -f (100 * $cur.Done / $cur.Total)) }
+    @{ Frac = $f; Eta = $eta; Text = "Generating the game code: $txt" }
+}
 # Runs the code generator: python <Script> <Arguments>, $Stages = the stages it is expected to go through.
 function Invoke-SpRegen([string]$Python, [string]$Arguments, [string[]]$Stages) {
     $w = @{}
     foreach ($k in @($script:SpDefaults.regen.Keys)) { $w[$k] = Get-SpTime 'regen' $k }
     $st = @{ State = @{}; Start = @{}; Last = (Get-Date); T0 = (Get-Date); Stage = ''; W = $w; Stages = $Stages }
-    $est = 0.0; foreach ($s in $Stages) { $base = ($s -split ':')[-1]; if ($w[$base]) { $est += $w[$base] } }
+    $est = Get-SpRegenEstimate $Stages
     Set-SpEstimate 'gen' $est
+    $st['Est'] = $est
     $onLine = {
         param($l)
         $st.Last = Get-Date
@@ -300,16 +340,8 @@ function Invoke-SpRegen([string]$Python, [string]$Arguments, [string[]]$Stages) 
         $st.State[$p.Stage] = @{ Done = $p.Done; Total = $p.Total }
     }
     $onTick = {
-        $f = Get-SpRegenFraction $st.Stages $st.State $st.W
-        $el = ((Get-Date) - $st.T0).TotalSeconds
-        $eta = -1
-        if ($f -gt 0.03) { $eta = $el / $f * (1 - $f) } elseif ($el -lt 30) { $eta = ($st.W.Values | Measure-Object -Sum).Sum }
-        $name = ($st.Stage -split ':')[-1]
-        $txt = if ($name -and $script:SpStageText[$name]) { $script:SpStageText[$name] } else { 'Generating the game code' }
-        $cur = $st.State[$st.Stage]
-        if ($cur -and $cur.Total -gt 1 -and $name -ne 'ppu_post') { $txt += (' ({0} / {1})' -f [int]$cur.Done, [int]$cur.Total) }
-        elseif ($cur -and $cur.Total -gt 1) { $txt += (' ({0:0}%)' -f (100 * $cur.Done / $cur.Total)) }
-        Write-SpStatus ("Generating the game code: $txt") $f $eta ((Get-Date) - $st.Last).TotalSeconds
+        $r = Get-SpRegenStatus $st ((Get-Date) - $st.T0).TotalSeconds
+        Write-SpStatus $r.Text $r.Frac $r.Eta ((Get-Date) - $st.Last).TotalSeconds
     }
     $code = Invoke-SpProcess $Python $Arguments $onLine $onTick 1000 @{ PYTHONUNBUFFERED = '1' } -Utf8
     if ($st.Stage -and $st.Start[$st.Stage]) { $base = ($st.Stage -split ':')[-1]; $script:SpRun.regen[$base] = ([double]$script:SpRun.regen[$base]) + ((Get-Date) - $st.Start[$st.Stage]).TotalSeconds }

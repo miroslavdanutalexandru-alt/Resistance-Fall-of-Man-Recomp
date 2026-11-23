@@ -112,6 +112,7 @@ Check ((Get-SpTime 'steps' 'rpcs3') -eq 0 -and -not (Test-SpHasRpcs3 $fp)) 'a po
 $script:SpDefaults['steps']['rpcs3'] = 600
 Initialize-SpProgress $fp -Unattended
 Check ((Get-SpTime 'steps' 'rpcs3') -eq 600 -and (Test-SpHasRpcs3 $fp)) 'with it (R2, R3): its default'
+$script:SpGenFull = $true
 $script:SpRun.steps['gen'] = 432.1; $script:SpRun.regen['ppu_lift'] = 250; $script:SpRun.build['speed'] = 1.5
 $script:SpRun['files'] = @{ 'recompiled\ppu_recomp_000.cpp' = '321.5 1000' }
 Save-SpTimings
@@ -133,7 +134,7 @@ $cul = [Threading.Thread]::CurrentThread.CurrentCulture
 try {
     [Threading.Thread]::CurrentThread.CurrentCulture = [Globalization.CultureInfo]::GetCultureInfo('ro-RO')
     Check ((Format-SpFileTime 321.54 1000) -eq '321.5 1000') 'per-file times are written with a ''.'' under ro-RO'
-    $script:SpOld = $null; $script:SpRun = @{ steps = @{ gen = 432.1 }; regen = @{}; build = @{ speed = 1.5 } }
+    $script:SpOld = $null; $script:SpRun = @{ steps = @{ gen = 432.1 }; regen = @{}; build = @{ speed = 1.5 } }; $script:SpGenFull = $true
     $script:SpRun['files'] = @{ 'recompiled\ppu_recomp_000.cpp' = (Format-SpFileTime 321.5 1000) }
     Save-SpTimings
     $j = [IO.File]::ReadAllText((Join-Path $logs 'setup_timings.json'))
@@ -149,6 +150,45 @@ try {
         Check ((Near (Get-SpTime 'steps' 'gen') 432.1) -and (Near (Get-SpTime 'build' 'speed') 1.5) -and (Near $times['recompiled\ppu_recomp_000.cpp'].Sec 321.5) -and $times['recompiled\ppu_recomp_000.cpp'].Bytes -eq 1000) "a comma-formatted timings file is read ($cn)"
     }
 } finally { [Threading.Thread]::CurrentThread.CurrentCulture = $cul }
+
+Write-Host 'the gen step: weighted by what runs this time'
+Remove-Item (Join-Path $logs 'setup_timings.json') -Force
+$script:SpRun = @{ steps = @{}; regen = @{}; build = @{} }
+Initialize-SpProgress $fp -Unattended
+$ppu = 'ppu_analyze', 'ppu_lift', 'ppu_emit', 'ppu_post', 'ppu_hooks', 'ppu_copy'
+$spu = 'spu_lift', 'spu_jobmods', 'spu_post', 'spu_copy'
+Check (Near (Get-SpRegenEstimate $spu) 30) 'SPU only: about 30 s by default'
+Check (Near (Get-SpRegenEstimate ($ppu + $spu)) 1080) 'PPU and SPU: about 18 min'
+Check (Near (Get-SpRegenEstimate @('eboot:ppu_lift', 'game:ppu_lift', 'spu_lift')) 315) 'a stage run twice (R1''s eboot: / game:) counts once: its time is measured over both runs'
+Set-SpGenPlan $spu
+Check ((Near $script:SpSteps['gen'] 30) -and -not $script:SpGenFull) 'an SPU-only update: the overall bar weights the gen step by 30 s, not 18 min'
+Set-SpGenPlan @()
+Check ((Near $script:SpSteps['gen'] 1) -and -not $script:SpGenFull) 'nothing to generate: 1 s'
+Set-SpGenPlan ($ppu + $spu) -Full
+Check ((Near $script:SpSteps['gen'] 1080) -and $script:SpGenFull) 'a full regen'
+$script:SpRun.regen['spu_lift'] = 20
+Initialize-SpProgress $fp -Unattended
+Check (-not $script:SpGenFull) 'a new run starts without a plan'
+Set-SpGenPlan $spu
+$script:SpRun.steps['gen'] = 33; $script:SpRun.regen['spu_lift'] = 20
+Save-SpTimings
+$o = Read-SpTimings (Join-Path $logs 'setup_timings.json')
+Check ((-not $o.steps.Contains('gen')) -and (Near $o.regen['spu_lift'] 20)) 'a part regen: its stage times are kept, not its time as the gen step'
+Set-SpGenPlan ($ppu + $spu) -Full
+$script:SpRun.steps['gen'] = 900
+Save-SpTimings
+$o = Read-SpTimings (Join-Path $logs 'setup_timings.json')
+Check (Near $o.steps['gen'] 900) 'a full regen: the gen step time is kept'
+Initialize-SpProgress $fp -Unattended
+Check (Near (Get-SpRegenEstimate $spu) 35) 'the next estimate uses the measured stage time (20 + 5 + 8 + 2)'
+$st = @{ State = @{}; Stage = ''; W = @{ spu_lift = 15; spu_jobmods = 5; spu_post = 8; spu_copy = 2 }; Stages = $spu; Est = 30 }
+$r = Get-SpRegenStatus $st 3
+Check ($r.Text -eq 'Generating the game code: starting') ('before the first stage, the step name once: ' + $r.Text)
+Check (Near $r.Eta 27 0.5) ('early ETA from the planned stages only: {0:0} s' -f $r.Eta)
+Check ((Get-SpRegenStatus $st 40).Eta -eq -1) 'past the estimate and nothing reported: no ETA rather than a wrong one'
+$st.Stage = 'spu_jobmods'; $st.State['spu_jobmods'] = @{ Done = 3; Total = 10 }
+$r = Get-SpRegenStatus $st 20
+Check ($r.Text -eq 'Generating the game code: Translating the SPU job modules (3 / 10)' -and $r.Eta -gt 0 -and $r.Eta -lt 30) ("during a stage: $($r.Text), {0:0} s left" -f $r.Eta)
 $script:SpRun = @{ steps = @{}; regen = @{}; build = @{} }
 # the log can be read while Setup writes it (FileShare.ReadWrite on both sides)
 $lf = Join-Path $logs 'build_rpcs3.log'
