@@ -2884,6 +2884,7 @@ static D3D12_SAMPLER_DESC gsamp_desc(const rsx_gsamp* g)
     d.MaxLOD = !g->mip ? 0.0f : g->max_lod >= 15.9f ? D3D12_FLOAT32_MAX : g->max_lod;
     return d;
 }
+static float fsr_split_lod_bias(float bias);   /* rsx_fsr.inc: no upscaler LOD bias while split screen renders natively */
 static D3D12_GPU_DESCRIPTOR_HANDLE gsamp_gpu(u32 blk)
 {
     D3D12_GPU_DESCRIPTOR_HANDLE h;
@@ -2935,7 +2936,7 @@ static u32 gsamp_block_for(const D3D12DrawRecord* dr)
         keys[u] = 0;
         if (dr->tex[u].set && (dr->tex[u].ctrl0 & 0x80000000u) && !(u == 0 && s_gsamp_s0pt)) {   /* disabled unit: default */
             g[u] = rsx_gsamp_decode(dr->tex[u].filter, dr->tex[u].ctrl0, dr->tex[u].address,
-                                    s_gsamp_aniso, s_gsamp_bias, s_gsamp_addr);
+                                    s_gsamp_aniso, fsr_split_lod_bias(s_gsamp_bias), s_gsamp_addr);
             keys[u] = rsx_gsamp_key(&g[u]); any = 1;
             if (gsamp_border(&g[u]) && border_on())   /* TEXTURE_BORDER_COLOR is part of the sampler */
                 keys[u] = (keys[u] ^ (0xB0C0000000000000ull | dr->bcol[u])) * 1099511628211ull | 1u;
@@ -13541,11 +13542,12 @@ skip_dump_consider: ;
         if (s_tt0 == 0) s_tt0 = tnow;
         if (tnow - s_tt0 >= 1000 && s_d3d.hwnd) {
             extern char g_rsx_title_base[128];
-            char tb[400];
-            snprintf(tb, sizeof(tb), "%s | FPS: %.2f%s | draws: %u | %ux%u",
+            char tb[400], rs[96];
+            fsr_title_res(rs, sizeof rs, s_d3d.width, s_d3d.height);
+            snprintf(tb, sizeof(tb), "%s | FPS: %.2f%s | draws: %u | %s",
                      g_rsx_title_base,
                      s_tframes * 1000.0 / (double)(tnow - s_tt0), s_ft_title,
-                     s_dbg_last_draws, s_d3d.width, s_d3d.height);
+                     s_dbg_last_draws, rs);
             SetWindowTextA(s_d3d.hwnd, tb);
             s_tframes = 0;
             s_tt0 = tnow;

@@ -154,6 +154,37 @@ static int fsr_split_paused(void)
     if (keep < 0) { const char* e = getenv("RFOM_SPLIT_AA"); keep = (e && atoi(e) > 0) ? 1 : 0; }
     return !keep && g_rfom_split != 0;
 }
+/* RFOM_SPLIT_LOD=1 (default): while split screen renders natively (above) the guest
+ * samplers drop the upscaler's negative texture LOD bias (log2 of RSX_UPSCALE, -1 at
+ * Performance). Kept, every texture sampled one mip too sharp with no temporal AA to
+ * resolve it, and the split-screen views shimmered (issue #25). A bias set by hand
+ * (RSX_LOD_BIAS / PORT_UPSCALE_LOD_BIAS = a number) is left alone. RFOM_SPLIT_LOD=0:
+ * keep the upscaler's bias in split screen too (the old behaviour). */
+static float fsr_split_lod_bias(float bias)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char* e = getenv("RFOM_SPLIT_LOD");
+        on = (e && *e) ? (atoi(e) > 0) : 1;
+        if (on) {
+            const pdq_lod_cfg c = pdq_lod_parse(getenv("PORT_UPSCALE_LOD_BIAS"));
+            const char* b = getenv("RSX_LOD_BIAS");
+            if (c.mode == PDQ_LOD_FIXED || (c.mode == PDQ_LOD_UNSET && b && *b && _stricmp(b, "auto"))) on = 0;
+        }
+    }
+    return (on && bias < 0.0f && fsr_mode() && fsr_split_paused()) ? 0.0f : bias;
+}
+/* Title bar resolution. The guest frame is always 1280x720, and showing only that read
+ * as "the game runs at 720p" on a 4K screen (issue #25); show what is really drawn. */
+static void fsr_title_res(char* b, size_t n, u32 w, u32 h)
+{
+    const u32 ow = SC(w), oh = SC(h);
+    const float u = g_up_frac;
+    if (fsr_mode() && g_fsr_live && g_fsr_scene_off && u < 1.0f && !fsr_split_paused())
+        snprintf(b, n, "render %ux%u -> %ux%u (game %ux%u)", (u32)((float)ow * u + 0.5f), (u32)((float)oh * u + 0.5f), ow, oh, w, h);
+    else if (ow != w || oh != h) snprintf(b, n, "render %ux%u (game %ux%u)", ow, oh, w, h);
+    else snprintf(b, n, "%ux%u", w, h);
+}
 static void fsr_camera(float* n, float* f, float* fov)
 {
     static int on = -1;
