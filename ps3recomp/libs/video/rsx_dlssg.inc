@@ -211,6 +211,7 @@ static int fg_load_dlss(ID3D12Device* dev)
 static int fg_load(ID3D12Device* dev)
 {
     s_fgd_on = fgd_level() > 0; g_pc_fg_diag = s_fgd_on;   /* RFOM_FG_DIAG */
+    if (s_fgd_on) fgd_key_msgs_on();   /* d3d12_wndproc forwards key messages (fg_diag_key) */
     { const char* e = getenv("RFOM_FG_HUDSPLIT"); s_fg_split = pfg_hudless(getenv("PORT_FG_HUDLESS"), e ? atoi(e) != 0 : 1);
       e = getenv("RFOM_FG_HUDDBG"); s_fg_dbg = e ? atoi(e) : 0; if (s_fg_dbg < 0 || s_fg_dbg > 2) s_fg_dbg = 0;
       e = getenv("RFOM_DLSSG_NULLTAGS"); s_fg_null_tags = e && *e == '1'; }
@@ -715,6 +716,7 @@ static void fg_present(ID3D12GraphicsCommandList* cl, UINT bi, u32 fi, D3D12_CPU
 }
 
 /* RFOM_FG_DIAG: present_blit, after the Present (t0 / t1: QPC before / after the call): this real present's row. */
+static void fg_diag_key(UINT msg, WPARAM wp, LPARAM lp) { if (s_fgd_on) fgd_key_msg(msg, wp, lp); }   /* window thread */
 static void fg_diag_frame(LONGLONG t0, LONGLONG t1)
 {
     static LONGLONG qf, prev0, prev1;

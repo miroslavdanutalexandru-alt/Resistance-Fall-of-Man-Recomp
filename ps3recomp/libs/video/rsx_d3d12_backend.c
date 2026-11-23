@@ -1644,8 +1644,10 @@ static void d3_winpos_save(HWND hwnd)
     pcx_winpos_format(&p, line, sizeof line);
     if ((f = fopen("window_pos.txt", "w")) != NULL) { fputs(line, f); fclose(f); }
 }
+static void fg_diag_key(UINT msg, WPARAM wp, LPARAM lp);   /* rsx_dlssg.inc, RFOM_FG_DIAG marker key */
 static LRESULT CALLBACK d3d12_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
+    fg_diag_key(msg, wp, lp);
     switch (msg) {
     case WM_SIZE:
         InterlockedExchange(&s_sc_resize, 1);   /* the render thread resizes the swap chain */

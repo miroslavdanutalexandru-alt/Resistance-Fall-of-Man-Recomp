@@ -21,8 +21,11 @@
  * and ResistanceFoMGame.exe on level loads) appends to the same file instead of rotating it away.
  * Threads: the present thread only copies a row into a preallocated queue under a brief spin lock (double buffer of
  * FGD_QCAP items; a full queue drops rows, counted); one long-lived writer thread swaps the queues and writes every
- * 250 ms. Exit: atexit stops the writer and waits at most 3 s; after an ExitProcess (other threads already gone) a TLS
- * callback writes what is queued without waiting on anything (bounded spin on the queue lock). Never hangs exit. */
+ * 250 ms. Exit: atexit never waits on the writer: between its passes it finishes the file itself (bounded ~20 ms of
+ * try-lock, otherwise the writer is told to finish); after an ExitProcess (other threads already gone) a TLS
+ * callback writes what is queued without waiting on anything (bounded spin on the queue lock). Never hangs exit.
+ * Marker key: the window procedure forwards WM_KEYDOWN (fgd_key_msg), so Pause (make + break sent together) is never
+ * missed; without that, GetAsyncKeyState is polled per present with the "pressed since the last call" bit. */
 #ifndef PORT_FGDIAG_H
 #define PORT_FGDIAG_H
 
@@ -110,6 +113,15 @@ static const fgd_cfg_t* fgd_cfg(void)
 }
 static int fgd_level(void) { return fgd_cfg()->level; }
 
+/* marker key presses from the window procedure (any thread); g_fgd_key_msgs: the program forwards its key messages */
+static volatile LONG g_fgd_key_hits, g_fgd_key_msgs;
+static void fgd_key_msgs_on(void) { InterlockedExchange(&g_fgd_key_msgs, 1); }
+static void fgd_key_msg(UINT msg, WPARAM wp, LPARAM lp)
+{
+    if ((msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) && !(lp & (1 << 30)) && g_fgd_cfg_read && g_fgd_cfg.vk && (int)wp == g_fgd_cfg.vk)
+        InterlockedIncrement(&g_fgd_key_hits);
+}
+
 /* run.log (stderr) without the CRT stream: also usable from the TLS callback */
 static void fgd_elog(const char* fmt, ...)
 {
@@ -184,8 +196,8 @@ typedef struct {
     fgd_item* q[2];
     volatile LONG qn[2];
     volatile LONG fi;                     /* queue the present thread fills */
-    volatile LONG accepting, stop, done, busy, dropped;
-    HANDLE wake, done_ev, file;
+    volatile LONG accepting, stop, done, busy, dropped, owner;
+    HANDLE wake, file;
     unsigned long long bytes, cap;
     unsigned rows, lines;
     LONG drop_seen;
@@ -371,14 +383,46 @@ static int fgd_open(fgd_stream* s)
     return 1;
 }
 
+/* The final write: the queued items, the trailer, close. The caller owns the file: the writer is gone (ExitProcess) or
+ * not in a pass (atexit took s->owner). Never waits on another thread (bounded try-lock on the queue). */
+static void fgd_final(fgd_stream* s, const char* how)
+{
+    if (s->done || !s->file || s->file == INVALID_HANDLE_VALUE) { s->done = 1; return; }
+    s->accepting = 0;
+    fgd_sink k = { s, s->xbuf, sizeof s->xbuf, 0 };
+    if (fgd_lock_timed(s)) {
+        const LONG w = s->fi;
+        if (s->busy) {   /* the writer died between taking the other queue and clearing it: write that queue first */
+            LONG n = s->qn[w ^ 1]; if (n > FGD_QCAP) n = FGD_QCAP;
+            fgd_sink_printf(&k, "--- writer stopped mid-write: its %ld queued items follow (some rows may repeat or be missing) ---\n", (long)n);
+            fgd_write_items(s, &k, s->q[w ^ 1], n);
+            s->qn[w ^ 1] = 0;
+        }
+        LONG n = s->qn[w]; if (n > FGD_QCAP) n = FGD_QCAP;
+        fgd_write_items(s, &k, s->q[w], n);
+        s->qn[w] = 0;
+        fgd_unlock(s);
+    } else fgd_sink_printf(&k, "--- queue locked at exit: last rows not written ---\n");
+    fgd_drop_note(s, &k);
+    fgd_trailer(s, &k, how);
+    fgd_sink_flush(&k);
+    CloseHandle(s->file);
+    s->file = NULL;
+    s->done = 1;
+}
+
+/* s->owner: 1 while the writer opens the file or runs a pass, 2 once an exit path took the file for good */
 static DWORD WINAPI fgd_writer(LPVOID p)
 {
     fgd_stream* s = (fgd_stream*)p;
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-    if (!fgd_open(s)) { s->accepting = 0; s->done = 1; SetEvent(s->done_ev); return 0; }
+    if (!fgd_open(s)) { s->accepting = 0; s->done = 1; InterlockedExchange(&s->owner, 0); return 0; }
+    InterlockedExchange(&s->owner, 0);
     fgd_sink k = { s, s->buf, sizeof s->buf, 0 };
     for (;;) {
         WaitForSingleObject(s->wake, 250);
+        if (InterlockedCompareExchange(&s->owner, 1, 0) != 0) return 0;   /* an exit path owns the file */
+        if (s->done) { InterlockedExchange(&s->owner, 0); return 0; }
         const LONG stopping = s->stop;
         for (int pass = 0; pass < (stopping ? 2 : 1); pass++) {   /* stopping: both queues */
             InterlockedExchange(&s->busy, 1);
@@ -399,50 +443,36 @@ static DWORD WINAPI fgd_writer(LPVOID p)
             CloseHandle(s->file);
             s->file = NULL;
             s->done = 1;
-            SetEvent(s->done_ev);
+            InterlockedExchange(&s->owner, 0);
             return 0;
         }
+        InterlockedExchange(&s->owner, 0);
     }
 }
 
+/* exit(): no waiting on the writer. Between its passes (almost always) the file is taken and finished right here;
+ * if a pass is running (a few ms), up to ~20 ms of tries, then the writer is told to stop and finishes it itself,
+ * or the TLS callback does at ExitProcess. */
 static void fgd_atexit(void)
 {
     fgd_stream* s = g_fgd_s;
     if (!s || s->done) return;
     s->accepting = 0;
+    for (int i = 0; i < 20; i++) {
+        if (InterlockedCompareExchange(&s->owner, 2, 0) == 0) { fgd_final(s, "exit"); return; }
+        Sleep(1);
+    }
     s->stop = 1;
     SetEvent(s->wake);
-    WaitForSingleObject(s->done_ev, 3000);
 }
 
-/* TLS callback, DLL_PROCESS_DETACH: other threads are gone (ExitProcess) or the writer already finished (atexit) */
+/* TLS callback, DLL_PROCESS_DETACH: other threads are gone (ExitProcess), or an exit path already finished the file */
 static void fgd_exit_dead(void)
 {
     fgd_stream* s = g_fgd_s;
-    if (!s || s->done || !s->file || s->file == INVALID_HANDLE_VALUE) return;
-    s->accepting = 0;
-    fgd_sink k = { s, s->xbuf, sizeof s->xbuf, 0 };
-    if (fgd_lock_timed(s)) {
-        const LONG w = s->fi;
-        if (s->busy) {   /* the writer died between taking the other queue and clearing it: write that queue first */
-            LONG n = s->qn[w ^ 1]; if (n > FGD_QCAP) n = FGD_QCAP;
-            fgd_sink_printf(&k, "--- writer stopped mid-write: its %ld queued items follow (some rows may repeat or be missing) ---\n", (long)n);
-            fgd_write_items(s, &k, s->q[w ^ 1], n);
-            s->qn[w ^ 1] = 0;
-        }
-        LONG n = s->qn[w]; if (n > FGD_QCAP) n = FGD_QCAP;
-        fgd_write_items(s, &k, s->q[w], n);
-        s->qn[w] = 0;
-        fgd_unlock(s);
-    } else fgd_sink_printf(&k, "--- queue locked at exit: last rows not written ---\n");
-    fgd_drop_note(s, &k);
-    fgd_trailer(s, &k, "ExitProcess");
-    fgd_sink_flush(&k);
-    CloseHandle(s->file);
-    s->file = NULL;
-    s->done = 1;
+    if (!s || s->done) return;
+    fgd_final(s, "ExitProcess");
 }
-
 static void NTAPI fgd_tls(PVOID h, DWORD reason, PVOID r)
 {
     (void)h; (void)r;
@@ -472,11 +502,11 @@ static int fgd_stream_start(void)
       if (!n || n >= sizeof exe) exe[0] = 0;
       snprintf(s->exe, sizeof s->exe, "%s", fgd_base(exe)); }
     s->wake = CreateEventA(NULL, FALSE, FALSE, NULL);
-    s->done_ev = CreateEventA(NULL, TRUE, FALSE, NULL);
-    if (!s->wake || !s->done_ev) { fgd_elog("[fg-diag] CreateEvent failed -- no frame log"); return 0; }   /* s leaks: once */
+    if (!s->wake) { fgd_elog("[fg-diag] CreateEvent failed -- no frame log"); return 0; }   /* s leaks: once */
+    s->owner = 1;   /* the writer opens the file first */
     g_fgd_s = s;
     HANDLE t = CreateThread(NULL, 0, fgd_writer, s, 0, NULL);
-    if (!t) { s->accepting = 0; s->done = 1; fgd_elog("[fg-diag] cannot start the writer thread -- no frame log"); return 0; }
+    if (!t) { s->accepting = 0; s->done = 1; s->owner = 0; fgd_elog("[fg-diag] cannot start the writer thread -- no frame log"); return 0; }
     CloseHandle(t);
     atexit(fgd_atexit);
     return 1;
@@ -605,6 +635,7 @@ static void fgd_frame(fgd_row* r, int key_ok)
     const fgd_cfg_t* c = fgd_cfg();
     if (!c->level) return;
     if (!g->active) {
+        InterlockedExchange(&g_fgd_key_hits, 0);   /* presses before recording starts don't count */
         if (r->type == '-') {
             if (!g->said_off) { g->said_off = 1;
                 fgd_elog("[fg-diag] RFOM_FG_DIAG=%d: frame generation does not run in this program (front end, or frame generation "
@@ -680,9 +711,14 @@ static void fgd_frame(fgd_row* r, int key_ok)
     }
     /* marker key */
     if (c->vk) {
-        const int down = key_ok && (GetAsyncKeyState(c->vk) & 0x8000) != 0;
-        if (down && !g->key_was) { g->last = *r; g->have_last = 1; fgd_user_mark(c->key, r->up); }
-        g->key_was = down;
+        int press;
+        if (g_fgd_key_msgs) press = InterlockedExchange(&g_fgd_key_hits, 0) > 0;   /* only sent while the window has focus */
+        else {   /* polled: Pause sends make and break together, so also the "pressed since the last call" bit; a held key once */
+            const SHORT ks = GetAsyncKeyState(c->vk);
+            press = key_ok && !g->key_was && (ks & 0x8001) != 0;
+            g->key_was = (ks & 0x8000) != 0;
+        }
+        if (press) { g->last = *r; g->have_last = 1; fgd_user_mark(c->key, r->up); }
     }
     /* the second */
     g->s_rows++;
