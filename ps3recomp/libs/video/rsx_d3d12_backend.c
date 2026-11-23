@@ -2461,6 +2461,7 @@ static u32 s_lfc_fi;
 static ID3D12Resource* s_lfc_res;      /* s_d3d.render_targets[s_lfc_fi] when scheduled (recreated = skip) */
 static LONGLONG s_lfc_t0, s_lfc_prev, s_lfc_qf;
 static double s_lfc_period_us;         /* measured movie frame period, 0 = not yet */
+static double s_lfc_sched_ticks;       /* period the pending repeats use (QPC ticks, > 0 while scheduled) */
 static unsigned s_lfc_reps, s_lfc_drops, s_lfc_active;
 static int s_f3_on;   /* rsx_fsr3fg.inc (included further down): FSR 3 FG generated a frame at the last present */
 static void present_draw_frame(ID3D12GraphicsCommandList* cl, UINT bi, u32 fi, D3D12_CPU_DESCRIPTOR_HANDLE* rtv,
@@ -2490,7 +2491,8 @@ static void movie_lfc_cancel(void)
 static void movie_lfc_arm(void)
 {
     LARGE_INTEGER now; QueryPerformanceCounter(&now);
-    const double slot = s_lfc_period_us * (double)s_lfc_qf / 1e6 / s_lfc_k;
+    const double slot = s_lfc_sched_ticks / s_lfc_k;
+    if (!(slot > 0.0)) { s_lfc_left = 0; return; }
     const double rel = (double)s_lfc_t0 + slot * s_lfc_i - (double)now.QuadPart;   /* QPC ticks */
     LARGE_INTEGER due; due.QuadPart = rel > 0.0 ? -(LONGLONG)(rel * 1e7 / (double)s_lfc_qf) - 1 : -1;
     if (!SetWaitableTimer(s_lfc_timer, &due, 0, NULL, NULL, FALSE)) s_lfc_left = 0;
@@ -2544,6 +2546,7 @@ static void movie_lfc_after_present(int movie, int vs, u32 fi, LONGLONG tq)
                             env = 0; return; }
     }
     s_lfc_active = 1;
+    s_lfc_sched_ticks = per * (double)s_lfc_qf / 1e6;
     s_lfc_t0 = tq; s_lfc_k = k; s_lfc_i = 1; s_lfc_left = k - 1; s_lfc_fi = fi; s_lfc_vs = vs;
     s_lfc_res = s_d3d.render_targets[fi];
     movie_lfc_arm();
@@ -2595,8 +2598,7 @@ static void movie_lfc_fire(void)
 {
     if (s_lfc_left <= 0) return;
     LARGE_INTEGER now; QueryPerformanceCounter(&now);
-    const int d = rfom_movie_lfc_due(s_lfc_t0, now.QuadPart, s_lfc_period_us > 0.0 ? s_lfc_period_us * (double)s_lfc_qf / 1e6
-                                     : RFOM_MOVIE_FRAME_US * (double)s_lfc_qf / 1e6, s_lfc_k, s_lfc_i);
+    const int d = rfom_movie_lfc_due(s_lfc_t0, now.QuadPart, s_lfc_sched_ticks, s_lfc_k, s_lfc_i);
     if (d == 0) { movie_lfc_arm(); return; }   /* early wake */
     if (d < 0 || s_sc_resize || cellGcm_get_flip_mode() != 2 || !cellVdec_movie_active(500)) {
         if (d < 0) s_lfc_drops++;
