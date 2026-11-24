@@ -24,6 +24,7 @@ Usage:
 import argparse, glob, hashlib, json, os, struct, subprocess, sys
 sys.path.insert(0, os.path.dirname(__file__))
 from wrap_spu_elf import wrap
+import spu_code_ptrs
 
 ROOT   = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 LIFTER = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'ps3recomp', 'tools', 'spu_lifter.py')
@@ -127,6 +128,9 @@ def switch_table_targets(raw, base=BASE):
 
 
 
+CODE_PTRS_REPORT = []
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -207,6 +211,23 @@ def main():
         inside.append(hex(BASE + 0x30))
         inside += [hex(a) for a in manual_link_targets(raw, BASE)]
         inside += [hex(a) for a in switch_table_targets(raw, BASE)]
+        # Code pointers (tools/spu_code_ptrs.py; SPU_LIFT_CODE_PTRS=0 disables):
+        # functions named only by an address in data (.ctors lists, pointer
+        # tables) or built with ila/il/ilhu+iohl and called through bisl/bi,
+        # e.g. the static constructor at LS 0x4088 of jobmod 7d5f74861e88
+        # (listed in .ctors only). Without an entry the call is interpreted.
+        # This lifter has no --observed-entries / --gap-funcs, so the targets
+        # go to --extra-funcs: a gap seed runs to the next function start, and
+        # one inside a function splits it and starts a new merge group.
+        if spu_code_ptrs.enabled():
+            cp = spu_code_ptrs.discover_elf(elf, base=BASE, lo=BASE + 0x30, hi=CODE_END.get(name))
+            seeded = {int(a, 0) for a in inside}
+            new = [a for a in cp["new"] if a not in seeded]
+            if new:
+                inside += [hex(a) for a in new]
+                print(f"  {name}: code-ptrs +{len(new)} entries: " + ",".join("0x%X" % a for a in new))
+                CODE_PTRS_REPORT.extend("%s 0x%X" % (name, a) for a in new)
+            inside = sorted(set(inside), key=lambda a: int(a, 0))
         if inside:
             cmd += ["--extra-funcs", ",".join(inside)]
         r = subprocess.run(cmd, capture_output=True, text=True)
@@ -231,6 +252,10 @@ def main():
 
     if os.path.exists(tmp_elf):
         os.remove(tmp_elf)
+    with open(os.path.join(OUTDIR, "jobmods_code_ptrs.txt"), "w") as f:
+        f.write("".join(x + "\n" for x in CODE_PTRS_REPORT))
+    print(f"code-ptrs: {len(CODE_PTRS_REPORT)} entry point(s) beyond function detection"
+          + ("" if spu_code_ptrs.enabled() else " (SPU_LIFT_CODE_PTRS=0)"))
     with open(os.path.join(OUTDIR, "jobmods_manifest.json"), "w") as f:
         json.dump(manifest, f, indent=2)
     emit_register(manifest, register_c, args.symbol_prefix)
