@@ -1019,6 +1019,7 @@ extern "C" void rfom_jb_jump(ppu_context* ctx, uint32_t buf_ea)
  * disagrees for 15 frames running, e.g. after flipping invert in the options.
  * The game's controller sensitivity (0-9) scales it too (rfom_ml_game_sens). */
 extern "C" volatile long g_ml_mode, g_kbm_ml_dx, g_kbm_ml_dy;
+extern "C" volatile int g_kbm_wheel_look_off;
 extern "C" volatile double g_ml_deg_per_count;
 extern "C" volatile double g_ml_sens_y;   /* cellPad.c PAD_MOUSE_SENS_Y */
 extern "C" volatile int g_ml_invert_y, g_ml_fed_rx, g_ml_fed_ry, g_kbm_capture, g_ml_rs_keys;
@@ -1650,7 +1651,7 @@ extern "C" void rfom_mouselook(uint32_t player)
       g_rfom_opts_ea = c ? vm_read32(c + 6848) : 0; }
     const ULONGLONG now = GetTickCount64();
     long dx = tank_mouse_owns(s_tank_obj) ? 0 : InterlockedExchange(&g_kbm_ml_dx, 0);   /* the tank turret takes X (rfom_tank_mouse_apply) */
-    long dy = InterlockedExchange(&g_kbm_ml_dy, 0);
+    long dy = InterlockedExchange(&g_kbm_ml_dy, 0); if (g_kbm_wheel_look_off) dx = dy = 0;   /* PORT_KBM_WHEEL: the mouse picks a weapon */
     /* counts gathered while the look code was not running (menus, pause,
      * cutscenes, a vehicle) are dropped, not applied in one jump */
     if (now - s_ml_last > 150 || !g_kbm_capture || !ml_stick_is_mouse()) dx = dy = 0;

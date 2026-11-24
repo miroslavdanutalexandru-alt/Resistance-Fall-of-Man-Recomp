@@ -2,6 +2,7 @@
  * movement must give a steady stick whose average is the exact deflection, never
  * dropping back to centre or jumping (Fall of Man issue #9: tank turret jitter). */
 #include <stdio.h>
+#include <stdlib.h>
 #include <math.h>
 #include "../libs/input/kbm_stick.h"
 #include "../libs/input/kbm_drive.h"
@@ -135,6 +136,52 @@ static void test_drive(void)
     }
 }
 
+/* Weapon wheel (PORT_KBM_WHEEL): the stick the wheel reads as the game sees it. */
+static double wmag(unsigned char x, unsigned char y)
+{
+    const double a = (x - 128) / 127.0, b = (y - 128) / 127.0;
+    return sqrt(a * a + b * b);
+}
+#define WSTEP(w, key, mx, my, kx, ky, t, d) kbm_wheel_step(&(w), key, 0, mx, my, kx, ky, t, d, 100.0, 150, &sx, &sy)
+
+static void test_wheel(void)
+{
+    unsigned char sx, sy;
+    /* a tap stays a tap: the sticks are never taken */
+    { kbm_wheel w = { 0 };
+      CHECK(!WSTEP(w, 1, 300, 300, 0, 0, 1000, 0));
+      CHECK(!WSTEP(w, 1, 0, 0, 0, 0, 1100, 1));
+      CHECK(!WSTEP(w, 0, 0, 0, 0, 0, 1120, 2)); }
+    /* a short mouse flick to the lower right (the Marksman slot): full length on the
+     * diagonal, and it stays there when the mouse stops */
+    { kbm_wheel w = { 0 };
+      CHECK(!WSTEP(w, 1, 0, 0, 0, 0, 1000, 0));
+      CHECK(WSTEP(w, 1, 0, 0, 0, 0, 1200, 1) && sx == 128 && sy == 128);   /* nothing moved: centred */
+      CHECK(WSTEP(w, 1, 20, 20, 0, 0, 1216, 2) && sx == 128 && sy == 128);   /* under 0.4 x radius */
+      CHECK(WSTEP(w, 1, 15, 15, 0, 0, 1232, 3) && sx > 128 && sx == sy && wmag(sx, sy) > 0.98 && wmag(sx, sy) < 1.02);
+      for (int i = 0; i < 20; i++) CHECK(WSTEP(w, 1, 0, 0, 0, 0, 1248 + 16 * i, 4 + i) && sx > 200 && sx == sy);
+      /* the other way: the direction swings round once the mouse has gone far enough */
+      CHECK(WSTEP(w, 1, -300, 0, 0, 0, 1600, 30) && sx < 10 && abs(sy - 128) < 20);
+      /* let go: kept for two more reports, then centre and the sticks are given back */
+      CHECK(WSTEP(w, 0, 0, 0, 0, 0, 1616, 30) && sx < 10);
+      CHECK(WSTEP(w, 0, 0, 0, 0, 0, 1632, 31) && sx < 10);
+      CHECK(!WSTEP(w, 0, 0, 0, 0, 0, 1648, 32));
+      CHECK(!WSTEP(w, 0, 50, 50, 0, 0, 1664, 33)); }
+    /* keys: a diagonal is full length (not 1.41), a single key straight out */
+    { kbm_wheel w = { 0 };
+      WSTEP(w, 1, 0, 0, 0, 0, 0, 0);
+      CHECK(WSTEP(w, 1, 0, 0, 1, 1, 200, 0) && sx == sy && sx > 128 && wmag(sx, sy) > 0.98 && wmag(sx, sy) < 1.02);
+      CHECK(WSTEP(w, 1, 0, 0, 0, -1, 216, 0) && sx == 128 && sy == 1);
+      CHECK(WSTEP(w, 1, 0, 0, 0, 0, 232, 0) && sx == 128 && sy == 1);    /* key let go: kept */
+      /* no reports taken after the release (game paused): 250 ms at most */
+      CHECK(WSTEP(w, 0, 0, 0, 0, 0, 400, 0));
+      CHECK(!WSTEP(w, 0, 0, 0, 0, 0, 482, 0)); }
+    /* pressed in a menu: ignored */
+    { kbm_wheel w = { 0 };
+      kbm_wheel_step(&w, 1, 1, 0, 0, 0, 0, 0, 0, 100.0, 150, &sx, &sy);
+      CHECK(!kbm_wheel_step(&w, 1, 0, 100, 100, 1, 1, 500, 0, 100.0, 150, &sx, &sy)); }
+}
+
 int main(void)
 {
     test_drive();
@@ -142,6 +189,7 @@ int main(void)
     test_mean_and_steadiness();
     test_fine_resolution();
     test_reversal_and_bounds();
+    test_wheel();
     if (fails) { fprintf(stderr, "test_kbm_stick: %d failure(s)\n", fails); return 1; }
     printf("test_kbm_stick: all passed\n");
     return 0;
