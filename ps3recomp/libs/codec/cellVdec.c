@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include "vdec_ffmpeg.h"
 #include "../guest_struct.h"   /* GUEST_EA, vm_read/vm_write: guest EA -> host */
 #include "ps3emu/guest_call.h" /* g_ps3_guest_caller -- cbFunc is a GUEST OPD */
@@ -89,6 +90,31 @@ int cellVdec_movie_active(unsigned window_ms)
 {
     const unsigned long long t = s_vdec_last_au_ms;
     return t != 0 && ps3_ms_now() - t < (unsigned long long)window_ms;
+}
+
+/* Resistance port: movie evidence for the backend's per-5 s "movie LFC" line (rsx_d3d12_backend.c):
+ * pictures the title took (GetPicture with a buffer) or skipped (GetPicture without one: the player
+ * dropping a late picture), and the slowest AU decode / picture copy-out. Read and reset there; a
+ * count lost to the race between the two threads only blurs a diagnostic. */
+static volatile unsigned s_vdec_st_taken, s_vdec_st_skipped, s_vdec_st_dec_us, s_vdec_st_out_us;
+static unsigned long long vdec_us_now(void)
+{
+    struct timespec ts;
+    if (!timespec_get(&ts, TIME_UTC)) return 0;
+    return (unsigned long long)ts.tv_sec * 1000000ull + (unsigned long long)ts.tv_nsec / 1000ull;
+}
+static void vdec_st_max(volatile unsigned* m, unsigned long long t0)
+{
+    const unsigned long long t1 = vdec_us_now();
+    if (!t0 || t1 < t0 || t1 - t0 > 10000000ull) return;
+    if ((unsigned)(t1 - t0) > *m) *m = (unsigned)(t1 - t0);
+}
+void cellVdec_movie_stats(unsigned* taken, unsigned* skipped, unsigned* dec_max_us, unsigned* out_max_us)
+{
+    *taken = s_vdec_st_taken; s_vdec_st_taken = 0;
+    *skipped = s_vdec_st_skipped; s_vdec_st_skipped = 0;
+    *dec_max_us = s_vdec_st_dec_us; s_vdec_st_dec_us = 0;
+    *out_max_us = s_vdec_st_out_us; s_vdec_st_out_us = 0;
 }
 
 /* Deliver a vdec message to the guest callback (handle, msgType, msgData,
@@ -382,9 +408,12 @@ s32 cellVdecDecodeAu(CellVdecHandle handle, s32 mode, const CellVdecAuInfo* auIn
         v->auCount++;
         v->aus[v->auCount % VDEC_AU_RING] = au;
         v->newPics = 0;
-        if (au.size)   /* an empty packet would mean end of stream to FFmpeg */
+        if (au.size) {   /* an empty packet would mean end of stream to FFmpeg */
+            const unsigned long long t0 = vdec_us_now();
             vdec_ff_decode(v->ff, vm_ptr8(au.startAddr), au.size, v->auCount,
                            vdec_on_picture, v);
+            vdec_st_max(&s_vdec_st_dec_us, t0);
+        }
         vdec_notify(handle, CELL_VDEC_MSG_TYPE_AUDONE, CELL_OK);
         vdec_notify_new_pics(handle);
         return CELL_OK;
@@ -585,9 +614,13 @@ static s32 vdec_take_picture(VdecSlot* v, u32 dst, u32 type, u32 matrix, u8 alph
           printf("[mtrace] armed at picture %d for %d methods\n", at, cnt);
           g_rfom_trace_left = cnt;
       } }
-    if (dst)                                           /* NULL: a skip */
+    if (dst) {                                         /* NULL: a skip */
+        const unsigned long long t0 = vdec_us_now();
         vdec_store_picture(dst, q->yuv, q->item.width, q->item.height,
                            type, matrix, alpha);
+        vdec_st_max(&s_vdec_st_out_us, t0);
+        s_vdec_st_taken++;
+    } else s_vdec_st_skipped++;
     free(q->yuv);
     q->yuv = NULL;
     return CELL_OK;

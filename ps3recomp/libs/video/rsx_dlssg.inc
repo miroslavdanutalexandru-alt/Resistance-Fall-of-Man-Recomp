@@ -88,6 +88,7 @@ static void (*p_fg_shutdown)(void);
 static int s_fg_req;                 /* frames to generate asked for (1 = 2x .. 3 = 4x), 0 = off */
 static int s_fg_ready;               /* Streamline + DLSS-G usable on this device */
 static int s_fg_on;                  /* DLSS-G enabled at the last present */
+static int s_fg_movie;               /* present_blit: this present is a movie frame -- generation stays off */
 static int s_fg_null_tags;           /* RFOM_DLSSG_NULLTAGS=1: null tags on untagged frames (opt-in) */
 static int s_fg_gen;                 /* frames generated while on (after the GPU clamp) */
 static int s_fg_streak;              /* consecutive presented frames with DLSS inputs */
@@ -663,7 +664,8 @@ static void fg_present(ID3D12GraphicsCommandList* cl, UINT bi, u32 fi, D3D12_CPU
             static unsigned n = 0;
             if (n < 10) { n++; fprintf(stderr, "[DLSS-G] frame generation paused: HUD not separated for 3 frames (present %u, RFOM_FG_UNSURE_PAUSE=0 keeps it on)%c", s_fg_presents, 10); }
         }
-        const int want = s_fgh.tagged && s_app_active && !IsIconic(s_d3d.hwnd) && ui_ok;
+        const int want = s_fgh.tagged && !s_fg_movie && s_app_active && !IsIconic(s_d3d.hwnd) && ui_ok;
+        if (s_fg_movie && s_fgh.tagged) { static int n = 0; if (!n++) fg_log("frame generation held off: a movie is playing (its frames are never interpolated)"); }
         s_fg_streak = want ? s_fg_streak + 1 : 0;
         if (s_fg_streak >= 2 && (!s_fg_on || s_fg_opt_w != s_sc_w || s_fg_opt_h != s_sc_h)) {
             if (!s_fg_gen) {

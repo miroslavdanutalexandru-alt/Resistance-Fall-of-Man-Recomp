@@ -411,7 +411,7 @@ static void f3_present(const D3D12_VIEWPORT* vp, int split, int* vs)
     const u64 fid = ++s_f3_fid;
     const u32 i = (u32)(fid % F3_RING);
     const int ui_on = fg_ui_on();
-    const int want = s_fgh.tagged && s_f3_ctx && s_app_active && !IsIconic(s_d3d.hwnd) && (!ui_on || split);
+    const int want = s_fgh.tagged && !s_fg_movie && s_f3_ctx && s_app_active && !IsIconic(s_d3d.hwnd) && (!ui_on || split);
     s_f3_streak = want ? s_f3_streak + 1 : 0;
     const int on = s_f3_streak >= 2;
     const int sp = on && split && f3_heaps();
