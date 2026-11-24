@@ -24,5 +24,6 @@ try {
 } finally {
     $w.Dispose()
 }
-if ($failed -and $code -eq 0) { $code = 1 }
+# cmd's `if errorlevel 1` misses negative codes (e.g. -1), so report any failure as 1
+if ($failed -or $code -ne 0) { $code = 1 }
 exit $code
