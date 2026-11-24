@@ -497,6 +497,13 @@ extern "C" void rfom_reflex_sim_end(void);     /* rfom_reflex.cpp: NVIDIA Reflex
 extern "C" void rfom_reflex_sim_start(void);
 extern "C" unsigned rfom_reflex_limit_us(void);   /* rfom_reflex.cpp: Reflex's frame limit (us), 0 = none */
 static int rfom_frame_wait_impl(uint64_t target, uint32_t last_ea);
+/* PORT_STATS_LOG=1: periodic statistics lines in run.log (off by default). Also used by the game hooks. */
+extern "C" int rfom_stats_log(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("PORT_STATS_LOG"); on = (e && atoi(e)) ? 1 : 0; }
+    return on;
+}
 #include "port_hitchcatch.h"   /* PORT_HITCHCATCH=<ms>: stacks of the key threads on a hitch */
 /* NVIDIA Reflex (RFOM_REFLEX): SIMULATION_END on entry; after the limiter's
  * wait, NvAPI_D3D_Sleep and SIMULATION_START of the next frame. Without frame
@@ -598,8 +605,8 @@ static int rfom_frame_wait_impl(uint64_t target, uint32_t last_ea)
         else YieldProcessor();
 #endif
     }
-    /* frame pacing stats, every 5 s: frames, mean and worst frame time */
-    { static uint64_t t0 = 0, prev = 0, worst = 0; static unsigned n = 0; static double sum = 0;
+    /* frame pacing stats, every 5 s: frames, mean and worst frame time (PORT_STATS_LOG=1) */
+    if (rfom_stats_log()) { static uint64_t t0 = 0, prev = 0, worst = 0; static unsigned n = 0; static double sum = 0;
       const uint64_t now = ppu_timebase_now();
       if (prev) { const uint64_t d = now - prev; sum += (double)d; n++; if (d > worst) worst = d; }
       prev = now;
@@ -783,7 +790,7 @@ extern "C" void rfom_fov_note(uint32_t cam, double f)
     if (!(f > 1.0 && f < 179.0)) return;
     static int any = -1; if (any < 0) any = getenv("RFOM_FOV_ANYCAM") ? 1 : 0;
     if (fabs(f - 82.0) < 0.01) s_rfom_view_cam = cam;
-    { static uint32_t seen[32]; static int ns = 0; int k = 0;   /* diag: distinct cameras */
+    if (rfom_stats_log()) { static uint32_t seen[32]; static int ns = 0; int k = 0;   /* diag: distinct cameras (PORT_STATS_LOG=1) */
       for (; k < ns; k++) if (seen[k] == cam) break;
       if (k == ns && ns < 32) { seen[ns++] = cam;
           FILE* fl = fopen("logs\\cameras.txt", ns == 1 ? "w" : "a");
@@ -851,7 +858,7 @@ extern "C" uint32_t rfom_speakers(uint32_t v)
 }
 /* Resistance port (v144, diagnostic): the sound-layout setup chain, so the
  * next launch that comes up with broken sound says which step differed.
- * logs\sndsetup.txt (appended, one block per launch): audio-out setup
+ * logs\sndsetup.txt (PORT_AUDIO_LOG=1; appended, one block per launch): audio-out setup
  * (D2FFC), sound setup (D37B0), the speaker-count getter's raw value, the
  * SCREAM bus count (515E4C) and every speaker layout the game selects
  * (51E738, with its name). rfom_snd_mode adds the layout in use each time the
@@ -875,6 +882,9 @@ static void snd_layout_name(uint32_t elem, char* out, int n)
 }
 static void snd_log(const char* line)
 {
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("PORT_AUDIO_LOG"); on = (e && atoi(e)) ? 1 : 0; }
+    if (!on) return;
     FILE* f = fopen("logs/sndsetup.txt", "a");
     if (!f) return;
     fprintf(f, "pid=%lu t=%llu tid=%lu %s\n", (unsigned long)GetCurrentProcessId(),
@@ -1571,7 +1581,7 @@ extern "C" void rfom_mouselook_pre(uint32_t player)
                              | ((td0 ? (vm_read32(vm_read32(td0 - 0x7FF8u) + 0xCu) & 0xFFu) : 0xFFu) << 16);
           static uint32_t lastkey = 0xFFFFFFFFu;
           if (key != lastkey) { lastkey = key; lg = t; static int n = 0;
-              if (n++ < 200) { const uint32_t ta = vm_read32(0x006BD648u - 0x7DC0u); const uint32_t area = ta ? vm_read32(vm_read32(ta - 0x7FF0u)) : 0xFFFFFFFFu;
+              if (rfom_stats_log() && n++ < 200) { const uint32_t ta = vm_read32(0x006BD648u - 0x7DC0u); const uint32_t area = ta ? vm_read32(vm_read32(ta - 0x7FF0u)) : 0xFFFFFFFFu;
                   FILE* f = fopen("logs\\gore.txt", n == 1 ? "w" : "a");
                   /* v163c: difficulty as func_0001C7E0 reads it: [[r2-0x7FA0]-0x7FF8]+0xC (word, 0 = none),
                      byte [[r2-0x7FA0]-0x7FF4]+0xC (raw level; the func returns 2 for raw >= 2) */
@@ -1984,7 +1994,7 @@ static void prompts_apply(uint32_t base, uint32_t end, int mode, uint32_t* blkp,
         i += m;
     }
     { static int logged_files = 0;                          /* what was found, for checking */
-      if (first && !starts.empty() && logged_files++ < 12) {
+      if (first && !starts.empty() && rfom_stats_log() && logged_files++ < 12) {
         char pfn[MAX_PATH + 32]; { char mp[MAX_PATH] = ""; GetModuleFileNameA(NULL, mp, MAX_PATH);
           const char* b = strrchr(mp, '\\'); b = b ? b + 1 : mp; snprintf(pfn, sizeof pfn, "logs\\prompts_%s.txt", b); }
         if (FILE* f = fopen(pfn, logged_files == 1 ? "w" : "a")) {
@@ -2254,7 +2264,7 @@ extern "C" void rfom_waggle(uint32_t out_ea, double window_s)
     uint32_t w = vm_read32(out_ea); float f; memcpy(&f, &w, 4);
     const int kbm = g_rfom_input_kbm != 0 || now - g_ml_kbm_ms < 500;   /* keyboard pad fed port 0 recently */
     { static int n = 0; static ULONGLONG last = 0;
-      if ((f > 0 || mouse > 0) && n < 3000 && now - last >= 100) { last = now;
+      if ((f > 0 || mouse > 0) && n < 3000 && now - last >= 100 && rfom_stats_log()) { last = now;
         if (FILE* lf = fopen("logs\\grab.txt", n++ ? "a" : "w")) {
             fprintf(lf, "t=%llu kbm=%d window=%.2f game=%.4f mouse=%.4f\n", (unsigned long long)now, kbm, window_s, f, mouse); fclose(lf); } } }
     if (!kbm || !en) return;

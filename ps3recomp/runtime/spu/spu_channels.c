@@ -42,6 +42,7 @@ char* rsx_getenv(const char* name);
 #include <time.h>
 #include "../platform/win32_compat.h"
 #include "ps3emu/log_first.h"
+#include "../ps3_log.h"      /* ps3_log_verbose: PS3_VERBOSE=1 */
 
 #ifdef __cplusplus
 extern "C" {
@@ -506,8 +507,17 @@ extern uint8_t* vm_base;
 typedef struct { uint64_t t; const void* ctx; uint32_t spu, type, a, b, c; } pmtrace_ent;
 static pmtrace_ent s_pmtrace[262144];
 static volatile LONG s_pmtrace_n = 0;
+/* SPU_PMTRACE=1: record the PM flow trace (a shared counter + a tick read per
+ * policy run / event ack / list stall) and dump it on a 4 s stall-notify sleep. */
+static int pmtrace_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("SPU_PMTRACE"); on = (e && atoi(e)) ? 1 : 0; }
+    return on;
+}
 void spu_pmtrace(const void* ctx, uint32_t spu, uint32_t type, uint32_t a, uint32_t b, uint32_t c)
 {
+    if (!pmtrace_on()) return;
     LONG i = InterlockedIncrement(&s_pmtrace_n) - 1;
     pmtrace_ent* e = &s_pmtrace[i & 262143];
     e->t = GetTickCount64(); e->ctx = ctx; e->spu = spu; e->type = type; e->a = a; e->b = b; e->c = c;
@@ -515,6 +525,7 @@ void spu_pmtrace(const void* ctx, uint32_t spu, uint32_t type, uint32_t a, uint3
 void spu_pmtrace_dump(const char* why)
 {
     static volatile LONG done = 0;
+    if (!pmtrace_on()) return;
     if (InterlockedExchange(&done, 1)) return;
     FILE* f = fopen("logs/pmtrace.txt", "w");
     if (!f) return;
@@ -699,11 +710,11 @@ volatile unsigned g_spu_putllc_sync_hit = 0;
  * "[putllc-fail] 5 s: ..." lists the top lines (image, link register, count,
  * no-reservation vs changed-line) and the host thread ids that took
  * reservations away on the worst one (match them to the F11 "prof tid" lines).
- * SPU_PUTLLC_DIAG=0 off. */
+ * SPU_PUTLLC_DIAG=1 on (off by default). */
 static void spu_putllc_fail_note(spu_context* ctx, uint32_t ea)
 {
     static int en = -1;
-    if (en < 0) { const char* e = getenv("SPU_PUTLLC_DIAG"); en = e ? atoi(e) : 1; }
+    if (en < 0) { const char* e = getenv("SPU_PUTLLC_DIAG"); en = e ? atoi(e) : 0; }
     if (!en) return;
     typedef struct { uint32_t ea, lr; int img; volatile long n, noresv; } PF;
     static PF t[32]; static volatile long s_lock; static ULONGLONG s_t0;
@@ -1454,7 +1465,7 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
     const uint64_t ft_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
 
     { static unsigned long bn = 0; unsigned long n = ++bn;
-      if (n <= 50 || (n % 512) == 0)
+      if (n <= 50 || ((n % 512) == 0 && ps3_log_verbose()))
         fprintf(stderr, "[ch-block] spu=%X pc=0x%05X op=%s ch=%u evstat=0x%X evmask=0x%X\n",
                 ctx->spu_id, ctx->pc & SPU_LS_MASK, op, channel,
                 ctx->event_status, ctx->event_mask); }

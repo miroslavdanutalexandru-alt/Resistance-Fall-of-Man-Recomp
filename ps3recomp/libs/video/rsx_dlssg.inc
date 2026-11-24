@@ -728,7 +728,7 @@ static void fg_present(ID3D12GraphicsCommandList* cl, UINT bi, u32 fi, D3D12_CPU
         if (s_fg_on && ((++s_fg_presents % 600u) == 0 || s_fg_presents == 120u)) {
             unsigned st = 0, mx = 0, pr = 0; int vok = 1; unsigned long long vram = 0;
             if (p_fg_state(&st, &mx, &vok, &pr, &vram)) {
-                if (st != s_fg_last_status || (s_fg_presents % 6000u) == 0) {
+                if (st != s_fg_last_status || ((s_fg_presents % 6000u) == 0 && port_stats_log())) {
                     fprintf(stderr, "[DLSS-G] status 0x%X%s%s%s%s%s, %u frames presented per rendered frame, %llu MB; HUD split %u of %u frames%c",
                             st, st & 1 ? " (resolution too low)" : "", st & 2 ? " (Reflex not detected)" : "",
                             st & 4 ? " (HDR format not supported)" : "", st & 8 ? " (camera constants invalid)" : "",

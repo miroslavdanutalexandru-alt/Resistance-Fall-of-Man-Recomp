@@ -448,7 +448,7 @@ static void f3_present(const D3D12_VIEWPORT* vp, int split, int* vs)
     f3_configure(on, 1, &r);
     s_f3_ring[(u32)((fid + 1u) % F3_RING)].reset = 0;   /* f3_prepare sets it for the next frame */
     if (on) s_f3_gen_n++;
-    if ((++s_f3_presents % 6000u) == 0u)
+    if ((++s_f3_presents % 6000u) == 0u && port_stats_log())
         fprintf(stderr, "[FSR3-FG] %u of the last 6000 presents had a generated frame; HUD split %u of %u frames%c",
                 s_f3_gen_n, s_fg_hud_ok, s_fg_hud_ok + s_fg_hud_fb, 10), s_f3_gen_n = 0;
 }
