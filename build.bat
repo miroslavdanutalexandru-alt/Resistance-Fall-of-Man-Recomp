@@ -6,8 +6,10 @@ cd /d "%~dp0"
 if not exist logs mkdir logs
 if not exist recompiled_game\ppu_recomp.h (echo The game code has not been generated yet - run Setup.bat first. & goto fail)
 rem A game window left open locks the .exe and the link fails -- close any that are still running.
-taskkill /IM ResistanceFoMGame.exe /F >nul 2>&1 && echo Closed a ResistanceFoMGame.exe that was still running.
-taskkill /IM ResistanceFoM.exe /F >nul 2>&1 && echo Closed a ResistanceFoM.exe that was still running.
+rem Close only a copy of ResistanceFoMGame.exe started from THIS folder (never one from another checkout).
+powershell -NoProfile -Command "$d=[IO.Path]::GetFullPath('%~dp0'); $k=0; Get-Process ResistanceFoMGame -EA 0 | ?{ $_.Path -and $_.Path.StartsWith($d,'OrdinalIgnoreCase') } | ForEach-Object { Stop-Process -Id $_.Id -Force; $k=1 }; if($k){ 'Closed a ResistanceFoMGame.exe that was still running.' }"
+rem Close only a copy of ResistanceFoM.exe started from THIS folder (never one from another checkout).
+powershell -NoProfile -Command "$d=[IO.Path]::GetFullPath('%~dp0'); $k=0; Get-Process ResistanceFoM -EA 0 | ?{ $_.Path -and $_.Path.StartsWith($d,'OrdinalIgnoreCase') } | ForEach-Object { Stop-Process -Id $_.Id -Force; $k=1 }; if($k){ 'Closed a ResistanceFoM.exe that was still running.' }"
 echo ============================================================
 echo  Resistance: Fall of Man - native PC build
 echo  Builds two programs: the front end (EBOOT) and the game (game.self).
