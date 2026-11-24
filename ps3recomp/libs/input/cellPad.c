@@ -898,7 +898,9 @@ static void pad_poll_keyboard(void)
       static ULONGLONG s_r2_ms = 0;
       if (btns & CELL_PAD_CTRL_R2) s_r2_ms = now;
       const int menu = fe2 && g_rfom_play_ms && now - g_rfom_play_ms > 200 && (!s_r2_ms || now - s_r2_ms > 300);
-      s_menu_last = menu;
+      /* PORT_KBM_WHEEL: menu mode without the R2 grace. E/R2 is also the vehicle
+       * throttle, so a throttle re-tap inside the 300 ms grace must not arm the wheel. */
+      s_menu_last = fe2 && g_rfom_play_ms && now - g_rfom_play_ms > 200;
       { static int was = -1;
         if (menu != was) { was = menu; static int n = 0;
           if (n++ < 200) { FILE* f = fopen("logs\\menumode.txt", n == 1 ? "w" : "a");
@@ -962,7 +964,10 @@ static void pad_poll_keyboard(void)
         const int wm = fe2_game ? kbm_wheel_mode() : 0;
         unsigned char wx = 128, wy = 128;
         const int wkx = lx < 0 ? -1 : lx > 0 ? 1 : 0, wky = ly < 0 ? -1 : ly > 0 ? 1 : 0;
-        const int on = wm && kbm_wheel_step(&s_kbm_wheel, wheel_key, wheel_menu, (double)mdx, (double)mdy, wkx, wky,
+        /* driving (vehicle input code ran < 200 ms ago): E/R2 is the throttle, never the wheel */
+        const int driving = g_rfom_drive_ms && now - g_rfom_drive_ms < 200;
+        if (driving) { s_kbm_wheel.menu = 1; s_kbm_wheel.live = 0; }   /* a hold that saw driving stays ignored */
+        const int on = wm && kbm_wheel_step(&s_kbm_wheel, wheel_key, wheel_menu || driving, (double)mdx, (double)mdy, wkx, wky,
                                             (unsigned long long)now, s_pad0_deliv, 100.0, 150, &wx, &wy);
         if (!wm) s_kbm_wheel.down = s_kbm_wheel.live = 0;
         if (on) {
