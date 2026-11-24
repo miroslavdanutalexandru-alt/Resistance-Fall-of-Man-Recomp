@@ -81,3 +81,8 @@ __pycache__/
 # logs and fall-detection dumps outside /logs/ (nothing tracked is a .log)
 *.log
 fall_*.bin
+# installer leftovers in a dev checkout (Inno Setup's uninstaller, the RFoMSwitch.exe it installs; build_installer.ps1 takes
+# RFoMSwitch.exe from build_dist\ or build\): never shipped from the root
+/unins*.dat
+/unins*.exe
+/RFoMSwitch.exe
