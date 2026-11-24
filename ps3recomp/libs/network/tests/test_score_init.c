@@ -17,7 +17,9 @@ void spu_lockline_unlock(void) {}
 /* sceNp.c reports ONLINE and queues its manager callback through these. */
 int np_psnr_enabled(void) { return 0; }
 const char* np_psnr_online_id(void) { return "PS3Player"; }
+const char* np_psnr_identity_key(void) { return NULL; }
 s32 cellSysutilQueueGuestCallbackArgs(u32 opd, const u64 args[8]) { (void)opd; (void)args; return 0; }
+void ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context*)) { (void)nid; (void)name; (void)fn; }   /* np_register_ctx */
 int main(void)
 {
     vm_base = calloc(1, 65536);

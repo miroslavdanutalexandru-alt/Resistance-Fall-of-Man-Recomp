@@ -8,6 +8,9 @@
 #include <string.h>
 #include <ctype.h>
 #include <time.h>
+#ifndef _WIN32
+#  include <unistd.h>   /* getpid */
+#endif
 
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
@@ -55,7 +58,128 @@ static int clean_online_id(const char* in, char out[17])
 }
 
 static char s_id[17];
+static char s_key[17 + 1 + 16];   /* what the identity derives from: see np_psnr_identity_key */
 static int  s_id_state;     /* 0 unresolved, 1 a name applies, 2 none (offline) */
+
+/* Adjective + animal, at most 8 + 8 letters, so every pair is a valid ID.
+ * 128 x 128 names: two players picking the same one is rare, and when it happens
+ * the saved salt still keeps them apart (np_psnr_identity_key). */
+static const char* const k_adj[] = {
+    "Amazing", "Brave", "Clever", "Daring", "Eager", "Fearless", "Fierce", "Gentle",
+    "Happy", "Jolly", "Lucky", "Mighty", "Nimble", "Quick", "Quiet", "Rapid",
+    "Sneaky", "Swift", "Witty", "Bold", "Calm", "Cosmic", "Crafty", "Dizzy",
+    "Electric", "Exciting", "Fancy", "Fuzzy", "Grumpy", "Hasty", "Lively", "Mellow",
+    "Plucky", "Proud", "Rowdy", "Sleepy", "Speedy", "Steady", "Sunny", "Zesty",
+    "Agile", "Ancient", "Atomic", "Awesome", "Bouncy", "Breezy", "Bright", "Brisk",
+    "Bubbly", "Cheeky", "Cheery", "Chilly", "Classic", "Cozy", "Curious", "Dapper",
+    "Dashing", "Eternal", "Fabulous", "Feisty", "Fluffy", "Frosty", "Funky",
+    "Giant", "Glossy", "Golden", "Groovy", "Hardy", "Heroic", "Humble", "Icy",
+    "Jazzy", "Jumpy", "Keen", "Kind", "Lunar", "Loyal", "Magic", "Merry", "Mystic",
+    "Noble", "Polar", "Peppy", "Quirky", "Radiant", "Royal", "Rustic", "Sassy",
+    "Shiny", "Silent", "Silly", "Smooth", "Snappy", "Solar", "Spicy", "Stellar",
+    "Stormy", "Sturdy", "Super", "Tiny", "Turbo", "Valiant", "Vivid", "Wacky",
+    "Wild", "Wise", "Zany", "Zippy", "Nifty", "Brainy", "Chipper", "Comfy", "Crisp",
+    "Dandy", "Dreamy", "Epic", "Fresh", "Gleeful", "Grand", "Jaunty", "Lofty",
+    "Misty", "Perky", "Rugged", "Spunky", "Swanky", "Trusty", "Upbeat" };
+static const char* const k_animal[] = {
+    "Hippo", "Lizard", "Badger", "Beaver", "Bison", "Cobra", "Condor", "Coyote",
+    "Falcon", "Ferret", "Gecko", "Heron", "Hyena", "Iguana", "Jackal", "Koala",
+    "Lemur", "Lynx", "Marmot", "Moose", "Narwhal", "Ocelot", "Otter", "Panda",
+    "Panther", "Parrot", "Pelican", "Penguin", "Puffin", "Raccoon", "Raven",
+    "Rhino", "Salmon", "Shark", "Sloth", "Tapir", "Tiger", "Toucan", "Walrus",
+    "Wombat", "Alpaca", "Anteater", "Axolotl", "Baboon", "Bear", "Beetle", "Bobcat",
+    "Buffalo", "Camel", "Caribou", "Cheetah", "Chipmunk", "Cougar", "Crab", "Crane",
+    "Cricket", "Dingo", "Dolphin", "Donkey", "Duck", "Eagle", "Elk", "Emu", "Finch",
+    "Flamingo", "Fox", "Frog", "Gazelle", "Gerbil", "Gibbon", "Giraffe", "Goat",
+    "Goose", "Gopher", "Gorilla", "Hamster", "Hare", "Hawk", "Hedgehog", "Ibex",
+    "Impala", "Jaguar", "Kiwi", "Kitten", "Lark", "Lemming", "Leopard", "Lion",
+    "Llama", "Lobster", "Macaw", "Magpie", "Mammoth", "Manatee", "Meerkat", "Mink",
+    "Mole", "Mongoose", "Monkey", "Moth", "Mouse", "Newt", "Octopus", "Orca",
+    "Osprey", "Ostrich", "Owl", "Oyster", "Pigeon", "Platypus", "Pony", "Possum",
+    "Quail", "Rabbit", "Reindeer", "Robin", "Seal", "Shrimp", "Skunk", "Snail",
+    "Sparrow", "Squid", "Stork", "Swan", "Turtle", "Viper", "Vulture", "Weasel" };
+
+/* 64 random-enough bits: the clock, the process and a counter, mixed. Not for
+ * secrets -- only to keep players' names and salts apart. */
+static uint64_t random64(void)
+{
+    static uint64_t n;
+    uint64_t x = (uint64_t)time(NULL) ^ ((uint64_t)clock() << 20) ^ (uint64_t)(uintptr_t)&n
+               ^ (++n * 0x9E3779B97F4A7C15ull);
+#ifdef _WIN32
+    LARGE_INTEGER qpc;
+    QueryPerformanceCounter(&qpc);
+    x ^= ((uint64_t)GetCurrentProcessId() << 32) ^ GetTickCount64() ^ ((uint64_t)qpc.QuadPart << 7);
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    x ^= ((uint64_t)getpid() << 32) ^ (uint64_t)ts.tv_nsec ^ ((uint64_t)ts.tv_sec << 30);
+#endif
+    if (!x) x = 0x9E3779B97F4A7C15ull;
+    for (int i = 0; i < 4; i++) { x ^= x << 13; x ^= x >> 7; x ^= x << 17; }   /* xorshift64 */
+    return x;
+}
+
+void np_psnr_random_id(char out[17])
+{
+    uint64_t x = random64();
+    snprintf(out, 17, "%s%s", k_adj[x % (sizeof k_adj / sizeof *k_adj)],
+             k_animal[(x >> 32) % (sizeof k_animal / sizeof *k_animal)]);
+}
+
+/* The random name is saved, so a player keeps one name -- and the account ID
+ * and console identity derived from it -- across launches. The file holds the
+ * name on its first line and a random salt (16 hex digits) on the second. */
+static const char* id_file(void)
+{
+    const char* f = getenv("PS3_NP_ID_FILE");
+    return f && *f ? f : "online_id.txt";
+}
+
+/* Drop a UTF-8 BOM and surrounding whitespace, in place. */
+static char* trim(char* s)
+{
+    if ((unsigned char)s[0] == 0xEF && (unsigned char)s[1] == 0xBB && (unsigned char)s[2] == 0xBF)
+        s += 3;
+    while (*s && isspace((unsigned char)*s)) s++;
+    size_t n = strlen(s);
+    while (n && isspace((unsigned char)s[n - 1])) s[--n] = 0;
+    return s;
+}
+
+/* 1: a valid name, with *salt set if the file has one (*has_salt);
+ * 0: no file or no name; -1: a name that is not a valid ID (reported). */
+static int load_saved_id(char out[17], uint64_t* salt, int* has_salt)
+{
+    char l1[128] = {0}, l2[128] = {0};
+    *has_salt = 0;
+    FILE* f = fopen(id_file(), "r");
+    if (!f) return 0;
+    if (!fgets(l1, sizeof l1, f)) l1[0] = 0;
+    if (!fgets(l2, sizeof l2, f)) l2[0] = 0;
+    fclose(f);
+    char* name = trim(l1);
+    if (!*name) return 0;
+    if (!clean_online_id(name, out) || strcmp(out, name) != 0) {
+        printf("[psnr] %s: \"%s\" is not a valid online ID (3-16 letters, digits, - or _, "
+               "starting with a letter); using a random name this run, the file is left as it is\n",
+               id_file(), name);
+        return -1;
+    }
+    char* s = trim(l2);
+    int hex = strlen(s) == 16;
+    for (int i = 0; hex && i < 16; i++) hex = isxdigit((unsigned char)s[i]) != 0;
+    if (hex) { *salt = strtoull(s, NULL, 16); *has_salt = 1; }
+    return 1;
+}
+
+static void save_id(const char* id, uint64_t salt)
+{
+    FILE* f = fopen(id_file(), "w");
+    if (!f) { printf("[psnr] could not save the player name to %s\n", id_file()); return; }
+    fprintf(f, "%s\n%016llx\n", id, (unsigned long long)salt);
+    fclose(f);
+}
 
 void np_psnr_setup(const char* username, const char* server)
 {
@@ -66,7 +190,12 @@ void np_psnr_setup(const char* username, const char* server)
         set_env("PSNR_SERVER", server);
     }
     /* The first valid one of: --username, PS3_NP_ONLINE_ID, and -- online
-     * only -- the OS login name. */
+     * only -- the name saved by an earlier run, else a new random one
+     * (np_psnr_random_id), saved for next time with a random salt. Never the OS login name: it
+     * would show the player's account name to everyone online. Online means
+     * PS3_NET_ONLINE, with or without a psnr server: a title with its own
+     * backend (Medius) needs a name of its own too. */
+    int online = getenv("PS3_NET_ONLINE") != NULL;
     const char* named[2] = { username, getenv("PS3_NP_ONLINE_ID") };
     int found = 0;
     for (int i = 0; i < 2 && !found; i++) {
@@ -77,22 +206,36 @@ void np_psnr_setup(const char* username, const char* server)
                    "starting with a letter)\n", named[i]);
     }
     if (!found) {
-        if (!np_psnr_enabled()) { s_id_state = 2; return; }   /* offline: "PS3Player" */
-#ifdef _WIN32
-        const char* os = getenv("USERNAME");
-#else
-        const char* os = getenv("USER");
-#endif
-        if (!clean_online_id(os, s_id)) strcpy(s_id, "PS3Player");
+        if (!online) { s_id_state = 2; return; }   /* offline: "PS3Player" */
+        uint64_t salt = 0;
+        int has_salt = 0;
+        int r = load_saved_id(s_id, &salt, &has_salt);
+        if (r == 1) {
+            printf("[psnr] player name from %s\n", id_file());
+            if (!has_salt) { salt = random64(); save_id(s_id, salt); }
+        } else {
+            np_psnr_random_id(s_id);
+            salt = random64();
+            if (r == 0) save_id(s_id, salt);   /* an invalid name is left for the player to fix */
+        }
+        snprintf(s_key, sizeof s_key, "%s#%016llx", s_id, (unsigned long long)salt);
+    } else {
+        snprintf(s_key, sizeof s_key, "%s", s_id);
     }
     s_id_state = 1;
-    printf("[psnr] player \"%s\"%s\n", s_id, np_psnr_enabled() ? "" : " (offline)");
+    printf("[psnr] player \"%s\"%s\n", s_id, online ? "" : " (offline)");
 }
 
 const char* np_psnr_identity(void)
 {
     if (!s_id_state) np_psnr_setup(NULL, NULL);
     return s_id_state == 1 ? s_id : NULL;
+}
+
+const char* np_psnr_identity_key(void)
+{
+    if (!s_id_state) np_psnr_setup(NULL, NULL);
+    return s_id_state == 1 ? s_key : NULL;
 }
 
 int np_psnr_enabled(void)

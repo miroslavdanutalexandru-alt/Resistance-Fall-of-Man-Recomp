@@ -119,7 +119,7 @@ jobs:
           .\test_np_matching2.exe
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
-      # The player name: --username, PS3_NP_ONLINE_ID, the OS login online,
+      # The player name: --username, PS3_NP_ONLINE_ID, a random name online,
       # and PSN's online ID rules.
       - name: Run the player-name test
         run: |

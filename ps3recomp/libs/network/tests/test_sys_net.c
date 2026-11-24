@@ -98,6 +98,38 @@ enum { ADDR_A = 0x1000, ADDR_B = 0x1100, LEN = 0x1200, OPT = 0x1300,
 
 static uint32_t errno_cell(void) { return vm_read32((uint32_t)call("_sys_net_errno_loc", 0, 0, 0, 0, 0, 0)); }
 
+static void test_set_env(const char* k, const char* v)
+{
+#ifdef _WIN32
+    _putenv_s(k, v);
+#else
+    setenv(k, v, 1);
+#endif
+}
+
+/* A DNS query for `name` (type `qtype`, class IN) at guest `ea`; returns its length. */
+static uint32_t put_dns_query(uint32_t ea, uint16_t id, const char* name, uint16_t qtype)
+{
+    uint8_t* q = vm_base + ea;
+    uint32_t p = 12;
+    memset(q, 0, 12);
+    q[0] = (uint8_t)(id >> 8); q[1] = (uint8_t)id;
+    q[2] = 0x01;                          /* RD */
+    q[5] = 1;                             /* QDCOUNT */
+    while (*name) {
+        const char* dot = strchr(name, '.');
+        size_t l = dot ? (size_t)(dot - name) : strlen(name);
+        q[p++] = (uint8_t)l;
+        memcpy(q + p, name, l);
+        p += (uint32_t)l;
+        name += l + (dot ? 1 : 0);
+    }
+    q[p++] = 0;
+    q[p++] = (uint8_t)(qtype >> 8); q[p++] = (uint8_t)qtype;
+    q[p++] = 0; q[p++] = 1;               /* IN */
+    return p;
+}
+
 static void put_sockaddr(uint32_t ea, uint32_t ip_be, uint16_t port)
 {
     memset(vm_base + ea, 0, 16);
@@ -353,6 +385,96 @@ int main(void)
     }
     assert(C1("socketclose", in) == 0 && C1("socketclose", out) == 0);
     assert(C1("socketclose", l2) == 0 && C1("socketclose", l1) == 0);
+
+    /* PS3_NET_HOSTS: "name ip" and "name=ip" lines, '#' comments, names
+     * matched case-insensitively, and a hostname on the right resolved by
+     * the host. */
+    {
+        const char* hosts = "test_sys_net_hosts.txt";
+        FILE* f = fopen(hosts, "w");
+        assert(f);
+        fputs("# community server\n"
+              "\n"
+              "Game.Example.COM 10.1.2.3\n"
+              "  other.example=10.4.5.6   # trailing comment\n"
+              "named.example\tlocalhost\n"
+              "broken.example\n", f);
+        fclose(f);
+        test_set_env("PS3_NET_HOSTS", hosts);
+
+        strcpy((char*)vm_base + STR, "game.example.com");
+        h = (uint32_t)call("gethostbyname", STR, 0, 0, 0, 0, 0);
+        assert(h && vm_read32(vm_read32(vm_read32(h + 16))) == 0x0A010203u);
+        assert(strcmp((const char*)vm_base + vm_read32(h), "game.example.com") == 0);
+        strcpy((char*)vm_base + STR, "other.example");
+        h = (uint32_t)call("gethostbyname", STR, 0, 0, 0, 0, 0);
+        assert(h && vm_read32(vm_read32(vm_read32(h + 16))) == 0x0A040506u);
+        strcpy((char*)vm_base + STR, "named.example");
+        h = (uint32_t)call("gethostbyname", STR, 0, 0, 0, 0, 0);
+        assert(h && vm_read32(vm_read32(vm_read32(h + 16))) == LOOP);
+        struct in_addr ov;
+        assert(!hosts_override("broken.example", &ov));   /* no address: not a match */
+        assert(!hosts_override("example.com", &ov));      /* no partial matches */
+
+        /* The question parser accepts one A/IN question and nothing else. */
+        char qn[256];
+        uint32_t ql = put_dns_query(BUF, 1, "a.example", 1);
+        assert(dns_parse_question(vm_base + BUF, ql, qn, sizeof qn) == ql && !strcmp(qn, "a.example"));
+        assert(dns_parse_question(vm_base + BUF, ql - 1, qn, sizeof qn) == 0);    /* truncated */
+        assert(dns_parse_question(vm_base + BUF, ql, qn, 8) == 0);                /* name too long */
+        ql = put_dns_query(BUF, 1, "a.example", 28);                              /* AAAA */
+        assert(dns_parse_question(vm_base + BUF, ql, qn, sizeof qn) == 0);
+        vm_base[BUF + 5] = 2;                                                     /* QDCOUNT 2 */
+        assert(dns_parse_question(vm_base + BUF, ql, qn, sizeof qn) == 0);
+        ql = put_dns_query(BUF, 1, "a.example", 1);
+        vm_base[BUF + 12] = 0xC0;                                                 /* compressed */
+        assert(dns_parse_question(vm_base + BUF, ql, qn, sizeof qn) == 0);
+
+        /* A query to port 53 for a listed name is answered locally: the
+         * next recvfrom returns the answer from the server it was sent to,
+         * with the query's ID, and nothing was sent. */
+        int32_t d = C3("socket", SYS_NET_AF_INET, SYS_NET_SOCK_DGRAM, 0);
+        assert(d > 0);
+        put_sockaddr(ADDR_A, 0x08080808u, 53);
+        ql = put_dns_query(BUF, 0xBEEF, "GAME.example.com", 1);
+        assert(call("sendto", d, BUF, ql, 0, ADDR_A, 16) == (int64_t)ql);
+        vm_write32(POLLFD, (uint32_t)d);
+        vm_write16(POLLFD + 4, SYS_NET_POLLIN);
+        vm_write16(POLLFD + 6, 0);
+        assert(C3("socketpoll", POLLFD, 1, 1000) == 1 && (vm_read16(POLLFD + 6) & SYS_NET_POLLIN));
+        /* A peek sees the answer and leaves it for the real read. */
+        memset(vm_base + BUF, 0, 512);
+        assert(call("recvfrom", d, BUF, 512, SYS_NET_MSG_PEEK, 0, 0) == (int64_t)ql + 16);
+        assert(vm_base[BUF] == 0xBE && vm_base[BUF + 1] == 0xEF);
+        memset(vm_base + BUF, 0, 512);
+        vm_write32(LEN, 16);
+        int32_t n = (int32_t)call("recvfrom", d, BUF, 512, 0, ADDR_B, LEN);
+        assert(n == (int32_t)ql + 16);
+        const uint8_t* r = vm_base + BUF;
+        assert(r[0] == 0xBE && r[1] == 0xEF);                    /* the query's ID */
+        assert(r[2] == 0x81 && r[3] == 0x80);                    /* response, no error */
+        assert(r[5] == 1 && r[7] == 1 && r[9] == 0 && r[11] == 0);
+        assert(r[ql] == 0xC0 && r[ql + 1] == 0x0C);              /* name -> the question */
+        assert(r[ql + 3] == 1 && r[ql + 5] == 1 && r[ql + 11] == 4);
+        assert(r[n - 4] == 10 && r[n - 3] == 1 && r[n - 2] == 2 && r[n - 1] == 3);
+        assert(vm_read32(ADDR_B + 4) == 0x08080808u && vm_read16(ADDR_B + 2) == 53);
+        /* Handed out once. */
+        assert((uint32_t)call("recvfrom", d, BUF, 512, SYS_NET_MSG_DONTWAIT, 0, 0) == 0x80010223u);
+
+        /* An answer left unread does not leak into the next socket that
+         * takes the same slot. */
+        ql = put_dns_query(BUF, 0x1234, "other.example", 1);
+        assert(call("sendto", d, BUF, ql, 0, ADDR_A, 16) == (int64_t)ql);
+        assert(C1("socketclose", d) == 0);
+        int32_t d2 = C3("socket", SYS_NET_AF_INET, SYS_NET_SOCK_DGRAM, 0);
+        assert(d2 == d);
+        assert((uint32_t)call("recvfrom", d2, BUF, 512, SYS_NET_MSG_DONTWAIT, 0, 0) == 0x80010223u);
+        assert(C1("socketclose", d2) == 0);
+
+        test_set_env("PS3_NET_HOSTS", "");
+        remove(hosts);
+        assert(!hosts_override("game.example.com", &ov));     /* unset: no overrides */
+    }
 
     /* A bad fd is EBADF (9), and closing works. */
     assert((uint32_t)C1("socketclose", 99) == 0x80010209u && errno_cell() == SYS_NET_EBADF);
