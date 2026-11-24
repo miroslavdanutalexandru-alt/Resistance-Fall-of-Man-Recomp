@@ -2551,6 +2551,7 @@ static void fsr_dispatch(void)
     /* RFOM_DLSS_CAM: exact camera motion into the pixels no matched draw covered */
     int cam_cut = 0;
     double fg_M[16]; int fg_has_M = 0;   /* DLSS-G: the camera the fill used (none = no camera motion) */
+    float fg_j[4] = { 0.0f, 0.0f, (float)w * uf, (float)h * uf };   /* its jitter (ndc) and view size (rsx_dlssg_ghost.inc) */
     static rfom_fgcam_hold_t hold;       /* RFOM_DLSS_FG_CAM_HOLD */
     if (!s_cf_armed) hold.has = 0;
     if (s_cf_armed) {
@@ -2581,6 +2582,7 @@ static void fsr_dispatch(void)
             if (fg_has_M) { const double d = vpcpu_mdist(fg_M, I); s_fgdf.mo = d > 1e8 ? -1.0f : (float)d; }
         }
         cam_fill(rw, rh, (float)w * uf, (float)h * uf, fg_has_M ? fg_M : NULL, j[0], j[1]);
+        fg_j[0] = j[0]; fg_j[1] = j[1];
     }
     const D3D12_RESOURCE_STATES rd = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     off_rt_transition(slot, rd);
@@ -2697,7 +2699,8 @@ static void fsr_dispatch(void)
             if (!ok) rc = FFX_API_RETURN_ERROR;
             else fg_tag_scene(cl, s_fsr_z, (unsigned)s_fsr_z_st, s_fsr_mv, (unsigned)s_fsr_mv_st, rw, rh,
                               js * jx, js * jy, dd.reset, fg_has_M ? fg_M : NULL,
-                              dd.cameraNear, dd.cameraFar, dd.cameraFovAngleVertical);   /* DLSS-G: the same depth / motion / jitter / camera */
+                              dd.cameraNear, dd.cameraFar, dd.cameraFovAngleVertical,   /* DLSS-G: the same depth / motion / jitter / camera */
+                              (s_fsr_rx && fsr_rx_val() > 0.0f) ? s_fsr_rx : NULL, fg_j);
         }
     } else if (s_xess_on) {
 #if RSX_HAVE_XESS
@@ -2735,8 +2738,16 @@ static void fsr_dispatch(void)
 #endif
     } else rc = p_ffxDispatch(&s_fsr_ctx, &dd.header);
     fsr_gt_end(gtq);
-    if (rc == FFX_API_RETURN_OK)   /* AMD FSR 3 frame generation: the same depth / motion / jitter / reset */
-        f3_prepare(cl, s_fsr_z, s_fsr_z_st, s_fsr_mv, s_fsr_mv_st, w, h, rw, rh, jx, jy, dt, dd.reset);
+    if (rc == FFX_API_RETURN_OK && s_f3_ready) {   /* AMD FSR 3 frame generation: the same depth / motion / jitter / reset */
+        ID3D12Resource *f3z = s_fsr_z, *f3mv = s_fsr_mv; unsigned f3zs = (unsigned)s_fsr_z_st, f3ms = (unsigned)s_fsr_mv_st;
+        fgx_cfg();   /* RFOM_DLSS_FG_FX_MV / _STATS / _MV_DEBUG: the private copies (no motion zeroing: FSR 3 dispatches here) */
+        if ((s_fgxc.fx || s_fgxc.stats || s_fgxc.mv_dbg) && f3zs == (unsigned)rd && f3ms == (unsigned)rd &&
+            fgx_prep(cl, s_fsr_z, s_fsr_mv, (s_fsr_rx && fsr_rx_val() > 0.0f) ? s_fsr_rx : NULL, rw, rh, fg_has_M ? fg_M : NULL, fg_j)) {
+            f3z = s_fgx.z; f3mv = s_fgx.mv; f3zs = f3ms = (unsigned)rd;
+        }
+        fgx_note_tag(dd.reset);
+        f3_prepare(cl, f3z, f3zs, f3mv, f3ms, w, h, rw, rh, jx, jy, dt, dd.reset);
+    }
     /* FFX bound its own descriptor heap / compute state. */
     vp_set_heaps(cl);   /* + the guest sampler heap (Phase 2) */
     cl->lpVtbl->SetGraphicsRootSignature(cl, s_d3d.vp_root_sig);

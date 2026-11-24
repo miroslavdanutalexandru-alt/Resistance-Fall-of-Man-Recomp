@@ -417,6 +417,27 @@ static void test_unsure_pause()
     CHECK(off == 10);
 }
 
+// RFOM_DLSS_FG_HUD_HOLD: a frame without a separated HUD keeps the last separated area for < 2 s
+static void test_hud_hold()
+{
+    rfom_fg_hudhold_t h = {0, 0};
+    // nothing separated yet: nothing to hold
+    CHECK(!rfom_fg_hudhold_step(&h, 1, 1, 0, 100, 2000));
+    CHECK(!rfom_fg_hudhold_step(&h, 1, 1, 1, 1000, 2000));
+    CHECK(rfom_fg_hudhold_step(&h, 1, 1, 0, 1016, 2000));
+    CHECK(rfom_fg_hudhold_step(&h, 1, 1, 0, 2999, 2000));
+    CHECK(!rfom_fg_hudhold_step(&h, 1, 1, 0, 3000, 2000));
+    // frames without the split neither use nor refresh the hold
+    CHECK(!rfom_fg_hudhold_step(&h, 1, 1, 1, 4000, 2000));
+    CHECK(!rfom_fg_hudhold_step(&h, 1, 0, 1, 5000, 2000));
+    CHECK(rfom_fg_hudhold_step(&h, 1, 1, 0, 5500, 2000));
+    CHECK(!rfom_fg_hudhold_step(&h, 1, 1, 0, 6000, 2000));
+    // turning it off forgets the area
+    CHECK(!rfom_fg_hudhold_step(&h, 1, 1, 1, 7000, 2000));
+    CHECK(!rfom_fg_hudhold_step(&h, 0, 1, 0, 7010, 2000));
+    CHECK(!rfom_fg_hudhold_step(&h, 1, 1, 0, 7020, 2000));
+}
+
 static void test_medoid_rel()
 {
 	static const double I[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
@@ -589,6 +610,7 @@ int main()
 	test_medoid();
 	test_medoid_rel();
 	test_unsure_pause();
+	test_hud_hold();
 	test_vote_majority();
 	test_nn_ambiguous();
 	test_camrep();

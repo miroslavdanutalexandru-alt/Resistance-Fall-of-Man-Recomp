@@ -32,6 +32,8 @@
  *   PORT_FG           dlssg | fsr3 | off (shared by the three ports): overrides RFOM_DLSS_FG / RFOM_FG_BACKEND;
  *                     unset or auto keeps them. dlssg keeps a 3x / 4x request; fsr3 is 2x.
  *   PORT_FG_HUDLESS   1 / 0: overrides RFOM_FG_HUDSPLIT. See scratch/framegen_fsr3.md.
+ *   RFOM_DLSS_FG_HUD_HOLD / _HUD_DEBUG / _FX_MV / _STATS / _MV_DEBUG: ghosting fixes (HUD hold for frames whose HUD
+ *                     could not be separated, effect motion, [fg-stats], motion-vector tint), see rsx_dlssg_ghost.inc.
  *
  * Wiring (manual hooking, see rfom_dlssg.cpp): the renderer keeps its native device and submits to the
  * native queue; only the swap chain is created through Streamline proxies (factory + queue), so the
@@ -405,7 +407,7 @@ static int fg_res_init(void)
     s_fg_hl_st = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE; s_fg_ui_st = D3D12_RESOURCE_STATE_RENDER_TARGET;
     if (!s_fg_hl || !s_fg_ui) { fg_log("HUD split unavailable (out of video memory)"); return 0; }
     D3D12_DESCRIPTOR_HEAP_DESC hd = {0};
-    hd.NumDescriptors = 3; hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+    hd.NumDescriptors = 4; hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;   /* ui, hsc, usc, HUD hold mask */
     if (FAILED(d->lpVtbl->CreateDescriptorHeap(d, &hd, &IID_ID3D12DescriptorHeap, (void**)&s_fg_rtv_heap))) { s_fg_rtv_heap = NULL; return 0; }
     s_fg_rtv_inc = d->lpVtbl->GetDescriptorHandleIncrementSize(d, D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     hd.NumDescriptors = 2 + 4 * FRAME_COUNT; hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV; hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
@@ -477,12 +479,16 @@ static int fg_sc_res(void)
     return 1;
 }
 
+#include "rsx_dlssg_ghost.inc"   /* RFOM_DLSS_FG_HUD_HOLD / _FX_MV / _STATS / _MV_DEBUG */
+
 /* rsx_fsr.inc, right after the DLSS Super Resolution evaluation on the frame's command list: the same
  * depth and motion vectors (render resolution, UV units, camera + object motion) go to DLSS-G. */
 /* M: the frame's solved camera (rsx_fsr.inc cam_solve, NULL when the camera fill used no camera motion);
- * cn / cf / cv: near, far, vertical fov. RFOM_DLSS_FG_REAL_CAM=0: DLSS-G is told the camera never moves (old). */
+ * cn / cf / cv: near, far, vertical fov. RFOM_DLSS_FG_REAL_CAM=0: DLSS-G is told the camera never moves (old).
+ * rx: the reactive (effect) mask or NULL; jv: the camera fill's jitter (ndc xy) and view size (rsx_dlssg_ghost.inc). */
 static void fg_tag_scene(ID3D12GraphicsCommandList* cl, ID3D12Resource* z, unsigned zst, ID3D12Resource* mv, unsigned mst,
-                         unsigned rw, unsigned rh, float jx, float jy, int reset, const double* M, float cn, float cf, float cv)
+                         unsigned rw, unsigned rh, float jx, float jy, int reset, const double* M, float cn, float cf, float cv,
+                         ID3D12Resource* rx, const float* jv)
 {
     if (!s_fg_ready && !s_fg_dbg && !g_pc_photo_nohud) return;
     s_fgh.tagged = 1;
@@ -500,6 +506,13 @@ static void fg_tag_scene(ID3D12GraphicsCommandList* cl, ID3D12Resource* z, unsig
         p_fg_camera(c2p, p2c, cn, cf, cv);
     }
     if (s_fgd_on && !s_fg_on) s_fgdf.reset |= FGD_R_RESUME;   /* the tag below asks for a reset */
+    fgx_note_tag(reset || !s_fg_on);
+    const unsigned rd = (unsigned)(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    if (fgx_defer() && zst == rd && mst == rd && fgx_prep(cl, z, mv, rx, rw, rh, M, jv)) {
+        s_fgx.pend = 1; s_fgx.rw = rw; s_fgx.rh = rh; s_fgx.jx = jx; s_fgx.jy = jy; s_fgx.reset = reset || !s_fg_on;
+        return;   /* tagged at the present (fgx_tag_present) */
+    }
+    s_fgx.pend = 0;
     p_fg_tag(cl, z, zst, mv, mst, rw, rh, jx, jy, reset || !s_fg_on);
 }
 
@@ -539,6 +552,7 @@ static void fg_hud_reset(void)
     const int gate = (s_fg_ready || s_f3_ready || s_fg_dbg || g_pc_photo_nohud) && s_fg_split && !g_pc_hdr_active && fg_res_init();
     memset(&s_fgh, 0, sizeof s_fgh);
     s_fgh.gate = gate;
+    s_fgx.pend = 0;
 }
 
 /* Photo mode (rfom_pcextra.cpp, F7; RFOM_PHOTO_HIDEHUD=0 = off): present_blit, after the frame is drawn into
@@ -577,7 +591,9 @@ static void fg_present(ID3D12GraphicsCommandList* cl, UINT bi, u32 fi, D3D12_CPU
     fg_late_check();
     const int split = s_fgh.gate && s_fgh.tagged && fg_sc_res();
     const int valid = split && s_fgh.open && !s_fgh.unsure && s_fgh.ndraw > 0;
-    if (s_fgd_on) { s_fgdf.hud = !split ? '-' : valid ? 'V' : 'F'; s_fgdf.hruns = (u16)s_fgh.runs; s_fgdf.hdraws = (u16)s_fgh.ndraw; }
+    const int hold_use = fgx_hold_step(split, valid);   /* RFOM_DLSS_FG_HUD_HOLD */
+    int paused_out = 0;
+    if (s_fgd_on) { s_fgdf.hud = !split ? '-' : valid ? 'V' : hold_use ? 'H' : 'F'; s_fgdf.hruns = (u16)s_fgh.runs; s_fgdf.hdraws = (u16)s_fgh.ndraw; }
     if (split) {
         if (valid) s_fg_hud_ok++; else s_fg_hud_fb++;
         fg_tr(cl, s_fg_ui, &s_fg_ui_st, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
@@ -600,6 +616,7 @@ static void fg_present(ID3D12GraphicsCommandList* cl, UINT bi, u32 fi, D3D12_CPU
         cl->lpVtbl->SetPipelineState(cl, s_blit_pso);
         cl->lpVtbl->SetGraphicsRootDescriptorTable(cl, 1, fg_srv(valid ? 0 : 2 + (int)fi));
         cl->lpVtbl->DrawInstanced(cl, 3, 1, 0, 0);
+        if (fgx_tint_ok()) { fgx_tint_draw(cl); fgx_restore(cl, k); }   /* RFOM_DLSS_FG_MV_DEBUG: generated frames tinted too */
         /* UI: the separated HUD (premultiplied), then the port's own OSD on top of it */
         cl->lpVtbl->OMSetRenderTargets(cl, 1, &ur, FALSE, NULL);
         if (valid) {
@@ -612,10 +629,11 @@ static void fg_present(ID3D12GraphicsCommandList* cl, UINT bi, u32 fi, D3D12_CPU
                 cl->lpVtbl->SetGraphicsRootDescriptorTable(cl, 1, fg_srv(1));
             }
             cl->lpVtbl->DrawInstanced(cl, 3, 1, 0, 0);
-        }
+        } else if (hold_use) fgx_hold_draw(cl);   /* not split this frame: the last split's HUD area of the real frame */
         osd_draw(cl, bi);
         fg_tr(cl, s_fg_hsc, &s_fg_hsc_st, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         fg_tr(cl, s_fg_usc, &s_fg_usc_st, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        if (valid) fgx_hold_record(cl);
         if (s_fg_dbg && shot != 1) {   /* debug view replaces what is presented (never the screenshot) */
             static const float grey[4] = {0.5f, 0.5f, 0.5f, 1};
             cl->lpVtbl->OMSetRenderTargets(cl, 1, &sc_rtv, FALSE, NULL);
@@ -637,12 +655,14 @@ static void fg_present(ID3D12GraphicsCommandList* cl, UINT bi, u32 fi, D3D12_CPU
             }
         }
     }
+    if (!s_fg_dbg) fgx_overlays(cl, sc_rtv, vp, shot, hold_use);   /* RFOM_DLSS_FG_MV_DEBUG / _HUD_DEBUG */
     if (s_fg_ready) {
         const unsigned l = (unsigned)(vp->TopLeftX + 0.5f), t = (unsigned)(vp->TopLeftY + 0.5f);
         unsigned w = (unsigned)(vp->Width + 0.5f), h = (unsigned)(vp->Height + 0.5f);
         if (l + w > s_sc_w) w = s_sc_w - l;
         if (t + h > s_sc_h) h = s_sc_h - t;
         const int ui_on = fg_ui_on();
+        if (s_fgh.tagged) fgx_tag_present(cl, hold_use);   /* the deferred scene tag (ghosting fixes) */
         if (s_fgh.tagged)
             p_fg_present_tags(cl, split ? s_fg_hsc : NULL, split ? s_fg_usc : NULL,
                               (unsigned)D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, l, t, w, h);
@@ -659,6 +679,7 @@ static void fg_present(ID3D12GraphicsCommandList* cl, UINT bi, u32 fi, D3D12_CPU
         const int truly_unsure = rfom_fg_unsure_frame(s_fgh.unsure, s_fgh.runs, s_fgh.open);
         const int paused = unsure_pause && ui_on && split && rfom_fg_upause_step(&upause, truly_unsure, 3, 15);
         if (!(unsure_pause && ui_on && split)) upause.bad_run = upause.off_left = 0;
+        paused_out = paused;
         const int ui_ok = !ui_on || (split && !paused);
         if (paused && s_fg_on) {
             static unsigned n = 0;
@@ -720,6 +741,7 @@ static void fg_present(ID3D12GraphicsCommandList* cl, UINT bi, u32 fi, D3D12_CPU
     } else if (s_f3_ready) f3_present(vp, split, vs);
     else if (s_fg_dbg && (++s_fg_presents % 600u) == 0)
         fprintf(stderr, "[DLSS-G] HUD split (debug view): HUD separated in %u of %u frames%c", s_fg_hud_ok, s_fg_hud_ok + s_fg_hud_fb, 10);
+    fgx_stats_present(split, valid, hold_use, paused_out);
     fg_hud_reset();
 }
 

@@ -70,7 +70,7 @@ typedef struct fgd_row {
                                   * Streamline actually presented per rendered frame (0 = unknown) */
     char type;                   /* 'D' DLSS-G, 'F' FSR 3, '-' none */
     char cam;                    /* S solved, H held (last solved), U unsolved, N no candidates, R no record, - none */
-    char hud;                    /* V separated, F not separated (whole frame generated), P paused, - no split */
+    char hud;                    /* V separated, F not separated (whole frame generated), H not separated (last HUD area held), P paused, - no split */
     char mk[4];                  /* set by fgd_frame: * spike, J pace jump, ! generated frames not presented */
 } fgd_row;
 
@@ -167,8 +167,9 @@ static const char fgd_legend[] =
     "#   W warming up (2 frames with inputs), X no FSR 3 context, H HUD split unavailable, Z resize\n"
     "# cam: S solved, H last solved held, U unsolved, N no candidates, R no record, - none | spread / motion: medoid spread and\n"
     "#   camera motion (ndc) | ex in nn cs amb un: scene draws matched exact / instance / nearest / camera-split / ambiguous /\n"
-    "#   unmatched (as [FG-MV]) | com: common camera term kept (approximate) | hud: V separated, F not separated, P paused,\n"
-    "#   - no split; runs / draws of the HUD split | mk: * spike (> 1.6x average), J pace jump, ! generated frames not presented\n"
+    "#   unmatched (as [FG-MV]) | com: common camera term kept (approximate) | hud: V separated, F not separated, H not separated\n"
+    "#   (last split's HUD area held), P paused, - no split; runs / draws of the HUD split\n"
+    "#   | mk: * spike (> 1.6x average), J pace jump, ! generated frames not presented\n"
     "# --- lines: events before the row they belong to; # second: per-second summary (also [fg-diag] in run.log)\n";
 static const char fgd_columns[] =
     "#   idx       t_ms      up  dt_ms cpu_ms  call sleep fg on n shown status reset    off      cam  spread  motion"

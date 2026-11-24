@@ -121,6 +121,23 @@ static inline int rfom_fg_upause_step(rfom_fg_upause_t* s, int unsure, int n_on,
     return 0;
 }
 
+/* HUD hold (rsx_dlssg_ghost.inc, RFOM_DLSS_FG_HUD_HOLD; the R2 port's R2_DLSS_FG_HUD_HOLD). Per present with the
+ * HUD split running (split): a frame whose HUD was separated (valid) records its HUD area and the time; a frame
+ * whose HUD was not separated keeps that area as UI while the last separated frame is less than max_ms old. Only
+ * separated frames refresh the time, so a long stretch without one (fade, overlay) lets the hold expire. Frames
+ * without the split leave the state alone; on = 0 (hold off or unavailable) forgets the area. Returns 1 when the
+ * held area is used for this present. */
+typedef struct { unsigned long long ms; int has; } rfom_fg_hudhold_t;
+
+static inline int rfom_fg_hudhold_step(rfom_fg_hudhold_t* h, int on, int split, int valid, unsigned long long now_ms,
+                                       unsigned max_ms)
+{
+    if (!on) { h->has = 0; return 0; }
+    if (!split) return 0;
+    if (valid) { h->has = 1; h->ms = now_ms; return 0; }
+    return h->has && now_ms - h->ms < (unsigned long long)max_ms;
+}
+
 /* Nearest-by-constants draw matching (rsx_fsr.inc, RSX_DLSS_MATCH_RATIO): feed each candidate's signature distance
  * d; keeps the best *bd and the nearest DISTINCT runner-up *bd2 (a candidate at the best's own distance is the same
  * draw drawn twice, not a rival). Returns 1 when d is the new best. Start with *bd = *bd2 = 3e38f. */

@@ -101,6 +101,7 @@ static u32 s_f3_dw, s_f3_dh, s_f3_mw, s_f3_mh, s_f3_hdr, s_f3_ctx_fail;
 static u64 s_f3_fid;                         /* frame ID of the last configured present */
 static int s_f3_streak, s_f3_on, s_f3_prev_split, s_f3_dbgflags;
 static u32 s_f3_presents, s_f3_gen_n;
+static int f3_is_on(void) { return s_f3_on; }   /* rsx_dlssg_ghost.inc stats */
 static ID3D12DescriptorHeap *s_f3_srv_heap, *s_f3_rtv_heap;   /* presenter thread only */
 static UINT s_f3_srv_inc, s_f3_rtv_inc, s_f3_slot;
 #define F3_RING 16u
