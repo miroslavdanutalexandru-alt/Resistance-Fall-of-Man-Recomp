@@ -44,4 +44,17 @@ call "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" >nul
 if errorlevel 1 (echo Could not set up the Visual Studio build tools. & exit /b 1)
 :paths
 set "PATH=%PORT_TC_PATH%C:\Program Files\LLVM\bin;C:\Program Files\CMake\bin;%LOCALAPPDATA%\Microsoft\WinGet\Links;%PATH%"
+rem vcvars64 picks the newest Windows SDK installed. The D3D12 renderer needs 10.0.20348 or newer: older d3d12.h
+rem declare some methods with the wrong C calling convention (and lack D3D12_SDK_VERSION, which is what is checked).
+set "PORT_D3D12_H="
+for %%H in (d3d12.h) do set "PORT_D3D12_H=%%~$INCLUDE:H"
+if not defined PORT_D3D12_H (echo The Windows SDK headers were not found [no d3d12.h on INCLUDE] - add a Windows SDK in the Visual Studio Installer or run Setup.bat again. & exit /b 1)
+findstr /m /c:"D3D12_SDK_VERSION" "%PORT_D3D12_H%" >nul 2>&1
+if errorlevel 1 goto sdk_old
+if defined WindowsSDKVersion echo Using Windows SDK %WindowsSDKVersion:\=%
 exit /b 0
+:sdk_old
+echo ERROR: the Windows SDK found is too old to build this port: %PORT_D3D12_H%
+echo Windows SDK 10.0.20348 or newer is needed; 10.0.26100 [Windows 11 SDK] is recommended. Add it in the Visual Studio
+echo Installer [Modify ^> Individual components ^> Windows 11 SDK] or run Setup.bat again, then build again.
+exit /b 1

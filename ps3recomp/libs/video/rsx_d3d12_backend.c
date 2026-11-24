@@ -61,6 +61,7 @@ char* rsx_getenv(const char* name);
 /* D3D12 headers */
 #include <d3d12.h>
 #include <d3d12sdklayers.h>   /* ID3D12Debug / ID3D12InfoQueue */
+#include "rsx_d3d12_compat.h" /* OPTIONS8/13/14, DEPTH_STENCIL_DESC2 on SDKs older than 10.0.26100 */
 #include <dxgi1_4.h>
 #include <dxgi1_6.h>
 #include <d3dcompiler.h>
@@ -4832,18 +4833,18 @@ static ID3D12Device2* s_dev2;   /* stream pipelines (ext_caps) */
 static void ext_caps(void)
 {
     ID3D12Device* d = s_d3d.device;
-    { D3D12_FEATURE_DATA_D3D12_OPTIONS8 o8; memset(&o8, 0, sizeof o8);
-      s_bc_unaligned_hw = SUCCEEDED(d->lpVtbl->CheckFeatureSupport(d, D3D12_FEATURE_D3D12_OPTIONS8, &o8, sizeof o8))
+    { rsx_d3d12_options8 o8; memset(&o8, 0, sizeof o8);
+      s_bc_unaligned_hw = SUCCEEDED(d->lpVtbl->CheckFeatureSupport(d, RSX_D3D12_FEATURE_OPTIONS8, &o8, sizeof o8))
                           && o8.UnalignedBlockTexturesSupported ? 1 : 0; }
     D3D12_FEATURE_DATA_D3D12_OPTIONS2 o2; memset(&o2, 0, sizeof o2);
-    D3D12_FEATURE_DATA_D3D12_OPTIONS14 o14; memset(&o14, 0, sizeof o14);
-    D3D12_FEATURE_DATA_D3D12_OPTIONS13 o13; memset(&o13, 0, sizeof o13);
+    rsx_d3d12_options14 o14; memset(&o14, 0, sizeof o14);
+    rsx_d3d12_options13 o13; memset(&o13, 0, sizeof o13);
     if (ext_env("RSX_ALPHA_FACTOR", 1)
-        && SUCCEEDED(d->lpVtbl->CheckFeatureSupport(d, D3D12_FEATURE_D3D12_OPTIONS13, &o13, sizeof o13)))
+        && SUCCEEDED(d->lpVtbl->CheckFeatureSupport(d, RSX_D3D12_FEATURE_OPTIONS13, &o13, sizeof o13)))
         s_alphafac_hw = o13.AlphaBlendFactorSupported ? 1 : 0;
     if (SUCCEEDED(d->lpVtbl->CheckFeatureSupport(d, D3D12_FEATURE_D3D12_OPTIONS2, &o2, sizeof o2)))
         s_dbounds_hw = o2.DepthBoundsTestSupported ? 1 : 0;
-    if (SUCCEEDED(d->lpVtbl->CheckFeatureSupport(d, D3D12_FEATURE_D3D12_OPTIONS14, &o14, sizeof o14)))
+    if (SUCCEEDED(d->lpVtbl->CheckFeatureSupport(d, RSX_D3D12_FEATURE_OPTIONS14, &o14, sizeof o14)))
         s_stencil2_hw = o14.IndependentFrontAndBackStencilRefMaskSupported ? 1 : 0;
     if (FAILED(d->lpVtbl->QueryInterface(d, &IID_ID3D12Device2, (void**)&s_dev2))) s_dev2 = NULL;
     if (!s_dev2) s_dbounds_hw = s_stencil2_hw = 0;
@@ -5775,8 +5776,8 @@ static u8 gl_blend_factor_d3d(u32 f, int is_alpha)
     case 0x0308: return D3D12_BLEND_SRC_ALPHA_SAT;
     case 0x8001: return D3D12_BLEND_BLEND_FACTOR;       /* CONSTANT_COLOR   */
     case 0x8002: return D3D12_BLEND_INV_BLEND_FACTOR;
-    case 0x8003: return s_alphafac_hw ? D3D12_BLEND_ALPHA_FACTOR     : D3D12_BLEND_BLEND_FACTOR;     /* CONSTANT_ALPHA (else Ac splat, ext_record) */
-    case 0x8004: return s_alphafac_hw ? D3D12_BLEND_INV_ALPHA_FACTOR : D3D12_BLEND_INV_BLEND_FACTOR;
+    case 0x8003: return s_alphafac_hw ? RSX_D3D12_BLEND_ALPHA_FACTOR     : D3D12_BLEND_BLEND_FACTOR;     /* CONSTANT_ALPHA (else Ac splat, ext_record) */
+    case 0x8004: return s_alphafac_hw ? RSX_D3D12_BLEND_INV_ALPHA_FACTOR : D3D12_BLEND_INV_BLEND_FACTOR;
     default:     return D3D12_BLEND_ONE;
     }
 }
@@ -6598,7 +6599,7 @@ typedef struct {
     PSS_SO(struct D3D12_RT_FORMAT_ARRAY) rtv;
     PSS_SO(DXGI_FORMAT) dsv;
     PSS_SO(DXGI_SAMPLE_DESC) sd;
-    PSS_SO(D3D12_DEPTH_STENCIL_DESC2) ds;   /* last: DESC1 is shorter */
+    PSS_SO(rsx_d3d12_depth_stencil_desc2) ds;   /* last: DESC1 is shorter */
 } PsoStream;
 static HRESULT pso_create_rec(const D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd, const PsoRec* r, ID3D12PipelineState** out)
 {
@@ -6623,8 +6624,8 @@ static HRESULT pso_create_rec(const D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd, cons
     const D3D12_DEPTH_STENCIL_DESC* d = &pd->DepthStencilState;
     size_t dsz;
     if (s2) {
-        D3D12_DEPTH_STENCIL_DESC2* o = &s.ds.v;
-        s.ds.t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL2;
+        rsx_d3d12_depth_stencil_desc2* o = &s.ds.v;
+        s.ds.t = RSX_D3D12_SUBOBJECT_DEPTH_STENCIL2;
         o->DepthEnable = d->DepthEnable; o->DepthWriteMask = d->DepthWriteMask; o->DepthFunc = d->DepthFunc;
         o->StencilEnable = d->StencilEnable;
         o->FrontFace.StencilFailOp = d->FrontFace.StencilFailOp; o->FrontFace.StencilDepthFailOp = d->FrontFace.StencilDepthFailOp;
@@ -6635,7 +6636,7 @@ static HRESULT pso_create_rec(const D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd, cons
         o->BackFace.StencilReadMask = (UINT8)(d->StencilReadMask ^ (UINT8)(r->stencil >> 48));
         o->BackFace.StencilWriteMask = (UINT8)(d->StencilWriteMask ^ (UINT8)(r->stencil >> 56));
         o->DepthBoundsTestEnable = db ? TRUE : FALSE;
-        dsz = sizeof(D3D12_DEPTH_STENCIL_DESC2);
+        dsz = sizeof(rsx_d3d12_depth_stencil_desc2);
     } else {
         D3D12_DEPTH_STENCIL_DESC1 o; memset(&o, 0, sizeof o);
         s.ds.t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1;

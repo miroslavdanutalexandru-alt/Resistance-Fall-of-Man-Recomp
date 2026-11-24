@@ -47,6 +47,7 @@ Check ((Test-BtFreshInstall 0) -and (Test-BtFreshInstall 3010) -and -not (Test-B
 Write-Host '-- portable layout'
 function New-FakeMsvc([string]$c, [string]$arch) {
     foreach ($f in 'msvc\crt\include\vcruntime.h', 'msvc\sdk\include\um\windows.h', 'msvc\sdk\include\ucrt\stdio.h', 'msvc\sdk\include\shared\x.h', "msvc\sdk\lib\um\$arch\kernel32.lib", "msvc\crt\lib\$arch\msvcrt.lib", "msvc\sdk\lib\ucrt\$arch\ucrt.lib") { Touch (Join-Path $c $f) }
+    Touch (Join-Path $c 'msvc\sdk\include\um\d3d12.h') "#define`tD3D12_SDK_VERSION`t( 616 )"
 }
 $c1 = Join-Path $Root 'c1 (x86)'; New-FakeMsvc $c1 'x86_64'; Touch "$c1\shims\link.exe"; Touch "$c1\llvm\bin\clang-cl.exe"; Touch "$c1\ninja\ninja.exe"
 $c2 = Join-Path $Root 'c2'; New-FakeMsvc $c2 'x64'; Touch "$c2\shims\link.exe"; Touch "$c2\msvc\sdk\include\cppwinrt\w.h"
@@ -75,6 +76,11 @@ Remove-Item "$c1\shims\link.exe"
 $out = @(& cmd /c "set PORT_TOOLCHAIN=&& set PORT_TOOLS_CACHE=$c1&& call `"$bat`" && echo RC=OK" 2>&1)
 Check (@($out -match 'incomplete').Count -and -not @($out -match '^RC=OK').Count) 'missing link shim stops the build with a message'
 Touch "$c1\shims\link.exe"
+# a Windows SDK older than 10.0.20348 (d3d12.h without D3D12_SDK_VERSION) stops the build with a message
+Touch "$c1\msvc\sdk\include\um\d3d12.h" 'typedef int D3D12_FEATURE;'
+$out = @(& cmd /c "set PORT_TOOLCHAIN=&& set PORT_TOOLS_CACHE=$c1&& call `"$bat`" && echo RC=OK" 2>&1)
+Check (@($out -match '10\.0\.20348 or newer').Count -and -not @($out -match '^RC=OK').Count) 'too old Windows SDK stops the build with a message'
+Touch "$c1\msvc\sdk\include\um\d3d12.h" "#define`tD3D12_SDK_VERSION`t( 616 )"
 
 $savedPath = $env:Path; $savedInc = $env:INCLUDE; $savedLib = $env:LIB
 try {
