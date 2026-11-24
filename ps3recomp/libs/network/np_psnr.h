@@ -53,6 +53,14 @@ void np_psnr_random_id(char out[17]);
  * called np_psnr_setup. */
 const char* np_psnr_identity(void);
 
+/* What the console identity (OpenPSID, MAC) and the NP account ID derive
+ * from: the name plus the salt saved with it (PS3_NP_ID_FILE), so two players
+ * who end up with the same name are still two consoles and two accounts. A
+ * name set outright (--username, PS3_NP_ONLINE_ID) has no salt: the same name
+ * is the same player, which is what lets two local instances be told apart
+ * by name. NULL whenever np_psnr_identity is. */
+const char* np_psnr_identity_key(void);
+
 /* The player's online ID, and the P2P port this instance binds and advertises. */
 const char* np_psnr_online_id(void);
 uint16_t    np_psnr_p2p_port(void);

@@ -28,6 +28,8 @@ void edat_add_klicensee(const uint8_t klic[16]) { (void)klic; }
 static const char* s_online_id = "BraveOtter";
 int np_psnr_enabled(void) { return 1; }
 const char* np_psnr_online_id(void) { return s_online_id; }
+static const char* s_key;   /* NULL: no salt, the account derives from the name */
+const char* np_psnr_identity_key(void) { return s_key ? s_key : s_online_id; }
 
 /* The callbacks the title would be handed on its next cellSysutilCheckCallback. */
 static struct { u32 opd; u64 args[8]; } s_queued[8];
@@ -193,6 +195,11 @@ int main(void)
     CHECK(call(GET_PARAM, SCE_NP_TICKET_PARAM_SUBJECT_ACCOUNT_ID, PARAM, 0, 0, 0, 0) == CELL_OK);
     CHECK(vm_read64(PARAM) != account);
     s_online_id = "BraveOtter";
+    /* Same name, another salt: another account. */
+    s_key = "BraveOtter#0123456789abcdef";
+    CHECK(call(GET_PARAM, SCE_NP_TICKET_PARAM_SUBJECT_ACCOUNT_ID, PARAM, 0, 0, 0, 0) == CELL_OK);
+    CHECK(vm_read64(PARAM) != account);
+    s_key = NULL;
 
     /* Every known parameter answers; the serial matches the ticket's header. */
     for (s32 id = SCE_NP_TICKET_PARAM_SERIAL_ID; id <= SCE_NP_TICKET_PARAM_SUBJECT_DOB; id++)
