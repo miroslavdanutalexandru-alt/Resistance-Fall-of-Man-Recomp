@@ -2693,6 +2693,8 @@ double rfom_pacing_correction_ms(void)
     const double c = pds_pace_correction_ms();
     return s_pace_pll ? c : 0.0;
 }
+/* project/rfom_reflex.cpp: the phase lock needs the port's limiter in charge (no Reflex frame limit then) */
+int rfom_pacing_pll(void) { return s_pace_pll; }
 
 static void pacing_apply(int movie, int* vs)
 {

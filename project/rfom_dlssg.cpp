@@ -40,6 +40,7 @@ std::wstring g_dir;
 const sl::ViewportHandle g_vp(0u);
 std::mutex g_tok_mu;
 unsigned long long g_render_id;   // frame id of the RENDERSUBMIT_START marker (render thread)
+sl::ReflexMode g_reflex_mode = sl::ReflexMode::eLowLatency;
 
 PFun_slInit* p_slInit;
 PFun_slShutdown* p_slShutdown;
@@ -251,8 +252,9 @@ __declspec(dllexport) int rfom_dlssg_init(ID3D12Device* dev, const wchar_t* dir,
         !GetFn(sl::kFeaturePCL, "slPCLSetMarker", p_slPCLSetMarker))
         return 0;
     sl::ReflexOptions ro{};
-    ro.mode = reflex >= 2 ? sl::ReflexMode::eLowLatencyWithBoost : sl::ReflexMode::eLowLatency;
-    ro.frameLimitUs = 0;                 // never a frame limiter: RFOM_FPS caps the rendered frames
+    g_reflex_mode = reflex >= 2 ? sl::ReflexMode::eLowLatencyWithBoost : sl::ReflexMode::eLowLatency;
+    ro.mode = g_reflex_mode;
+    ro.frameLimitUs = 0;                 // no limit until rfom_dlssg_set_limit (the game's frame cap, rfom_reflex.cpp)
     ro.useMarkersToOptimize = true;
     r = p_slReflexSetOptions(ro);
     if (r != sl::Result::eOk) { Log("slReflexSetOptions failed: %s", ResStr(r)); return 0; }
@@ -314,6 +316,20 @@ __declspec(dllexport) void rfom_dlssg_sleep(unsigned long long id)
     if (!g_init || !p_slReflexSleep) return;
     sl::FrameToken* t = Token(id);
     if (t) p_slReflexSleep(*t);
+}
+
+// Game thread (rfom_reflex.cpp, before the sleep): Reflex's frame limit in microseconds per rendered frame
+// (before frame generation), 0 = no limit. Returns 1 when Streamline accepted it.
+__declspec(dllexport) int rfom_dlssg_set_limit(unsigned us)
+{
+    if (!g_init || !p_slReflexSetOptions) return 0;
+    sl::ReflexOptions ro{};
+    ro.mode = g_reflex_mode;
+    ro.frameLimitUs = us;
+    ro.useMarkersToOptimize = true;
+    const sl::Result r = p_slReflexSetOptions(ro);
+    if (r != sl::Result::eOk) { Log("slReflexSetOptions (frame limit %u us) failed: %s", us, ResStr(r)); return 0; }
+    return 1;
 }
 
 // F3 overlay: average latency over the driver's last frames (same arithmetic as rfom_reflex.cpp).

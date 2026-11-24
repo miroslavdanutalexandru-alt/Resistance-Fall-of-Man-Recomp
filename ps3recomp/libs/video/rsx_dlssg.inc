@@ -39,7 +39,8 @@
  * the g_pc_fg_* hooks below while frame generation is usable. Frame generation turns itself off on any
  * frame without DLSS inputs (front-end menus, .bik movies, loading screens, DLSS failure), while the
  * window is in the background or minimised, and around swap-chain resizes; it turns back on after two
- * consecutive frames with inputs. The port's frame limiter (RFOM_FPS) caps the rendered frames. */
+ * consecutive frames with inputs. The port's frame limiter (RFOM_FPS) caps the rendered frames; Reflex gets
+ * the same cap as its frame limit (rfom_reflex.cpp, RFOM_REFLEX_LIMIT=0 = the port's limiter alone). */
 
 #include "port_fg_logic.h"
 #include "rfom_fg_cam.h"
@@ -48,6 +49,9 @@
 void (*volatile g_pc_fg_marker)(int type, unsigned long long id) = 0;
 void (*volatile g_pc_fg_sleep)(unsigned long long id) = 0;
 int (*volatile g_pc_fg_latency)(double* total_ms, double* render_ms, double* gpu_ms) = 0;
+/* Reflex frame limit through Streamline (rfom_reflex.cpp, game thread): us per rendered frame, 0 = none; null with an
+ * older rfom_dlssg.dll (the port's limiter alone then, as before) */
+int (*volatile g_pc_fg_limit)(unsigned us) = 0;
 /* RFOM_FG_DIAG (port_fgdiag.h): rfom_reflex.cpp times its sleep into g_pc_fg_sleep_us while g_pc_fg_diag is set */
 volatile int g_pc_fg_diag = 0;
 volatile long long g_pc_fg_sleep_us = 0;
@@ -78,6 +82,7 @@ static int  (*p_fg_set_options)(int, int, unsigned, unsigned, unsigned);
 static int  (*p_fg_state)(unsigned*, unsigned*, int*, unsigned*, unsigned long long*);
 static int  (*p_fg_null_tags)(ID3D12GraphicsCommandList*);   /* optional (older rfom_dlssg.dll: none) */
 static void (*p_fg_camera)(const float*, const float*, float, float, float);   /* optional (older rfom_dlssg.dll: none) */
+static int  (*p_fg_limit)(unsigned);   /* optional (older rfom_dlssg.dll: none) */
 static void (*p_fg_shutdown)(void);
 
 static int s_fg_req;                 /* frames to generate asked for (1 = 2x .. 3 = 4x), 0 = off */
@@ -154,7 +159,7 @@ static int fg_env_gen(void)
     return 0;
 }
 
-static void fg_clear_hooks(void) { g_pc_fg_marker = 0; g_pc_fg_sleep = 0; g_pc_fg_latency = 0; }
+static void fg_clear_hooks(void) { g_pc_fg_marker = 0; g_pc_fg_sleep = 0; g_pc_fg_latency = 0; g_pc_fg_limit = 0; }
 
 static void fg_fail(const char* why)
 {
@@ -186,6 +191,7 @@ static int fg_load_dlss(ID3D12Device* dev)
     FG_FN(p_fg_state, "rfom_dlssg_state"); FG_FN(p_fg_shutdown, "rfom_dlssg_shutdown");
     FG_FN(p_fg_null_tags, "rfom_dlssg_null_tags");
     FG_FN(p_fg_camera, "rfom_dlssg_camera");
+    FG_FN(p_fg_limit, "rfom_dlssg_set_limit");
 #undef FG_FN
     if (!p_fg_init || !p_fg_upgrade || !p_fg_create_queue || !p_fg_marker || !p_fg_sleep || !p_fg_latency || !p_fg_tag ||
         !p_fg_present_tags || !p_fg_set_options || !p_fg_state || !p_fg_shutdown) {
@@ -277,7 +283,7 @@ static int fg_create_queue(const D3D12_COMMAND_QUEUE_DESC* qd)
 /* Reflex through Streamline (DLSS-G requires it): set the hooks rfom_reflex.cpp routes through. */
 static int fg_reflex_init(void)
 {
-    g_pc_fg_marker = p_fg_marker; g_pc_fg_sleep = p_fg_sleep; g_pc_fg_latency = p_fg_latency;
+    g_pc_fg_marker = p_fg_marker; g_pc_fg_sleep = p_fg_sleep; g_pc_fg_latency = p_fg_latency; g_pc_fg_limit = p_fg_limit;
     int (*ri)(void*) = g_pc_reflex_init;
     if (!ri || !ri((void*)s_d3d.device)) { fg_fail("NVIDIA Reflex could not be routed through Streamline"); return 0; }
     g_pc_reflex_active = 2;

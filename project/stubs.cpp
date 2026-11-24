@@ -396,7 +396,7 @@ static void rfom_fps_init(void)
             if (m < 30) m = 30;
             fprintf(stderr, "[fps] RFOM_FPS=vrr: %d Hz monitor -> %d fps cap\n", hz, m);
         }
-        else { fm = atof(e); if (!(fm > 0.0)) fm = 240.0; if (fm < 30.0) fm = 30.0; if (fm > 1000.0) fm = 1000.0; m = (int)(fm + 0.5); }
+        else { fm = strtod(e, nullptr); if (!(fm > 0.0)) fm = 240.0; if (fm < 30.0) fm = 30.0; if (fm > 1000.0) fm = 1000.0; m = (int)(fm + 0.5); }
     }
     if (m > 0 && m < 30) m = 30;
     if (m > 1000) m = 1000;
@@ -431,6 +431,14 @@ extern "C" double rfom_fps_target(void)
 {
     rfom_fps_init();
     return s_rf_mode < 0 ? -1.0 : s_rf_fps;
+}
+/* rfom_reflex.cpp: the frame cap in effect now (fps, -1 = RFOM_FPS=orig); *pacing = set by fixed-refresh pacing */
+extern "C" double rfom_fps_limit_now(int* pacing)
+{
+    rfom_fps_init();
+    const double p = s_rf_pace;
+    if (pacing) *pacing = s_rf_mode >= 0 && p > 0.0;
+    return s_rf_mode < 0 ? -1.0 : p > 0.0 ? p : s_rf_fps;
 }
 extern "C" void rfom_fps_pacing_set(double fps)
 {
@@ -487,11 +495,13 @@ extern "C" void rfpf_frame_tick(void);   /* rfom_pcfeat.cpp: F3 overlay frame ti
 extern "C" void rfx_frame_tick(void);    /* rfom_pcextra.cpp: benchmark frame times */
 extern "C" void rfom_reflex_sim_end(void);     /* rfom_reflex.cpp: NVIDIA Reflex markers + sleep */
 extern "C" void rfom_reflex_sim_start(void);
+extern "C" unsigned rfom_reflex_limit_us(void);   /* rfom_reflex.cpp: Reflex's frame limit (us), 0 = none */
 static int rfom_frame_wait_impl(uint64_t target, uint32_t last_ea);
 #include "port_hitchcatch.h"   /* PORT_HITCHCATCH=<ms>: stacks of the key threads on a hitch */
 /* NVIDIA Reflex (RFOM_REFLEX): SIMULATION_END on entry; after the limiter's
- * wait, NvAPI_D3D_Sleep and SIMULATION_START of the next frame. Reflex never
- * paces the game by itself -- its sleep follows this limiter. */
+ * wait, NvAPI_D3D_Sleep and SIMULATION_START of the next frame. Without frame
+ * generation Reflex never paces the game by itself -- its sleep follows this
+ * limiter; with it, Reflex's frame limit is the cap (RFOM_REFLEX_LIMIT, rfom_reflex.cpp). */
 extern "C" int rfom_frame_wait(uint64_t target, uint32_t last_ea)
 {
     rfom_reflex_sim_end();
@@ -544,7 +554,13 @@ static int rfom_frame_wait_impl(uint64_t target, uint32_t last_ea)
     rfx_frame_tick();
     rfom_fps_init();
     if (s_rf_mode < 0) return 0;
-    if (s_rf_pace > 0.0) {   /* fixed-refresh pacing's phase lock (rsx_d3d12_backend.c): presents mid-refresh */
+    /* Reflex paces the frame cap itself (DLSS Frame Generation, RFOM_REFLEX_LIMIT): a wait for the cap
+     * (not a longer one: scripted 30 fps, menus) ends 5% early so the Reflex sleep right after it sets the
+     * pace instead of the two limiters fighting. Without the phase lock (the limit is off with it). */
+    const unsigned rlu = rfom_reflex_limit_us();
+    const double rlt = (double)rlu * 79.8;
+    if (rlu && (double)target < rlt * 1.02) { if ((double)target > rlt * 0.95) target = (uint64_t)(rlt * 0.95); }
+    else if (s_rf_pace > 0.0) {   /* fixed-refresh pacing's phase lock (rsx_d3d12_backend.c): presents mid-refresh */
         double c = rfom_pacing_correction_ms() * 79800.0;
         const double lim = (double)target * 0.25;
         if (c > lim) c = lim; else if (c < -lim) c = -lim;
