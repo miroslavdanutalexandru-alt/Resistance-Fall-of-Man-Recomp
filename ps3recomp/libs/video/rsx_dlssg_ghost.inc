@@ -208,8 +208,8 @@ static ID3D12RootSignature* fgx_rs(const D3D12_ROOT_SIGNATURE_DESC* rd)
 /* compute side: root signature (28 constants + a table of 3 SRVs and 4 UAVs), the three pipelines, the ring */
 static int fgx_init(void)
 {
-    if (s_fgx.zero) return 1;
-    if (s_fgx.bad) return 0;
+    if (s_fgx.bad) return 0;   /* any failure is final (partial objects are kept, never used) */
+    if (s_fgx.heap) return 1;  /* created last: everything is ready */
     s_fgx.bad = 1;
     ID3D12Device* d = s_d3d.device;
     D3D12_DESCRIPTOR_RANGE rg[2]; memset(rg, 0, sizeof rg);
@@ -236,7 +236,9 @@ static int fgx_init(void)
     }
     D3D12_DESCRIPTOR_HEAP_DESC hd = {0}; hd.NumDescriptors = 8u * FGX_RING; hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-    if (FAILED(d->lpVtbl->CreateDescriptorHeap(d, &hd, &IID_ID3D12DescriptorHeap, (void**)&s_fgx.heap))) { s_fgx.heap = NULL; return 0; }
+    if (FAILED(d->lpVtbl->CreateDescriptorHeap(d, &hd, &IID_ID3D12DescriptorHeap, (void**)&s_fgx.heap))) {
+        s_fgx.heap = NULL; fg_log("ghosting fixes unavailable (descriptor heap)"); return 0;
+    }
     s_fgx.inc = d->lpVtbl->GetDescriptorHandleIncrementSize(d, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     s_fgx.bad = 0;
     return 1;
@@ -375,6 +377,7 @@ static D3D12_GPU_DESCRIPTOR_HANDLE fgx_cset(ID3D12Resource* t0, DXGI_FORMAT f0, 
 static void fgx_draw(ID3D12GraphicsCommandList* cl, ID3D12PipelineState* pso, ID3D12Resource* t0, DXGI_FORMAT f0,
                      ID3D12Resource* t1, DXGI_FORMAT f1, const float* c8)
 {
+    if (!pso || !s_fgx.heap || !s_fgx.grs) return;
     D3D12_CPU_DESCRIPTOR_HANDLE c; D3D12_GPU_DESCRIPTOR_HANDLE g;
     fgx_set(&c, &g);
     fgx_srv(c, 0, t0, f0); fgx_srv(c, 1, t1, f1);
@@ -594,7 +597,7 @@ static void fgx_tag_present(ID3D12GraphicsCommandList* cl, int hold_use)
     s_fgx.pend = 0;
     if (!s_fgx.mv || !s_fgx.z) return;
     const D3D12_RESOURCE_STATES rd = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-    if (hold_use && s_fgx.mask && s_fgx.zero) {
+    if (hold_use && s_fgx.mask && s_fgx.zero && s_fgx.heap) {
         fg_tr(cl, s_fgx.mask, &s_fgx.mask_st, rd);
         fg_tr(cl, s_fgx.mv, &s_fgx.mv_st, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         u32 k[28]; memset(k, 0, sizeof k);
