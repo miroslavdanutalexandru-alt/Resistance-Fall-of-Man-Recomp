@@ -127,6 +127,7 @@ More input options (launcher → Controls page, written to `settings.bat`; log l
 | Stick anti-deadzone | **Off**, 10, 20, 30% | `PAD_ANTI_DEADZONE=0..50` | The smallest movement outside the deadzone already starts at this much deflection, skipping the game's own dead zone. |
 | Trigger deadzone | **Off**, 10, 20, 30% | `PAD_TRIGGER_DEADZONE=0..50` | L2 / R2 only count once pulled this far. |
 | Turn boost | **Off**, 90, 180, 270 deg/s | `PAD_TURN_BOOST=0..720` | Look acceleration: the right stick held at the edge ramps up extra turn speed (not while zoomed). |
+| (no launcher option) | **On**, Off, Left stick only | `PORT_KBM_WHEEL=0\|left` | Weapon wheel on keyboard & mouse: while the wheel key (E) is held, moving the mouse toward a slot (or WASD, diagonals full length) picks it, and the choice stays until you let go; the view holds still meanwhile. The direction goes to the left stick and, with direct mouse look, the right stick. `0` = old behaviour; `left` = left stick only. |
 | Crouch | **As the game**, Toggle, Hold | `PAD_CROUCH_MODE=toggle\|hold` | Experimental. Toggle / hold for the crouch button (L2, C). L2 is sprint in some layouts, so it follows the same mode. |
 | Vibration | **100%**, 75, 50, 25%, Off | `PAD_RUMBLE=0..100\|off` | Rumble strength of every controller (both motors scaled). |
 | Confirm button | **Cross**, Circle | `PS3_ENTER_BUTTON=circle` | The console's "enter button" setting (Japanese layout: Circle confirms). Keyboard Enter / Esc keep meaning confirm / back in menus. Experimental: the game may keep its own layout. |

@@ -114,6 +114,7 @@ static u32           s_port_setting[CELL_PAD_MAX_PORT_NUM];
 static PadHostState  s_host_state[PAD_MAX_HOST_PORTS];
 /* Per-port "a report has arrived since your last read" flag; see cellPadGetData. */
 static int s_data_fresh[PAD_MAX_HOST_PORTS];
+static volatile unsigned s_pad0_deliv;   /* reports port 0 handed to the game (kbm_wheel_step) */
 
 #if PAD_BACKEND_SDL2
 static SDL_GameController* s_sdl_controllers[PAD_MAX_HOST_PORTS];
@@ -677,6 +678,29 @@ static u32 kbm_unswap(u32 hsb)
 static volatile int s_kbm_reload = 0;
 void cellpad_reload_controls(void) { s_kbm_reload = 1; }
 void (*volatile g_port_xi_hook)(int port, void* gamepad) = 0;
+/* PORT_KBM_WHEEL: set while the weapon wheel takes the mouse; the direct mouse
+ * look (project/stubs.cpp) drops its counts then, so the view holds still. */
+volatile int g_kbm_wheel_look_off = 0;
+static kbm_wheel s_kbm_wheel;   /* PORT_KBM_WHEEL state (kbm_stick.h) */
+static int s_menu_last = 0;     /* menu mode at the last keyboard poll */
+/* The weapon wheel's button: Resistance: Fall of Man opens it by holding R2 ("Weapon wheel"). */
+#define KBM_WHEEL_BTN CELL_PAD_CTRL_R2
+/* PORT_KBM_WHEEL: 0 = off (old behaviour); 1 (default) = the wheel direction goes
+ * to the left stick and, with direct mouse look, to the right stick too (the look
+ * code ignores its stick then; which one the wheel reads was not checked in this
+ * game); left = the left stick only. */
+static int kbm_wheel_mode(void)
+{
+    static int m = -1;
+    if (m < 0) {
+        const char* e = getenv("PORT_KBM_WHEEL");
+        m = !e || !*e ? 1 : !_stricmp(e, "left") ? 2 : atoi(e) ? 1 : 0;
+        printf("[controls] weapon wheel on keyboard & mouse: %s (PORT_KBM_WHEEL)\n",
+               m == 0 ? "off" : m == 2 ? "mouse / keys select, left stick only" : "mouse / keys select");
+    }
+    return m;
+}
+
 static void pad_poll_keyboard(void)
 {
     static int off = -1;
@@ -696,6 +720,7 @@ static void pad_poll_keyboard(void)
         hs->analog_rx = hs->analog_ry = 128;
         hs->trigger_l2 = hs->trigger_r2 = 0;
         hs->connected = 1;
+        g_kbm_wheel_look_off = 0;
         ClipCursor(NULL);
         InterlockedExchange(&g_kbm_mouse_dx, 0); InterlockedExchange(&g_kbm_mouse_dy, 0);
         InterlockedExchange(&g_kbm_wheel, 0);
@@ -746,6 +771,7 @@ static void pad_poll_keyboard(void)
 
     u16 btns = 0; int lx = 0, ly = 0, krx = 0, kry = 0, interact = 0;
     u16 wup_btn = 0;   /* v190e: buttons the wheel-up notch pressed this poll */
+    int wheel_key = 0; /* PORT_KBM_WHEEL: a key bound to the weapon wheel button is held (not a mouse-wheel notch) */
     for (int i = 0; i < s_kbm_n; i++) {
         int vk = s_kbm[i].vk, down;
         if (vk == KBM_WHEEL_UP) down = wheel_up_frames > 0;
@@ -754,7 +780,8 @@ static void pad_poll_keyboard(void)
         else down = (GetAsyncKeyState(vk) & 0x8000) != 0;
         if (!down) continue;
         switch (s_kbm[i].act) {
-        case KA_BTN: btns |= s_kbm[i].btn; if (vk == KBM_WHEEL_UP) wup_btn |= s_kbm[i].btn; break;
+        case KA_BTN: btns |= s_kbm[i].btn; if (vk == KBM_WHEEL_UP) wup_btn |= s_kbm[i].btn;
+                     if ((s_kbm[i].btn & KBM_WHEEL_BTN) && vk != KBM_WHEEL_UP && vk != KBM_WHEEL_DOWN) wheel_key = 1; break;
         case KA_LS_UP: ly -= 1; break;    case KA_LS_DOWN: ly += 1; break;
         case KA_LS_LEFT: lx -= 1; break;  case KA_LS_RIGHT: lx += 1; break;
         case KA_RS_UP: kry -= 1; break;   case KA_RS_DOWN: kry += 1; break;
@@ -764,6 +791,12 @@ static void pad_poll_keyboard(void)
     }
     if (wheel_up_frames > 0) wheel_up_frames--;
     if (wheel_dn_frames > 0) wheel_dn_frames--;
+    /* the weapon wheel button went down in a menu (menu mode before the press) */
+    const int wheel_menu = s_kbm_wheel.down ? s_kbm_wheel.menu : s_menu_last;
+    static int fe2_game = -1;   /* not the front-end executable */
+    if (fe2_game < 0) { char mp[MAX_PATH] = ""; GetModuleFileNameA(NULL, mp, MAX_PATH);
+                        const char* b = strrchr(mp, '\\'); b = b ? b + 1 : mp;
+                        fe2_game = _stricmp(b, "ResistanceFoM.exe") ? 1 : 0; }
     /* v190e: sniper scope (the game's view FOV under 45 degrees: the Fareye is
      * ~27, ADS zooms ~65). In the scope the game zooms in with L2 -- the crouch
      * button -- so Shift zoomed in and also stood the player up, while the wheel
@@ -865,6 +898,7 @@ static void pad_poll_keyboard(void)
       static ULONGLONG s_r2_ms = 0;
       if (btns & CELL_PAD_CTRL_R2) s_r2_ms = now;
       const int menu = fe2 && g_rfom_play_ms && now - g_rfom_play_ms > 200 && (!s_r2_ms || now - s_r2_ms > 300);
+      s_menu_last = menu;
       { static int was = -1;
         if (menu != was) { was = menu; static int n = 0;
           if (n++ < 200) { FILE* f = fopen("logs\\menumode.txt", n == 1 ? "w" : "a");
@@ -923,6 +957,21 @@ static void pad_poll_keyboard(void)
         static kbm_stick_carry carry_x, carry_y;   /* sub-step carry per axis (kbm_stick.h) */
         hs->analog_rx = kbm_mouse_axis(fx, &carry_x);
         hs->analog_ry = kbm_mouse_axis(fy, &carry_y);
+    }
+    {   /* PORT_KBM_WHEEL (kbm_stick.h kbm_wheel_step): the weapon wheel's direction */
+        const int wm = fe2_game ? kbm_wheel_mode() : 0;
+        unsigned char wx = 128, wy = 128;
+        const int wkx = lx < 0 ? -1 : lx > 0 ? 1 : 0, wky = ly < 0 ? -1 : ly > 0 ? 1 : 0;
+        const int on = wm && kbm_wheel_step(&s_kbm_wheel, wheel_key, wheel_menu, (double)mdx, (double)mdy, wkx, wky,
+                                            (unsigned long long)now, s_pad0_deliv, 100.0, 150, &wx, &wy);
+        if (!wm) s_kbm_wheel.down = s_kbm_wheel.live = 0;
+        if (on) {
+            hs->analog_lx = wx; hs->analog_ly = wy;
+            if (wm == 1 && g_ml_mode && !krx && !kry) { hs->analog_rx = wx; hs->analog_ry = wy; }
+            static int said = 0;
+            if (!said) { said = 1; printf("[controls] weapon wheel: mouse / movement keys pick the slot (PORT_KBM_WHEEL=0 turns this off)\n"); }
+        }
+        g_kbm_wheel_look_off = on;
     }
     hs->analog_rx = kbm_drive_rx(drive_steer, hs->analog_rx);
     g_ml_fed_rx = (int)hs->analog_rx - 128; g_ml_fed_ry = (int)hs->analog_ry - 128;
@@ -2188,6 +2237,7 @@ emit:
             if (!s_data_fresh[port_no]) data->len = 0;   /* nothing new: end the drain */
             else                        s_data_fresh[port_no] = 0;
         }
+        if (port_no == 0 && data->len) s_pad0_deliv++;   /* PORT_KBM_WHEEL: a report the game took */
     }
     {
         unsigned int ea = (unsigned int)(uintptr_t)data_guest;
