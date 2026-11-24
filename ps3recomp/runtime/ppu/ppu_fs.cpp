@@ -408,7 +408,7 @@ static void cellFsOpen(ppu_context* ctx)
           { const char* want = FS_DBG_ENV("FS_STACK");
             if (want && *want && strstr(gpath, want)) ydkj_host_bt("fs-open");
           } }
-      else fprintf(stderr, "[fs] open '%s' -> fd %d\n", gpath, fd); }
+      else if (FS_DBG_ENV("PS3_FSLOG")) fprintf(stderr, "[fs] open '%s' -> fd %d\n", gpath, fd); }
     if (FS_DBG_ENV("PS3_FSLOG_BT") && strstr(gpath, ".usm")) {
         /* Resolve to GUEST functions (raw host RVAs are useless here): this tells us
          * which criMv/criFs function opened the movie, so the reader-attach path
@@ -584,20 +584,21 @@ static void cellFsRead(ppu_context* ctx)
     /* Per-fd totals, not just the first 50 lines. The flat cap made "this file is
      * opened and never read" unfalsifiable: reads on a later-opened fd fall off
      * the end of the log and look identical to reads that never happen.
-     * FS_READ_ALL=1 logs every read; otherwise a per-fd first-read line plus a
-     * periodic summary is enough to tell the two apart. */
+     * FS_READ_ALL=1 logs every read; PS3_FSLOG=1 adds a per-fd first-read line
+     * plus a periodic summary, enough to tell the two apart (off by default). */
     { static uint64_t tot=0; static int _n=0;
       static uint64_t per_fd[64]; static uint32_t cnt_fd[64];
       tot+=n;
       if (fd>=0 && fd<64) { per_fd[fd]+=n; cnt_fd[fd]++; }
-      int first_for_fd = (fd>=0 && fd<64 && cnt_fd[fd]==1);
+      const int fs_sum = (FS_DBG_ENV("PS3_FSLOG") || FS_DBG_ENV("FS_READ_ALL")) ? 1 : 0;
+      int first_for_fd = fs_sum && (fd>=0 && fd<64 && cnt_fd[fd]==1);
       if(PS3_LOG_FIRST(_n, 50) || first_for_fd || FS_DBG_ENV("FS_READ_ALL"))
         fprintf(stderr,"[fs] read fd=%d nbytes=%llu -> %zu (magic=%02X%02X%02X%02X, total=%llu)%s\n",
                 fd,(unsigned long long)nbytes,n,vm_base[buf],vm_base[buf+1],vm_base[buf+2],vm_base[buf+3],
                 (unsigned long long)tot, first_for_fd?"  <= FIRST READ ON THIS FD":"");
       if (FS_DBG_ENV("FS_READ_PATH") && ref->path[0])
           fprintf(stderr, "        from %s\n", ref->path);
-      if ((_n % 2000)==0) { fprintf(stderr,"[fs] read summary after %d reads:",_n);
+      if (fs_sum && (_n % 2000)==0) { fprintf(stderr,"[fs] read summary after %d reads:",_n);
           for (int i=0;i<64;i++) if (cnt_fd[i]) fprintf(stderr," fd%d=%ux/%lluB",i,cnt_fd[i],(unsigned long long)per_fd[i]);
           fprintf(stderr,"\n"); } }
     if (FS_DBG_ENV("PS3_FSLOG_TOC") && nbytes >= 50000) {  /* data.toc read -> who parses it? */

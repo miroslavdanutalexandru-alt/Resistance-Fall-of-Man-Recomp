@@ -2421,7 +2421,7 @@ static int cam_solve_core(u32 fr, u32 n, double (*Ms)[16], const u32* pg, double
         for (u32 i = 0; i < n && g >= 0; i++)
             if (cnt[i] == gc && vpcpu_mdist(Ms[g], Ms[i]) > tol) uniq = 0;
         static u32 nlog;
-        if (g >= 0 && (nlog < 16 || nlog % 600 == 0)) {
+        if (g >= 0 && (nlog < 16 || (nlog % 600 == 0 && port_stats_log()))) {
             char line[1024]; int o = snprintf(line, sizeof line, "[DLSS] camera candidates disagree (frame %u, %u candidates, largest group %d%s):",
                                               fr, n, gc, uniq ? "" : ", tied");
             for (u32 i = 0; i < n && o > 0 && o < (int)sizeof line - 48; i++) {
@@ -2765,7 +2765,7 @@ static void fsr_dispatch(void)
           QueryPerformanceCounter(&q1); QueryPerformanceFrequency(&qf);
           const double tpms = (q0.QuadPart && t1 > t0 && q1.QuadPart > q0.QuadPart) ? (double)(t1 - t0) / ((double)(q1.QuadPart - q0.QuadPart) * 1000.0 / (double)qf.QuadPart) : 0.0;   /* TSC ticks per ms (0 on the first report) */
           q0 = q1; t0 = t1;
-          fprintf(stderr, "[FSR] stats/600: history resets %u (frame gaps %u), scene draws %u, matched to last frame %.1f%%, over slot limit %u, lead waits %u, exact %.1f%%, camera fallback %.1f%%,                     ambiguous %.1f%% (view-attached kept %u, common camera term kept %u), depth-range draws %u, record %.3f ms/frame%c",
+          if (port_stats_log()) fprintf(stderr, "[FSR] stats/600: history resets %u (frame gaps %u), scene draws %u, matched to last frame %.1f%%, over slot limit %u, lead waits %u, exact %.1f%%, camera fallback %.1f%%,                     ambiguous %.1f%% (view-attached kept %u, common camera term kept %u), depth-range draws %u, record %.3f ms/frame%c",
                   nr, gap, rec, rec ? 100.0 * mt / rec : 0.0, ov, s_fsr_st_wait, rec ? 100.0 * s_fsr_st_exact / rec : 0.0,
                                       rec ? 100.0 * s_fsr_st_cam / rec : 0.0, rec ? 100.0 * s_fsr_st_amb / rec : 0.0, s_fsr_st_vm, s_fsr_st_common, s_fsr_st_zr, tpms > 0.0 ? (double)s_fsr_st_tsc / tpms / 600.0 : 0.0, 10);
           if (s_gt_frames) { fprintf(stderr, "[FSR] GPU/frame (%u frames): motion pass %.3f ms, upscaler %.3f ms%c", s_gt_frames, s_gt_ms[0] / s_gt_frames, s_gt_ms[1] / s_gt_frames, 10);
@@ -2773,7 +2773,7 @@ static void fsr_dispatch(void)
           /* one line for the next play session: where the camera motion came from */
           { const u32 cf = s_cf_st[0] + s_cf_st[1] + s_cf_st[2] + s_cf_st[3];
             const u32 md = s_cf_mt[0] + s_cf_mt[1] + s_cf_mt[2] + s_cf_mt[3] + s_cf_mt[4];
-            fprintf(stderr, "[DLSS] camera/600: %s | exact %u (plurality %u, loose vote %u, medoid %u), fallback %u (candidates disagree; last camera held %u; streaks 1-3/4-10/11-30/31+ %u/%u/%u/%u), none %u (no candidates), no record %u, cuts->reset %u"
+            if (port_stats_log()) fprintf(stderr, "[DLSS] camera/600: %s | exact %u (plurality %u, loose vote %u, medoid %u), fallback %u (candidates disagree; last camera held %u; streaks 1-3/4-10/11-30/31+ %u/%u/%u/%u), none %u (no candidates), no record %u, cuts->reset %u"
                             " | candidates %.1f/frame (exact-instance draws %.1f, evaluated %.1f, refused %.1f, left out %.1f; programs left out %u) | fill depth scene %u / none %u"
                             " | draws exact %.1f%% instance %.1f%% nearest %.1f%% camera-split %.1f%% unmatched %.1f%%"
                             " | render %ux%u of %ux%u (%.4f) | SSAO: %s%c",
@@ -2795,7 +2795,7 @@ static void fsr_dispatch(void)
         cl->lpVtbl->CopyResource(cl, rt->res, s_fsr_out);
         off_rt_transition(slot, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     }
-    { static int lg = 0; if (lg < 3 || (s_fsr_frame_r % 600u) == 0) { lg++; fprintf(stderr, "[FSR] frame %u upscaled (jitter %.3f,%.3f)%c", s_fsr_frame_r, jx, jy, 10); } }
+    { static int lg = 0; if (lg < 3 || ((s_fsr_frame_r % 600u) == 0 && port_stats_log())) { lg++; fprintf(stderr, "[FSR] frame %u upscaled (jitter %.3f,%.3f)%c", s_fsr_frame_r, jx, jy, 10); } }
 }
 
 /* Render thread, per non-clear draw: a jittered scene draw starts / continues

@@ -1831,6 +1831,14 @@ static WklPm* spurs_resolve_pm(u32 wid)
     return r->fn ? r : NULL;
 }
 
+/* SPURS_WSTATS=1: the "[spurs-poll] 5 s", "[spurs] 5 s" and "[wstats] 5 s" lines
+ * and the per-run lane timing behind them. Off by default. */
+static int spurs_stats_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("SPURS_WSTATS"); on = (e && atoi(e)) ? 1 : 0; }
+    return on;
+}
 /* Resistance port: the kernel side of cellSpursModulePollStatus. The HLE poll
  * always answered "keep running", so a policy module that idles inside its own
  * loop (the WWS job manager waiting on an empty list) held its SPU forever.
@@ -1886,6 +1894,7 @@ int spurs_pm_should_yield(u32 ea, u32 cur_wid, u32 sn, int busy)
             yield = 1;
         }
     }
+    if (spurs_stats_on()) {
     if (yield) InterlockedIncrement(busy ? &n_yield_busy : &n_yield_idle);
     else if (waiting) InterlockedIncrement(&n_keep);
     { const LONGLONG now = (LONGLONG)GetTickCount64(), t0 = s_t0;
@@ -1894,6 +1903,7 @@ int spurs_pm_should_yield(u32 ea, u32 cur_wid, u32 sn, int busy)
           fprintf(stderr, "[spurs-poll] 5 s: %ld polls kept the SPU over lower-priority work, %ld busy yields to higher priority, %ld idle yields%c",
                   (long)InterlockedExchange(&n_keep, 0), (long)InterlockedExchange(&n_yield_busy, 0),
                   (long)InterlockedExchange(&n_yield_idle, 0), 10); }
+    }
     return yield;
 }
 
@@ -2225,7 +2235,7 @@ unsigned long spurs_lane_host_tid(unsigned lane)
  * never runs under that lock, and only a genuine return releases contention. */
 /* v182 diag: per-workload lane time over 5 s (busy ms, runs, jobs, which SPUs
  * it ran as, most lanes on it at once) -- which job lists are the serial path
- * the main thread waits on. SPURS_WSTATS=0 off. */
+ * the main thread waits on. SPURS_WSTATS=1 on (off by default). */
 static volatile LONGLONG s_ws_us[16]; static volatile LONG s_ws_runs[16], s_ws_jobs[16], s_ws_spus[16], s_ws_maxc[16];
 static void spurs_wstats_report(struct SpursInst* si)
 {
@@ -2262,13 +2272,14 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
         const uint64_t ft_pm0 = PS3_FT_ON() ? ps3_ft_now() : 0;
         { extern SPU_THREAD_LOCAL volatile unsigned long long* g_spu_poll_mark;
           slot->poll_mark = 0; g_spu_poll_mark = &slot->poll_mark; }
-        LARGE_INTEGER ws0; QueryPerformanceCounter(&ws0);
-        { const LONG a = (LONG)si->active[slot->wid & 15];   /* lanes on this workload right now */
+        const int ws_on = spurs_stats_on();
+        LARGE_INTEGER ws0; ws0.QuadPart = 0; if (ws_on) QueryPerformanceCounter(&ws0);
+        if (ws_on) { const LONG a = (LONG)si->active[slot->wid & 15];   /* lanes on this workload right now */
           LONG o = s_ws_maxc[slot->wid & 15]; while (a > o && InterlockedCompareExchange(&s_ws_maxc[slot->wid & 15], a, o) != o) o = s_ws_maxc[slot->wid & 15]; }
         spu_run_policy_module(slot->fn, slot->image_id, slot->pm, slot->pm_size,
                               slot->data, slot->wid, slot->ea, slot->run_spu);
         slot->poll_mark = 0;
-        { static LARGE_INTEGER f; if (!f.QuadPart) QueryPerformanceFrequency(&f);
+        if (ws_on) { static LARGE_INTEGER f; if (!f.QuadPart) QueryPerformanceFrequency(&f);
           LARGE_INTEGER ws1; QueryPerformanceCounter(&ws1);
           const u32 w = slot->wid & 15;
           extern SPU_THREAD_LOCAL volatile unsigned g_spurs_pm_jobs;
@@ -2278,12 +2289,12 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
         if (ft_pm0) ps3_ft_span(16, 48u + (u32)(slot - si->slots), slot->wid, slot->run_spu, ft_pm0, ps3_ft_now());
         extern SPU_THREAD_LOCAL volatile unsigned g_spurs_pm_polls;
         unsigned polls = g_spurs_pm_polls;
-        /* Resistance port diagnostic (SPURS_SLOTLOG=0 disables): York freezes
+        /* Resistance port diagnostic (SPURS_SLOTLOG=1, off by default): York freezes
          * with a WWS job list whose per-SPU slot says "SPU n is on job k" while
          * nothing runs it. After every PM run, check the job-list headers the
          * game's frame code waits on (fixed addresses in this build of FoM) and
          * report a run that returned while its SPU's slot still names a job. */
-        { static int sl = -1; if (sl < 0) { const char* e = getenv("SPURS_SLOTLOG"); sl = e ? atoi(e) : 1; }
+        { static int sl = -1; if (sl < 0) { const char* e = getenv("SPURS_SLOTLOG"); sl = e ? atoi(e) : 0; }
           static volatile LONG nlog = 0;
           static const u32 heads[] = { 0x10325000u, 0x10328E00u };
           if (sl && slot->run_spu < 6)
@@ -2334,12 +2345,11 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
           else spurs_kick_kernel(si);
           { const LONGLONG now = (LONGLONG)GetTickCount64(), t0 = s_t0;
             if (!t0) s_t0 = now;
-            else if (now - t0 >= 5000 && InterlockedCompareExchange64(&s_t0, now, t0) == t0)
+            else if (now - t0 >= 5000 && spurs_stats_on() && InterlockedCompareExchange64(&s_t0, now, t0) == t0)
               { fprintf(stderr, "[spurs] 5 s: %ld policy-module runs, %ld started by their lane at once (%ld continued the same list), %ld spread runs%c",
                         (long)InterlockedExchange(&n_runs, 0), (long)InterlockedExchange(&n_self, 0),
                         (long)InterlockedExchange(&s_n_cont, 0), (long)InterlockedExchange(&s_n_spread, 0), 10);
-                static int wsn = -1; if (wsn < 0) { const char* e = getenv("SPURS_WSTATS"); wsn = e ? atoi(e) : 1; }
-                if (wsn) spurs_wstats_report(si); } } }
+                spurs_wstats_report(si); } } }
     }
     ReleaseSRWLockExclusive(&si->lock);
     return 0;
@@ -2673,7 +2683,7 @@ s32 cellSpursEventFlagSet(CellSpursEventFlag* eventFlag, u16 bits)
     if (!sync)
         return CELL_SPURS_TASK_ERROR_STAT;
 
-    { static unsigned _n=0; if (_n++ < 40 || (_n%1000)==0)   /* unsigned: periodic, wrapping is defined */
+    { static unsigned _n=0; if (_n++ < 40 || ((_n%1000)==0 && spurs_stats_on()))   /* unsigned: periodic, wrapping is defined */
         fprintf(stderr, "[cellSpurs] EventFlagSet#%u flagEA=0x%08X bits=0x%04X "
                 "events=0x%04X used=0x%04X pend=0x%04X mode=0x%04X\n",
                 _n, ea, (unsigned)bits,

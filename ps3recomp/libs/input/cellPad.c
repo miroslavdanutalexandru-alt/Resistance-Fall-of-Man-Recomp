@@ -903,7 +903,8 @@ static void pad_poll_keyboard(void)
       s_menu_last = fe2 && g_rfom_play_ms && now - g_rfom_play_ms > 200;
       { static int was = -1;
         if (menu != was) { was = menu; static int n = 0;
-          if (n++ < 200) { FILE* f = fopen("logs\\menumode.txt", n == 1 ? "w" : "a");
+          static int dg = -1; if (dg < 0) { const char* e = getenv("PORT_STATS_LOG"); dg = (e && atoi(e)) ? 1 : 0; }
+          if (dg && n++ < 200) { FILE* f = fopen("logs\\menumode.txt", n == 1 ? "w" : "a");
                            if (f) { fprintf(f, "t=%llu menu=%d space_start=%d pause_ui=%d\n", now, menu, (int)g_rfom_space_start, (int)g_rfom_pause_ui); fclose(f); } } } }
       static int s_esc_armed = 0;
       if (!menu) s_esc_armed = 0;

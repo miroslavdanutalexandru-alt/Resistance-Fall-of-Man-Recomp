@@ -158,6 +158,14 @@ static u64 shk_get(ID3DBlob* blob)
     ReleaseSRWLockShared(&s_shk_lock);
     return key;
 }
+/* PORT_STATS_LOG=1: the periodic statistics lines ("[present] 5 s", movie LFC,
+ * "[FSR] stats/600", "[DLSS] camera/600", ...). Off by default. */
+static int port_stats_log(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("PORT_STATS_LOG"); on = (e && atoi(e)) ? 1 : 0; }
+    return on;
+}
 static unsigned s_gpu_vendor;   /* tentative; set with s_gpu_device at device creation */
 /* RSX_VS_STRICT (default: on unless the adapter is NVIDIA; 1 = on, 0 = off):
  * vertex programs compile IEEE-strict with their position math `precise`
@@ -271,13 +279,14 @@ static HRESULT shc_compile_ex(const char* src, size_t len, const char* name, con
      * bytecode (shadercache\<key>.hlsl) and in logs\shmiss\ for this run. The
      * same intro recompiled ~15 programs on every launch, so some part of the
      * generated source differs between runs; two runs of these files show
-     * which. RSX_SHMISS_SAVE=0 off. */
+     * which. Default: only the shadercache\ copy; RSX_SHMISS_SAVE=1 adds the
+     * logs\shmiss\ copy and the "[shmiss]" lines, =0 neither. */
     { static int sv = -1;
-      if (sv < 0) { const char* e2 = getenv("RSX_SHMISS_SAVE"); sv = e2 ? atoi(e2) : 1;
-                    if (sv) CreateDirectoryA("logs\\shmiss", NULL); }
+      if (sv < 0) { const char* e2 = getenv("RSX_SHMISS_SAVE"); sv = e2 ? (atoi(e2) ? 2 : 0) : 1;
+                    if (sv == 2) CreateDirectoryA("logs\\shmiss", NULL); }
       if (sv && en && shk_h) {
           char fn[96];
-          for (int w = 0; w < 2; w++) {
+          for (int w = 0; w < sv; w++) {
               snprintf(fn, sizeof fn, w ? "logs\\shmiss\\%016llX_%s.hlsl" : "shadercache\\%016llX.hlsl",
                        (unsigned long long)shk_h, target);
               FILE* hf = fopen(fn, "wb");
@@ -285,7 +294,7 @@ static HRESULT shc_compile_ex(const char* src, size_t len, const char* name, con
           }
           static volatile LONG nmiss = 0;
           const LONG k = InterlockedIncrement(&nmiss);
-          if (k <= 200) fprintf(stderr, "[shmiss] %016llX %s %s %u bytes (%.0f ms)%c", (unsigned long long)shk_h,
+          if (sv == 2 && k <= 200) fprintf(stderr, "[shmiss] %016llX %s %s %u bytes (%.0f ms)%c", (unsigned long long)shk_h,
                                 name ? name : "?", target, (unsigned)len,
                                 (double)(q1.QuadPart - q0.QuadPart) * 1000.0 / (double)qf.QuadPart, 10);
       } }
@@ -2506,7 +2515,7 @@ static void movie_lfc_cancel(void)
     s_lfc_left = 0;
 }
 
-/* Every 5 s of a movie (and at its end, flush = 1): "[D3D12] movie LFC 5.0 s: ..." */
+/* Every 5 s of a movie (and at its end, flush = 1): "[D3D12] movie LFC 5.0 s: ..." (PORT_STATS_LOG=1) */
 static void movie_lfc_window(LONGLONG now, int flush)
 {
     unsigned taken = 0, skipped = 0, dec_us = 0, out_us = 0;
@@ -2518,7 +2527,7 @@ static void movie_lfc_window(LONGLONG now, int flush)
     if (!flush && (double)(now - s_lfcw_t0) < 5.0 * (double)s_lfc_qf) return;
     cellVdec_movie_stats(&taken, &skipped, &dec_us, &out_us);
     static unsigned nlog = 0;
-    if (s_lfcw_frames && nlog < 400) {
+    if (s_lfcw_frames && nlog < 400 && port_stats_log()) {
         nlog++;
         char unsched[160] = "";
         if (s_lfcw_unsched)
@@ -5096,14 +5105,14 @@ static int gf_begin(const rsx_state* st, u32 first, u32 count)
     s_gfp.ib_end = s_vp_ib_off;
     s_gfp.epoch = st->begin_epoch; s_gfp.fp = st->shader_program; s_gfp.brk = st->prim_break;
     s_gf_draws++;
-    if ((s_gf_draws % 50000u) == 0)
+    if ((s_gf_draws % 50000u) == 0 && port_stats_log())
         fprintf(stderr, "[GPUFETCH] %llu records on the GPU-fetch path, %llu fell back, %llu MB raw copied%c",
                 (unsigned long long)s_gf_draws, (unsigned long long)s_gf_fallback,
                 (unsigned long long)(s_gf_bytes >> 20), 10);
-    if ((s_gf_draws % 50000u) == 0 && gf_dedup_on())
+    if ((s_gf_draws % 50000u) == 0 && gf_dedup_on() && port_stats_log())
         fprintf(stderr, "[GPUFETCH] dedup: %llu MB reused instead of copied, %llu repeats had changed data%c",
                 (unsigned long long)(s_gf_dup_bytes >> 20), (unsigned long long)s_gf_dup_changed, 10);
-    if ((s_gf_draws % 50000u) == 0) {
+    if ((s_gf_draws % 50000u) == 0 && port_stats_log()) {
         char wb[256]; int wp = 0;
         for (int w = 1; w < 24; w++) if (s_gf_why[w]) wp += snprintf(wb + wp, sizeof wb - wp, " #%d:%llu", w, (unsigned long long)s_gf_why[w]);
         if (wp) fprintf(stderr, "[GPUFETCH] fallback reasons (gf_begin exit #: count):%s%c", wb, 10);
@@ -9349,7 +9358,7 @@ static void vp_record_cb_impl(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
               if (((dr->alpha_ctl >> 16) & 1u) && PS3_LOG_FIRST(_at, 4))
                   printf("[ALPHATEST] enable func=%u ref=%u\n",
                          (dr->alpha_ctl >> 8) & 0xFFu, dr->alpha_ctl & 0xFFu); }
-            { static u32 seen[96][2]; static int ns = 0; int k = 0;   /* v163b diag: alpha test per FP */
+            if (port_stats_log()) { static u32 seen[96][2]; static int ns = 0; int k = 0;   /* v163b diag: alpha test per FP (PORT_STATS_LOG=1) */
               for (; k < ns; k++) if (seen[k][0] == dr->fp_addr && seen[k][1] == dr->alpha_ctl) break;
               if (k == ns && ns < 96) { seen[ns][0] = dr->fp_addr; seen[ns][1] = dr->alpha_ctl; ns++;
                   FILE* f = fopen("logs\\alphactl.txt", ns == 1 ? "w" : "a");
@@ -9837,7 +9846,7 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt, float sc)
                 off, w, h, sc, SCS(sc, w), SCS(sc, h), SC(w), SC(h), 10); } }
     /* v171 diag: which surfaces get (re)created -- York churns hundreds a second */
     { static FILE* f = NULL; static int n = 0;
-      if (n < 4000) { if (!f) f = fopen("logs\\rtmake.txt", "w");
+      if (n < 4000 && port_stats_log()) { if (!f) f = fopen("logs\\rtmake.txt", "w");
           if (f) { fprintf(f, "%llu RT off=0x%08X %ux%u fmt=%u slot=%d sc=%.2f\n", (unsigned long long)GetTickCount64(), off, w, h, (unsigned)want_fmt, slot, sc);
                    if ((++n & 63) == 0) fflush(f); } } }
 
@@ -10342,7 +10351,7 @@ static D3D12_CPU_DESCRIPTOR_HANDLE zeta_dsv(u32 zoff, u32 w, u32 h, float sc, D3
         s_d3d.cmd_list->lpVtbl->ClearDepthStencilView(s_d3d.cmd_list, zt_handle(z),
             D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, NULL);
         { static FILE* f = NULL; static int n2 = 0;   /* v171 diag */
-          if (n2 < 4000) { if (!f) f = fopen("logs\\zetamake.txt", "w");
+          if (n2 < 4000 && port_stats_log()) { if (!f) f = fopen("logs\\zetamake.txt", "w");
               if (f) { fprintf(f, "%llu ZETA off=0x%08X %ux%u slot=%d sc=%.2f\n", (unsigned long long)GetTickCount64(), zoff, w, h, z, sc);
                        if ((++n2 & 63) == 0) fflush(f); } } }
         { static int n = 0; if (n < 24) { n++;
@@ -11387,7 +11396,7 @@ static void ft_note_present(void)
         if (s_ft_1n < 4096) s_ft_1s[s_ft_1n++] = d;
         if (s_ft_5n < 16384) s_ft_5s[s_ft_5n++] = d;
         if (csv_on < 0) {
-            const char* e = getenv("RSX_FRAMETIME_CSV"); csv_on = e ? atoi(e) : 1;
+            const char* e = getenv("RSX_FRAMETIME_CSV"); csv_on = e ? atoi(e) : 0;
             if (csv_on) {
                 csv = fopen("logs/frametimes.csv", "w");
                 if (csv) fprintf(csv, "seconds,frame_ms\n");
@@ -11406,7 +11415,8 @@ static void ft_note_present(void)
         snprintf(s_ft_title, sizeof s_ft_title, " | frame %.1f ms, 1%% low %.1f ms, worst %.1f ms", a, p, m);
         s_ft_1n = 0; t1 = tk;
     }
-    if (tk - t5 >= 5000 && s_ft_5n) {
+    if (tk - t5 >= 5000 && s_ft_5n && !port_stats_log()) { s_ft_5n = 0; t5 = tk; }
+    else if (tk - t5 >= 5000 && s_ft_5n) {
         double a, p, m; ft_stats(s_ft_5s, s_ft_5n, &a, &p, &m);
         unsigned o20 = 0, o33 = 0, o50 = 0;
         for (unsigned i = 0; i < s_ft_5n; i++) {
@@ -11440,13 +11450,13 @@ static const char* ssao_status(void);   /* rsx_ssao.inc */
  * once as "[FXSCALE] ..."; nothing is re-allocated (no screen-shaped feeder
  * exists in R1, so there is nothing that can safely be moved). 0 = no audit. */
 static u8 s_fx_pre_w[MAX_OFF_RTS], s_fx_pre_s[MAX_OFF_RTS], s_fx_post[MAX_OFF_RTS];
-/* RFOM_SPLIT_LOG=<n> (default 64, 0 = off): the first n split-screen clears and
+/* RFOM_SPLIT_LOG=<n> (default 0 = off): the first n split-screen clears and
  * target / viewport changes go to the log as "[coop] ..." lines -- how the two
  * views share the scene surface, for co-op rendering reports. Render thread. */
 static int split_log_take(void)
 {
     static int left = -1;
-    if (left < 0) { const char* e = getenv("RFOM_SPLIT_LOG"); left = e ? atoi(e) : 64; if (left < 0) left = 0; }
+    if (left < 0) { const char* e = getenv("RFOM_SPLIT_LOG"); left = e ? atoi(e) : 0; if (left < 0) left = 0; }
     if (!left || !g_rfom_split) return 0;
     left--;
     return 1;
@@ -15319,10 +15329,10 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
           if (((++n) % 20000) == 0)
               printf("[backend] arrays callbacks=%lld (prim=%u count=%u)\n", n, primitive, count), fflush(stdout); } }
     (void)ud;
-    /* Log the first 20 calls in detail, then every 1000th to show liveness
-     * without flooding. */
+    /* Log the first 20 calls in detail, then (PORT_STATS_LOG=1) every 1000th to
+     * show liveness without flooding. */
     static u64 s_total = 0;
-    if (s_total < 20 || (s_total % 1000) == 0) {
+    if (s_total < 20 || ((s_total % 1000) == 0 && port_stats_log())) {
         printf("[D3D12] draw_arrays #%llu prim=%u first=%u count=%u\n",
                (unsigned long long)s_total, primitive, first, count);
     }

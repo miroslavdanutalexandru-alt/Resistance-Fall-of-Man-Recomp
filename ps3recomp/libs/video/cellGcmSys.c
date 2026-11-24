@@ -3805,7 +3805,9 @@ CellGcmReportData* cellGcmGetReportDataAddress(u32 index)
 u32 cellGcmGetReport(u32 type, u32 index)
 {
     { static unsigned n = 0;   /* unsigned: the periodic line keeps counting, and wrapping is defined */
-      if (n++ < 8 || (n % 2000) == 0) printf("[cellGcmSys] GetReport(type=%u, index=%u) -> %u%c", type, index,
+      static int per = -1;     /* the every-2000th line: PORT_STATS_LOG=1 */
+      if (per < 0) { const char* e = getenv("PORT_STATS_LOG"); per = (e && atoi(e)) ? 1 : 0; }
+      if (n++ < 8 || (per && (n % 2000) == 0)) printf("[cellGcmSys] GetReport(type=%u, index=%u) -> %u%c", type, index,
                           index < CELL_GCM_MAX_REPORT_COUNT ? s_report_data[index].value : 0u, 10); }
     if (index >= CELL_GCM_MAX_REPORT_COUNT) return 0;
     return vm_read32(GCM_REPORT_GUEST_BASE + index * 16u + 8u);

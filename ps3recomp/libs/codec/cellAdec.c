@@ -372,10 +372,14 @@ static u32 adec_ac3_decode(AdecSlot* a, CellAdecHandle h, u32 src, u32 size, u32
       if (df == (FILE*)-1) { const char* e = getenv("ADEC_DUMP"); df = e ? fopen(e, "wb") : NULL;
                              if (e) printf("[cellAdec] dumping AC3 PCM to %s (%u ch f32le)\n", e, nout); }
       if (df) fwrite(out, sizeof(float), n, df);
-      static unsigned clipped, fr; fr++;
+      /* clipped-sample count: with ADEC_DUMP or PORT_AUDIO_LOG only */
+      static int clog = -1;
+      if (clog < 0) { const char* e = getenv("PORT_AUDIO_LOG"); clog = (df || (e && *e && atoi(e))) ? 1 : 0; }
+      static unsigned clipped, fr;
+      if (clog) { fr++;
       for (u32 i = 0; i < n; i++) if (out[i] > 1.0f || out[i] < -1.0f) clipped++;
       if (fr % 160 == 0) { if (clipped) printf("[cellAdec] AC3: %u samples over full scale in the last 160 frames\n", clipped);
-                           clipped = 0; } }
+                           clipped = 0; } } }
     for (u32 i = 0; i < n; i++) {
         float v = out[i];
         if (v > 1.0f) v = 1.0f; else if (v < -1.0f) v = -1.0f;
