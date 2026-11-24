@@ -137,7 +137,7 @@ jobs:
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_np_matching2 libs/network/tests/test_np_matching2.c
           /tmp/test_np_matching2
 
-      # The player name: --username, PS3_NP_ONLINE_ID, the OS login online,
+      # The player name: --username, PS3_NP_ONLINE_ID, a random name online,
       # and PSN's online ID rules.
       - name: Run the player-name test
         run: |
