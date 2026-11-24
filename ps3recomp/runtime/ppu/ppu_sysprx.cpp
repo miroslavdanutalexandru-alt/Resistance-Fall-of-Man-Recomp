@@ -930,7 +930,7 @@ extern "C" void ppu_sysprx_register(void)
     /* sceNpScore ranking calls take up to 15 arguments: the ones past r10
      * come off the stack, so they need the full context. */
     np_score_register_ctx();
-    /* sceNpManagerRequestTicket / RegionTicket: no generated NID entry, and
+    /* sceNpManagerRequestTicket / GetTicket / GetTicketParam: no generated NID entry, and
      * the online front end waits on RequestTicket's completion. */
     np_register_ctx();
     /* cellSaveDataUserAutoLoad/UserAutoSave take nine arguments; the ninth

@@ -390,12 +390,15 @@ static int  s_np_ticket_ready = 0;
 static char s_np_ticket_service[25];   /* the service ID it was requested for */
 static u64  s_np_ticket_issued_ms;
 
-/* A stable 64-bit account ID from the online ID (FNV-1a), so one player keeps
- * one account across runs and two players never share one. */
-static u64 np_ticket_account_id(const char* online_id)
+/* A stable 64-bit account ID (FNV-1a) from the name and its saved salt
+ * (np_psnr_identity_key), so one player keeps one account across runs and two
+ * players never share one, even with the same name. */
+static u64 np_ticket_account_id(void)
 {
+    const char* key = np_psnr_identity_key();
+    if (!key) key = np_psnr_online_id();
     u64 h = 0xCBF29CE484222325ull;
-    for (const char* p = online_id; *p; p++) { h ^= (u8)*p; h *= 0x100000001B3ull; }
+    for (const char* p = key; *p; p++) { h ^= (u8)*p; h *= 0x100000001B3ull; }
     return h;
 }
 
@@ -491,7 +494,7 @@ static s32 np_ticket_get_param(s32 id, u32 out_ea)
         vm_write64(out_ea, s_np_ticket_issued_ms + NP_TICKET_LIFETIME_MS);
         break;
     case SCE_NP_TICKET_PARAM_SUBJECT_ACCOUNT_ID:
-        vm_write64(out_ea, np_ticket_account_id(online_id));
+        vm_write64(out_ea, np_ticket_account_id());
         break;
     case SCE_NP_TICKET_PARAM_SUBJECT_ONLINE_ID:
         for (u32 i = 0; i < SCE_NP_ONLINEID_MAX_LENGTH && online_id[i]; i++)
