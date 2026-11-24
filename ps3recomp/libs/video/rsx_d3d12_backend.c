@@ -2446,7 +2446,12 @@ static int present_notear(void);
  * Only the render thread touches the swap chain, so nothing else changes. Any real present cancels
  * pending repeats; the next one schedules its own if it is still a movie frame -- so repeats stop
  * with the movie's last frame. Not while DLSS-G / FSR 3 FG generates frames (they pace presents
- * themselves; movies are untagged, so generation is off there anyway), not with RSX_ASYNC=0.
+ * themselves); a movie frame always turns generation off (s_fg_movie), so movie frames are never
+ * interpolated and get their repeats. Not with RSX_ASYNC=0.
+ * Every 5 s of a movie run.log gets "[D3D12] movie LFC 5.0 s: ..." (movie_lfc_window): real presents
+ * and their spacing, repeats presented / scheduled / dropped / cut off and how late they went out,
+ * frames left unrepeated and why, and what the decoder delivered (pictures the game took or skipped,
+ * slowest decode) -- uneven presents and pictures the game itself held back look different there.
  * RFOM_MOVIE_LFC unset/empty = auto (only on the VRR movie path, not with the FSR 3 FG swap chain),
  * 0 = off, N = N presents per movie frame (1-8) whenever a movie presents with interval 0. */
 #ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
@@ -2466,6 +2471,14 @@ static LONGLONG s_lfc_t0, s_lfc_prev, s_lfc_qf;
 static double s_lfc_period_us;         /* measured movie frame period, 0 = not yet */
 static double s_lfc_sched_ticks;       /* period the pending repeats use (QPC ticks, > 0 while scheduled) */
 static unsigned s_lfc_reps, s_lfc_drops, s_lfc_active;
+/* Per-5 s movie line (movie_lfc_window): the real presents, what became of their repeats, and what the
+ * decoder delivered -- tells uneven presents apart from pictures the game itself held or skipped. */
+static LONGLONG s_lfcw_t0;             /* window start (QPC), 0 = no movie window open */
+static unsigned s_lfcw_frames, s_lfcw_want, s_lfcw_reps, s_lfcw_drops, s_lfcw_lost, s_lfcw_unsched;
+static double s_lfcw_late_sum, s_lfcw_late_max, s_lfcw_gap_min, s_lfcw_gap_max;   /* ms */
+static const char* s_lfcw_why;         /* why the last unrepeated frame was not repeated */
+/* cellVdec.c: pictures the title took / skipped, slowest decode / copy-out (us), since the last call */
+void cellVdec_movie_stats(unsigned* taken, unsigned* skipped, unsigned* dec_max_us, unsigned* out_max_us);
 static int s_f3_on;   /* rsx_fsr3fg.inc (included further down): FSR 3 FG generated a frame at the last present */
 static void present_draw_frame(ID3D12GraphicsCommandList* cl, UINT bi, u32 fi, D3D12_CPU_DESCRIPTOR_HANDLE* rtv,
                                D3D12_VIEWPORT* vp, float* k);
@@ -2488,7 +2501,39 @@ static DWORD WINAPI movie_lfc_drs_thread(LPVOID p)
 static void movie_lfc_cancel(void)
 {
     if (s_lfc_left > 0 && s_lfc_timer) CancelWaitableTimer(s_lfc_timer);
+    if (s_lfc_left > 0) s_lfcw_lost += (unsigned)s_lfc_left;
     s_lfc_left = 0;
+}
+
+/* Every 5 s of a movie (and at its end, flush = 1): "[D3D12] movie LFC 5.0 s: ..." */
+static void movie_lfc_window(LONGLONG now, int flush)
+{
+    unsigned taken = 0, skipped = 0, dec_us = 0, out_us = 0;
+    if (!s_lfcw_t0) {   /* a movie starts: open the window, drop the decoder counts from before it */
+        cellVdec_movie_stats(&taken, &skipped, &dec_us, &out_us);
+        s_lfcw_t0 = now; s_lfcw_gap_min = 1e9;
+        return;
+    }
+    if (!flush && (double)(now - s_lfcw_t0) < 5.0 * (double)s_lfc_qf) return;
+    cellVdec_movie_stats(&taken, &skipped, &dec_us, &out_us);
+    static unsigned nlog = 0;
+    if (s_lfcw_frames && nlog < 400) {
+        nlog++;
+        char unsched[160] = "";
+        if (s_lfcw_unsched)
+            snprintf(unsched, sizeof unsched, ", %u frames not repeated (%s)", s_lfcw_unsched, s_lfcw_why ? s_lfcw_why : "?");
+        fprintf(stderr, "[D3D12] movie LFC %.1f s: %u frames (%.2f-%.2f ms apart), repeats %u of %u presented, %u dropped (late), "
+                        "%u cut off (next frame first / movie stopped)%s; repeats late avg %.2f max %.2f ms | decoder: %u pictures "
+                        "taken, %u skipped by the game, slowest decode %.1f ms, copy-out %.1f ms%c",
+                (double)(now - s_lfcw_t0) / (double)s_lfc_qf, s_lfcw_frames,
+                s_lfcw_gap_max > 0.0 ? s_lfcw_gap_min : 0.0, s_lfcw_gap_max,
+                s_lfcw_reps, s_lfcw_want, s_lfcw_drops, s_lfcw_lost, unsched,
+                s_lfcw_reps ? s_lfcw_late_sum / s_lfcw_reps : 0.0, s_lfcw_late_max,
+                taken, skipped, dec_us / 1000.0, out_us / 1000.0, 10);
+    }
+    s_lfcw_frames = s_lfcw_want = s_lfcw_reps = s_lfcw_drops = s_lfcw_lost = s_lfcw_unsched = 0;
+    s_lfcw_late_sum = s_lfcw_late_max = s_lfcw_gap_max = 0.0; s_lfcw_gap_min = 1e9; s_lfcw_why = NULL;
+    s_lfcw_t0 = flush ? 0 : now;
 }
 
 static void movie_lfc_arm(void)
@@ -2501,37 +2546,29 @@ static void movie_lfc_arm(void)
     if (!SetWaitableTimer(s_lfc_timer, &due, 0, NULL, NULL, FALSE)) s_lfc_left = 0;
 }
 
-/* present_blit, after a real present (tq = QPC just before it): measure the movie cadence, decide k
- * and schedule this frame's repeats. movie = the frame was a movie frame (see present_blit). */
-static void movie_lfc_after_present(int movie, int vs, u32 fi, LONGLONG tq)
+static int s_lfc_said_k = -1;
+
+/* movie_lfc_after_present: decide k and schedule this movie frame's repeats. NULL = scheduled, else why not. */
+static const char* movie_lfc_schedule(int vs, u32 fi, LONGLONG tq)
 {
-    static int env = -2, said_k = -1, said_n = 0, said_off = 0;
-    if (!s_lfc_qf) { LARGE_INTEGER f; QueryPerformanceFrequency(&f); s_lfc_qf = f.QuadPart ? f.QuadPart : 1; }
-    if (!movie) {
-        if (s_lfc_active && said_n < 32) { said_n++;
-            fprintf(stderr, "[D3D12] movie LFC: movie ended, %u repeat presents, %u dropped (late)%c", s_lfc_reps, s_lfc_drops, 10); }
-        s_lfc_active = 0; s_lfc_prev = 0; s_lfc_period_us = 0.0; s_lfc_reps = s_lfc_drops = 0; said_k = -1;
-        return;
-    }
-    if (s_lfc_prev) s_lfc_period_us = rfom_movie_period_update(s_lfc_period_us, (double)(tq - s_lfc_prev) * 1e6 / (double)s_lfc_qf);
-    s_lfc_prev = tq;
+    static int env = -2, said_n = 0, said_off = 0;
     if (env == -2) { const char* e = getenv("RFOM_MOVIE_LFC"); env = (e && *e) ? atoi(e) : -1; if (env < -1) env = 0; }
-    if (vs != 0) return;                        /* vsync movie present: the display shows it evenly */
+    if (vs != 0) return "vsync present";        /* vsync movie present: the display shows it evenly */
     const char* off = NULL;
     if (env == 0) off = "off (RFOM_MOVIE_LFC=0)";
     else if (GetCurrentThreadId() != s_lfc_rt_tid) off = "off (needs the render thread, RSX_ASYNC=0)";
     else if (env < 0) {
         const double p = s_movie_per_us;
-        if (!(s_tearing && !present_notear() && p > 0.0 && !rfom_movie_lock_k(p))) return;   /* not the VRR movie path */
+        if (!(s_tearing && !present_notear() && p > 0.0 && !rfom_movie_lock_k(p))) return "not the VRR movie path";
         if (s_f3_ready) off = "off (FSR 3 frame generation paces the presents itself; RFOM_MOVIE_LFC=2 forces it)";
     }
-    if (off) { if (!said_off) { said_off = 1; fprintf(stderr, "[D3D12] movie LFC: %s%c", off, 10); } return; }
-    if (s_fg_on || s_f3_on) return;             /* frame generation running: it owns the present cadence */
+    if (off) { if (!said_off) { said_off = 1; fprintf(stderr, "[D3D12] movie LFC: %s%c", off, 10); } return off; }
+    if (s_fg_on || s_f3_on) return "frame generation on";   /* it owns the present cadence */
     const double per = s_lfc_period_us > 0.0 ? s_lfc_period_us : RFOM_MOVIE_FRAME_US;
     const double hz = s_movie_per_us > 0.0 ? 1e6 / s_movie_per_us : 0.0;
     const int k = rfom_movie_lfc_count(1e6 / per, hz, env);
-    if (k != said_k && said_n < 32) {
-        said_k = k; said_n++;
+    if (k != s_lfc_said_k && said_n < 32) {
+        s_lfc_said_k = k; said_n++;
         if (k >= 2)
             fprintf(stderr, "[D3D12] movie LFC: %.2f fps movie, each frame presented %dx (%.1f presents/s, %.2f ms apart) to stay "
                             "inside the VRR range at %.2f Hz (%s; RFOM_MOVIE_LFC=0 = off, =N = N presents per frame)%c",
@@ -2541,29 +2578,58 @@ static void movie_lfc_after_present(int movie, int vs, u32 fi, LONGLONG tq)
         if (k >= 2) { static int drs = 0; if (!drs) { drs = 1; HANDLE th = CreateThread(NULL, 0, movie_lfc_drs_thread, NULL, 0, NULL);
                                                       if (th) CloseHandle(th); } }
     }
-    if (k < 2) return;
+    if (k < 2) return "not needed at this refresh rate";
     if (!s_lfc_timer) {
         s_lfc_timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
         if (!s_lfc_timer) s_lfc_timer = CreateWaitableTimerW(NULL, FALSE, NULL);
         if (!s_lfc_timer) { if (!said_off) { said_off = 1; fprintf(stderr, "[D3D12] movie LFC: off (no waitable timer)%c", 10); }
-                            env = 0; return; }
+                            env = 0; return "no waitable timer"; }
     }
     s_lfc_active = 1;
     s_lfc_sched_ticks = per * (double)s_lfc_qf / 1e6;
     s_lfc_t0 = tq; s_lfc_k = k; s_lfc_i = 1; s_lfc_left = k - 1; s_lfc_fi = fi; s_lfc_vs = vs;
     s_lfc_res = s_d3d.render_targets[fi];
+    s_lfcw_want += (unsigned)(k - 1);
     movie_lfc_arm();
+    return NULL;
+}
+
+/* present_blit, after a real present (tq = QPC just before it): measure the movie cadence, decide k
+ * and schedule this frame's repeats. movie = the frame was a movie frame (see present_blit). */
+static void movie_lfc_after_present(int movie, int vs, u32 fi, LONGLONG tq)
+{
+    static int said_n = 0;
+    if (!s_lfc_qf) { LARGE_INTEGER f; QueryPerformanceFrequency(&f); s_lfc_qf = f.QuadPart ? f.QuadPart : 1; }
+    if (!movie) {
+        if (s_lfcw_t0) movie_lfc_window(tq, 1);
+        if (s_lfc_active && said_n < 32) { said_n++;
+            fprintf(stderr, "[D3D12] movie LFC: movie ended, %u repeat presents, %u dropped (late)%c", s_lfc_reps, s_lfc_drops, 10); }
+        s_lfc_active = 0; s_lfc_prev = 0; s_lfc_period_us = 0.0; s_lfc_reps = s_lfc_drops = 0; s_lfc_said_k = -1;
+        return;
+    }
+    movie_lfc_window(tq, 0);
+    if (s_lfc_prev) {
+        const double gap_us = (double)(tq - s_lfc_prev) * 1e6 / (double)s_lfc_qf;
+        s_lfc_period_us = rfom_movie_period_update(s_lfc_period_us, gap_us);
+        const double gap_ms = gap_us / 1000.0;
+        if (gap_ms < s_lfcw_gap_min) s_lfcw_gap_min = gap_ms;
+        if (gap_ms > s_lfcw_gap_max) s_lfcw_gap_max = gap_ms;
+    }
+    s_lfc_prev = tq;
+    s_lfcw_frames++;
+    const char* why = movie_lfc_schedule(vs, fi, tq);
+    if (why) { s_lfcw_unsched++; s_lfcw_why = why; }
 }
 
 /* The repeat: the last movie frame (virtual back buffer s_lfc_fi) and the OSD to the next swap-chain
  * buffer, presented like the real one (no screenshot, frame-generation tags, latency markers or
  * frame-time sample: it is not a new frame). */
-static void movie_lfc_present(void)
+static int movie_lfc_present(LONGLONG* tp)
 {
     const u32 fi = s_lfc_fi;
     if (s_sc_wait) WaitForSingleObjectEx(s_sc_wait, 20, TRUE);
     const UINT bi = s_d3d.swap_chain->lpVtbl->GetCurrentBackBufferIndex(s_d3d.swap_chain);
-    if (bi >= FRAME_COUNT || !s_sc_buf[bi] || !s_d3d.render_targets[fi] || s_d3d.render_targets[fi] != s_lfc_res) return;
+    if (bi >= FRAME_COUNT || !s_sc_buf[bi] || !s_d3d.render_targets[fi] || s_d3d.render_targets[fi] != s_lfc_res) return 0;
     blit_wait(s_blit_fv[bi]);
     ID3D12GraphicsCommandList* cl = s_blit_list;
     s_blit_alloc[bi]->lpVtbl->Reset(s_blit_alloc[bi]);
@@ -2592,9 +2658,12 @@ static void movie_lfc_present(void)
     const u64 v = ++s_blit_ctr;
     s_d3d.cmd_queue->lpVtbl->Signal(s_d3d.cmd_queue, s_blit_fence, v);
     s_blit_fv[bi] = v;
+    LARGE_INTEGER t; QueryPerformanceCounter(&t);
+    *tp = t.QuadPart;
     s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain, (UINT)s_lfc_vs,
                                       (s_lfc_vs == 0 && s_tearing && !present_notear()) ? DXGI_PRESENT_ALLOW_TEARING : 0);
     pds_note_presents(1);
+    return 1;
 }
 
 /* Render thread, the timer fired: present the due repeat, or drop it when late / the movie is gone. */
@@ -2605,11 +2674,18 @@ static void movie_lfc_fire(void)
     const int d = rfom_movie_lfc_due(s_lfc_t0, now.QuadPart, s_lfc_sched_ticks, s_lfc_k, s_lfc_i);
     if (d == 0) { movie_lfc_arm(); return; }   /* early wake */
     if (d < 0 || s_sc_resize || cellGcm_get_flip_mode() != 2 || !cellVdec_movie_active(500)) {
-        if (d < 0) s_lfc_drops++;
+        if (d < 0) { s_lfc_drops++; s_lfcw_drops += (unsigned)s_lfc_left; }
+        else s_lfcw_lost += (unsigned)s_lfc_left;
         s_lfc_left = 0; return;
     }
-    movie_lfc_present();
-    s_lfc_reps++; s_lfc_i++;
+    LONGLONG tp = 0;
+    if (movie_lfc_present(&tp)) {   /* lateness at the Present call (after the swap-chain / blit waits) */
+        const double late_ms = ((double)tp - ((double)s_lfc_t0 + s_lfc_sched_ticks / s_lfc_k * s_lfc_i)) * 1000.0 / (double)s_lfc_qf;
+        s_lfc_reps++; s_lfcw_reps++;
+        s_lfcw_late_sum += late_ms;
+        if (late_ms > s_lfcw_late_max) s_lfcw_late_max = late_ms;
+    } else s_lfcw_lost++;
+    s_lfc_i++;
     if (--s_lfc_left > 0) movie_lfc_arm();
 }
 
@@ -2876,6 +2952,7 @@ static void present_blit(int vs)
         }
         osd_draw(cl, bi);
     }
+    s_fg_movie = movie || (cellGcm_get_flip_mode() == 2 && cellVdec_movie_active(500));   /* any movie, VRR path or not */
     fg_present(cl, bi, fi, rtv, &vp, k, shot, &vs);   /* DLSS-G: HUD-less / UI tags, on/off, debug view */
     b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
