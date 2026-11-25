@@ -2292,6 +2292,7 @@ static ID3D12RootSignature* s_cf_rs; static ID3D12PipelineState* s_cf_pso; stati
 static UINT s_cf_inc; static u32 s_cf_ring; static int s_cf_fail;
 static u32 s_cf_st[4], s_cf_cut, s_cf_dep[2], s_cf_plur, s_cf_med, s_cf_held, s_cf_loose, s_cf_run[4];   /* per frame: exact / fallback (no agreement) / none (no candidates) / no record data; cuts; fill with / without scene depth */
 static u32 s_cf_cand, s_cf_elig, s_cf_tried, s_cf_bad, s_cf_mt[5];
+static u32 s_cf_fgr[2];   /* RFOM_DLSS_FG_CAM_RESET: frame generation resets on held / unsolved (or plurality) frames */
 static const char s_cf_hlsl[] =
 "Texture2D<float> dep : register(t0);\n"
 "RWTexture2D<float2> mvo : register(u0);\n"
@@ -2480,6 +2481,30 @@ static int cam_solve_core(u32 fr, u32 n, double (*Ms)[16], const u32* pg, double
     if (dlss_cut_on() && vpcpu_is_cut(M, 1.0)) *cut = 1;
     return 1;
 }
+/* RFOM_DLSS_FG_CAM_RESET: how far camera M moves the screen in render pixels (1e9: a point behind the camera) */
+static double fgc_px(const double* M, u32 rw, u32 rh)
+{
+    static const double I[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
+    const double d = vpcpu_mdist(M, I);
+    return d > 1e8 ? 1e9 : d * 0.5 * (double)(rw > rh ? rw : rh);
+}
+/* RFOM_DLSS_FG_CAM_RESET (default 1; 0 = old, 2 = held cameras too): a frame whose camera was not solved
+ * (rfom_fgcam_untrusted src) while the camera moves resets frame generation (DLSS-G / FSR 3 only; the upscaler
+ * keeps its history), so it does not blend two views with a wrong or zero camera motion (double image while turning). */
+static int fgc_reset(int src, double moving_px)
+{
+    static int mode = -1;
+    if (mode < 0) mode = dlss_env_i("RFOM_DLSS_FG_CAM_RESET", 1, 0, 2);
+    if (!(s_fg_ready || s_f3_ready) || !pfg_cam_reset(mode, src, moving_px)) return 0;
+    s_cf_fgr[src == PFG_CAM_HELD ? 0 : 1]++;
+    static int logged;
+    if (!logged) {
+        logged = 1;
+        fprintf(stderr, "[FG] camera not solved this frame (%s) while the camera moves (%.1f px): frame generation reset (RFOM_DLSS_FG_CAM_RESET=%d)%c",
+                src == PFG_CAM_HELD ? "last solved camera held" : "no camera motion / plurality guess", moving_px, mode, 10);
+    }
+    return 1;
+}
 /* Sentinel pixels of the motion / depth targets -> camera motion through the
  * scene depth (or zero motion, as before, when there is no exact M). */
 static void cam_fill(u32 rw, u32 rh, float vw, float vh, const double* M, float jnx, float jny)
@@ -2553,9 +2578,12 @@ static void fsr_dispatch(void)
     double fg_M[16]; int fg_has_M = 0;   /* DLSS-G: the camera the fill used (none = no camera motion) */
     float fg_j[4] = { 0.0f, 0.0f, (float)w * uf, (float)h * uf };   /* its jitter (ndc) and view size (rsx_dlssg_ghost.inc) */
     static rfom_fgcam_hold_t hold;       /* RFOM_DLSS_FG_CAM_HOLD */
+    static rfom_fgcam_latch_t fgc_latch; /* RFOM_DLSS_FG_CAM_RESET: the last solved camera's motion */
+    int fg_cam = PFG_CAM_TRUSTED; double fg_cam_px = 0.0;
     if (!s_cf_armed) hold.has = 0;
     if (s_cf_armed) {
         double M[16]; float j[2] = { 0.0f, 0.0f };
+        const u32 plur0 = s_cf_plur;
         const int cs = cam_solve(s_fsr_frame_r, M, j, &cam_cut);
         /* RFOM_DLSS_FG_CAM_HOLD (default 3, 0 = off): unsolved frames reuse the last solved camera for the
          * fill and DLSS-G alike (never across a frame gap or cut: those reset the history anyway). */
@@ -2568,6 +2596,8 @@ static void fsr_dispatch(void)
         const double* hM = rfom_fgcam_hold(&hold, cs == 1 ? M : NULL, hgap || (cs != 1 && cs != 2), cam_cut, hold_max);
         if (hM) { memcpy(fg_M, hM, sizeof fg_M); fg_has_M = 1; }
         if (cs == 2 && hM) s_cf_held++;
+        fg_cam = rfom_fgcam_untrusted(&fgc_latch, s_fsr_frame_r, cs, hgap, cam_cut, s_cf_plur != plur0,
+                                      cs == 1 ? fgc_px(M, rw, rh) : 0.0, cs == 2 && hM ? fgc_px(hM, rw, rh) : -1.0, &fg_cam_px);
         { static u32 run;   /* fallback streak lengths: why the hold (max hold_max frames) leaves frames uncovered */
           if (cs == 2) run++;
           else if (run) { s_cf_run[run <= 3 ? 0 : run <= 10 ? 1 : run <= 30 ? 2 : 3]++; run = 0; } }
@@ -2640,6 +2670,8 @@ static void fsr_dispatch(void)
         s_fgdf.reset |= (u8)(((s_fsr_last_frame == 0 || s_fsr_frame_r != s_fsr_last_frame + 1u) ? FGD_R_GAP : 0) | (cam_cut ? FGD_R_CUT : 0) |
                              ((fgd_why & PDQ_RESET_HITCH) ? FGD_R_HITCH : 0) | ((fgd_why & PDQ_RESET_RESOLUTION) ? FGD_R_RES : 0));
     }
+    /* RFOM_DLSS_FG_CAM_RESET: frame generation only; the upscaler keeps its history */
+    const int fg_reset = dd.reset || (fg_cam != PFG_CAM_TRUSTED && fgc_reset(fg_cam, fg_cam_px));
     fsr_camera(&dd.cameraNear, &dd.cameraFar, &dd.cameraFovAngleVertical);
     dd.viewSpaceToMetersFactor = 1.0f;
     { const char* e = getenv("RSX_FSR_LINEAR"); dd.flags = (e && atoi(e)) ? 0u : FFX_UPSCALE_FLAG_NON_LINEAR_COLOR_SRGB; }
@@ -2698,7 +2730,7 @@ static void fsr_dispatch(void)
                 : p_dlss_eval(cl, rt->res, s_fsr_z, s_fsr_mv, s_fsr_out, js * jx, js * jy, (float)rw, (float)rh, dd.reset, dt);
             if (!ok) rc = FFX_API_RETURN_ERROR;
             else fg_tag_scene(cl, s_fsr_z, (unsigned)s_fsr_z_st, s_fsr_mv, (unsigned)s_fsr_mv_st, rw, rh,
-                              js * jx, js * jy, dd.reset, fg_has_M ? fg_M : NULL,
+                              js * jx, js * jy, fg_reset, fg_has_M ? fg_M : NULL,
                               dd.cameraNear, dd.cameraFar, dd.cameraFovAngleVertical,   /* DLSS-G: the same depth / motion / jitter / camera */
                               (s_fsr_rx && fsr_rx_val() > 0.0f) ? s_fsr_rx : NULL, fg_j);
         }
@@ -2745,8 +2777,8 @@ static void fsr_dispatch(void)
             fgx_prep(cl, s_fsr_z, s_fsr_mv, (s_fsr_rx && fsr_rx_val() > 0.0f) ? s_fsr_rx : NULL, rw, rh, fg_has_M ? fg_M : NULL, fg_j)) {
             f3z = s_fgx.z; f3mv = s_fgx.mv; f3zs = f3ms = (unsigned)rd;
         }
-        fgx_note_tag(dd.reset);
-        f3_prepare(cl, f3z, f3zs, f3mv, f3ms, w, h, rw, rh, jx, jy, dt, dd.reset);
+        fgx_note_tag(fg_reset);
+        f3_prepare(cl, f3z, f3zs, f3mv, f3ms, w, h, rw, rh, jx, jy, dt, fg_reset);
     }
     /* FFX bound its own descriptor heap / compute state. */
     vp_set_heaps(cl);   /* + the guest sampler heap (Phase 2) */
@@ -2783,6 +2815,10 @@ static void fsr_dispatch(void)
                     s_cf_dep[0], s_cf_dep[1],
                     md ? 100.0 * s_cf_mt[1] / md : 0.0, md ? 100.0 * s_cf_mt[2] / md : 0.0, md ? 100.0 * s_cf_mt[3] / md : 0.0,
                     md ? 100.0 * s_cf_mt[4] / md : 0.0, md ? 100.0 * s_cf_mt[0] / md : 0.0, rw, rh, w, h, uf, ssao_status(), 10);
+            if (port_stats_log() && s_cf_fgr[0] + s_cf_fgr[1])
+                fprintf(stderr, "[DLSS] camera/600: frame generation reset on %u moving frames without a solved camera (RFOM_DLSS_FG_CAM_RESET): held %u, unsolved / plurality %u%c",
+                        s_cf_fgr[0] + s_cf_fgr[1], s_cf_fgr[0], s_cf_fgr[1], 10);
+            s_cf_fgr[0] = s_cf_fgr[1] = 0;
             memset(s_cf_st, 0, sizeof s_cf_st); memset(s_cf_mt, 0, sizeof s_cf_mt); memset(s_cf_dep, 0, sizeof s_cf_dep); memset(s_cf_run, 0, sizeof s_cf_run);
             s_cf_cut = s_cf_cand = s_cf_elig = s_cf_tried = s_cf_bad = s_cf_plur = s_cf_med = s_cf_held = s_cf_loose = s_cf_rskip = s_cf_rout = 0; }
           s_fsr_st_rec = s_fsr_st_match = s_fsr_st_over = s_fsr_st_wait = s_fsr_st_exact = s_fsr_st_cam = s_fsr_st_amb = s_fsr_st_vm = s_fsr_st_common = s_fsr_st_zr = 0; s_fsr_st_tsc = 0; nr = gap = 0;

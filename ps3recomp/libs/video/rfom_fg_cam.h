@@ -8,6 +8,8 @@
 #ifndef RFOM_FG_CAM_H
 #define RFOM_FG_CAM_H
 
+#include "port_fg_logic.h"   /* PFG_CAM_* / pfg_cam_moving_px (RFOM_DLSS_FG_CAM_RESET) */
+
 /* 4x4 inverse (Gauss-Jordan, partial pivoting); 0 when singular */
 static inline int rfom_fgcam_inv(const double* m, double* out)
 {
@@ -75,6 +77,32 @@ static inline const double* rfom_fgcam_hold(rfom_fgcam_hold_t* h, const double* 
     if (max_age > 0 && h->has && h->age < max_age) { h->age++; return h->M; }
     h->has = 0;
     return 0;
+}
+
+/* RFOM_DLSS_FG_CAM_RESET (rsx_fsr.inc fsr_dispatch; R2's R2_DLSS_FG_CAM_RESET): is this frame's camera a measurement?
+ * cs: cam_solve's result (1 solved, 2 unsolved: candidates disagree, 0 no candidates: no program's camera rows
+ * changed, i.e. a still camera, 3 no record data); gap: a frame gap (the history resets anyway); cut: a camera cut;
+ * plur: the solve was the opt-in RFOM_DLSS_CAM_PLURALITY guess (a largest agreeing group); m_px: the solved camera's
+ * motion (render px); h_px: the held camera's motion (RFOM_DLSS_FG_CAM_HOLD), < 0 = none (identity). Solved frames
+ * and still ones latch their motion. Returns the pfg_cam_reset src (PFG_CAM_TRUSTED = nothing to check) and sets
+ * *moving to pfg_cam_moving_px: the stand-in's own motion, else the latched motion for PFG_CAM_LATCH frames. */
+typedef struct { double px; unsigned fr; } rfom_fgcam_latch_t;
+
+static inline int rfom_fgcam_untrusted(rfom_fgcam_latch_t* l, unsigned fr, int cs, int gap, int cut, int plur,
+                                       double m_px, double h_px, double* moving)
+{
+    *moving = 0.0;
+    if (gap) return PFG_CAM_TRUSTED;
+    if ((cs == 1 && !plur) || cs == 0) {
+        if (!cut) { l->px = cs == 1 ? m_px : 0.0; l->fr = fr; }
+        return PFG_CAM_TRUSTED;
+    }
+    if (cs == 1) { *moving = pfg_cam_moving_px(-1.0, m_px, l->px, fr - l->fr); return PFG_CAM_GUESSED; }
+    if (cs == 2) {
+        *moving = pfg_cam_moving_px(-1.0, h_px, l->px, fr - l->fr);
+        return h_px >= 0.0 ? PFG_CAM_HELD : PFG_CAM_GUESSED;
+    }
+    return PFG_CAM_TRUSTED;
 }
 
 /* RFOM_DLSS_CAM_REP (rsx_fsr.inc cam_solve / cam_note): a camera candidate comes from a program whose shared

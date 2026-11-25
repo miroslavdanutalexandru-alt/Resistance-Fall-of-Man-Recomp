@@ -595,9 +595,40 @@ static void test_camrep()
 	for (int i = 0; i < 8; ++i) rfom_camrep_step(&u, 0.045, 0.004, 0.05);  // TOL2 0.05: floor capped at the old 0.05
 	CHECK(!u.out && u.score == 0);
 }
+static void test_fg_cam_reset()
+{
+	// R2_DLSS_FG_CAM_RESET (R1: RFOM_DLSS_FG_CAM_RESET): same decision as R2
+	CHECK(pfg_cam_reset(1, PFG_CAM_ZEROED, 3.0) && pfg_cam_reset(1, PFG_CAM_GUESSED, 1.0) && pfg_cam_reset(1, PFG_CAM_ZEROED, 1e9));
+	CHECK(!pfg_cam_reset(1, PFG_CAM_ZEROED, 0.5) && !pfg_cam_reset(1, PFG_CAM_GUESSED, 0.0) && !pfg_cam_reset(1, PFG_CAM_TRUSTED, 50.0));
+	CHECK(!pfg_cam_reset(1, PFG_CAM_HELD, 50.0) && pfg_cam_reset(2, PFG_CAM_HELD, 50.0) && !pfg_cam_reset(2, PFG_CAM_HELD, 0.2));
+	CHECK(!pfg_cam_reset(0, PFG_CAM_ZEROED, 50.0) && !pfg_cam_reset(1, PFG_CAM_ZEROED, std::nan("")));
+	CHECK(pfg_cam_reset(1, PFG_CAM_ZEROED, pfg_cam_moving_px(-1.0, -1.0, 12.0, PFG_CAM_LATCH)));
+	CHECK(!pfg_cam_reset(1, PFG_CAM_ZEROED, pfg_cam_moving_px(-1.0, -1.0, 12.0, PFG_CAM_LATCH + 1)));
+	CHECK(!pfg_cam_reset(1, PFG_CAM_GUESSED, pfg_cam_moving_px(-1.0, 0.05, 12.0, 1)));
+	CHECK(pfg_cam_reset(1, PFG_CAM_GUESSED, pfg_cam_moving_px(-1.0, -1.0, 12.0, 2)));
+	CHECK(!pfg_cam_reset(1, PFG_CAM_ZEROED, pfg_cam_moving_px(0.0, -1.0, 12.0, 0)) && pfg_cam_reset(1, PFG_CAM_ZEROED, pfg_cam_moving_px(4.0, -1.0, 0.0, 30)));
+	CHECK(pfg_cam_reset(1, PFG_CAM_GUESSED, pfg_cam_moving_px(0.0, 6.0, 0.0, 0)));
+	// R1: cam_solve states -> src / moving px
+	rfom_fgcam_latch_t l = {};
+	double mv = -1.0;
+	CHECK(rfom_fgcam_untrusted(&l, 10, 1, 0, 0, 0, 12.0, -1.0, &mv) == PFG_CAM_TRUSTED && l.px == 12.0 && l.fr == 10);   // solved: latched
+	CHECK(rfom_fgcam_untrusted(&l, 11, 2, 0, 0, 0, 0.0, -1.0, &mv) == PFG_CAM_GUESSED && mv == 12.0);   // unsolved, no hold: last solved motion
+	CHECK(pfg_cam_reset(1, PFG_CAM_GUESSED, mv));
+	CHECK(rfom_fgcam_untrusted(&l, 12, 2, 0, 0, 0, 0.0, 11.0, &mv) == PFG_CAM_HELD && mv == 11.0);      // held: its own motion
+	CHECK(!pfg_cam_reset(1, PFG_CAM_HELD, mv) && pfg_cam_reset(2, PFG_CAM_HELD, mv));
+	CHECK(rfom_fgcam_untrusted(&l, 10 + PFG_CAM_LATCH + 1, 2, 0, 0, 0, 0.0, -1.0, &mv) == PFG_CAM_GUESSED && mv == 0.0);   // latch expired
+	CHECK(rfom_fgcam_untrusted(&l, 30, 1, 0, 0, 1, 0.2, -1.0, &mv) == PFG_CAM_GUESSED && !pfg_cam_reset(1, PFG_CAM_GUESSED, mv));   // still plurality guess
+	CHECK(rfom_fgcam_untrusted(&l, 31, 1, 0, 0, 1, 9.0, -1.0, &mv) == PFG_CAM_GUESSED && pfg_cam_reset(1, PFG_CAM_GUESSED, mv));    // moving plurality guess
+	CHECK(rfom_fgcam_untrusted(&l, 32, 0, 0, 0, 0, 0.0, -1.0, &mv) == PFG_CAM_TRUSTED && l.px == 0.0);   // no candidates: still camera
+	CHECK(rfom_fgcam_untrusted(&l, 33, 2, 0, 0, 0, 0.0, -1.0, &mv) == PFG_CAM_GUESSED && !pfg_cam_reset(1, PFG_CAM_GUESSED, mv));
+	CHECK(rfom_fgcam_untrusted(&l, 34, 1, 0, 1, 0, 50.0, -1.0, &mv) == PFG_CAM_TRUSTED && l.px == 0.0);  // cut: not latched
+	CHECK(rfom_fgcam_untrusted(&l, 35, 2, 1, 0, 0, 0.0, -1.0, &mv) == PFG_CAM_TRUSTED);                  // frame gap: resets anyway
+	CHECK(rfom_fgcam_untrusted(&l, 36, 3, 0, 0, 0, 0.0, -1.0, &mv) == PFG_CAM_TRUSTED);                  // no record data
+}
 #endif
 
 int main()
+
 {
 	test_legacy_equivalence();
 	test_selector();
@@ -614,6 +645,7 @@ int main()
 	test_vote_majority();
 	test_nn_ambiguous();
 	test_camrep();
+	test_fg_cam_reset();
 #endif
 	std::printf("fg_logic_test: %d checks, %d failed\n", g_checks, g_fail);
 	return g_fail ? 1 : 0;
