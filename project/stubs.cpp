@@ -1964,7 +1964,7 @@ static void prompts_apply(uint32_t base, uint32_t end, int mode, uint32_t* blkp,
       const char* b = strrchr(mp, '\\'); b = b ? b + 1 : mp;
       /* v162b: not when the pause menu loads its text (play was running a moment ago) -- Space there is Cross */
       const ULONGLONG t = GetTickCount64();
-      if (_stricmp(b, "ResistanceFoM.exe") && (!g_rfom_play_ms || t - g_rfom_play_ms > 3000)) g_rfom_space_start = 1;
+      if (_stricmp(b, "ResistanceFoM.exe") && (!g_rfom_play_ms || t - g_rfom_play_ms > 3000)) { g_rfom_space_start = 1; g_rfom_pause_ui = 0; }   /* a level load ends any pause menu */
       else if (_stricmp(b, "ResistanceFoM.exe")) g_rfom_pause_ui = 1; }   /* v162c: text loaded mid-play = the pause menu */
     for (uint32_t i = 1; fe_menu && mode == 0 && i < end; i++) {
         if (p[i - 1] != 0 || p[i] == 0) continue;

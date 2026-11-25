@@ -114,13 +114,21 @@ static inline float rfom_aspect_present_mul(float mul, unsigned long long last_m
 #define RFOM_ASPECT_PLAY_MS 250u
 #define RFOM_ASPECT_SCENE_GAP_MS 250u
 #define RFOM_ASPECT_MENU_CAM_MS 500u
-/* The menu input of rfom_aspect_gate: the pause menu flag (g_rfom_pause_ui, set by a text load
- * soon after play) counts only while no widened camera was set within RFOM_ASPECT_MENU_CAM_MS
- * (cam_ms: the last, 0 = none). A paused world is not re-shot every frame; a cutscene moves its
- * camera, so a stale flag (a text load followed by a cutscene) cannot letterbox the cutscene. */
-static inline int rfom_aspect_menu(int pause_ui, unsigned long long cam_ms, unsigned long long now_ms)
+/* The menu input of rfom_aspect_gate. The pause menu flag (g_rfom_pause_ui) is set by a text load
+ * soon after play and cleared only by on-foot play or a level load, so it can outlive the pause
+ * menu (restart into an in-engine intro, a text load before a cutscene or vehicle section). It
+ * counts only until a widened camera is set more than RFOM_ASPECT_MENU_CAM_MS after it was raised
+ * (the paused world is not re-shot; any cutscene sets its camera at least on its cuts, however
+ * seldom), and that ends it for good, until the flag drops and is raised again.
+ * *since: when the flag was seen raised (0 = down), *spent: it was ended by a camera;
+ * cam_ms: the last widened camera (0 = none). */
+static inline int rfom_aspect_menu(int pause_ui, unsigned long long* since, int* spent,
+                                   unsigned long long cam_ms, unsigned long long now_ms)
 {
-    return pause_ui && (!cam_ms || (now_ms > cam_ms && now_ms - cam_ms >= RFOM_ASPECT_MENU_CAM_MS));
+    if (!pause_ui) { *since = 0; *spent = 0; return 0; }
+    if (!*since) *since = now_ms ? now_ms : 1;
+    if (cam_ms && cam_ms > *since && cam_ms - *since >= RFOM_ASPECT_MENU_CAM_MS) *spent = 1;
+    return !*spent;
 }
 static inline float rfom_aspect_gate(unsigned long long* held, float m, int menu, unsigned long long play_ms,
                                      unsigned long long scene_ms, unsigned long long scene_run0, unsigned long long now_ms,

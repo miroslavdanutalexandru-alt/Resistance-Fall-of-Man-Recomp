@@ -221,60 +221,70 @@ static void test_gate_cutscene_rearms(void)
     CHECK(rfom_aspect_gate(&held, n, 0, t, 0, 0, t, 1000) == n);
 }
 
-/* The pause menu (g_rfom_pause_ui) with the 3D world still drawn steadily behind it and the camera set
- * now and then: locked at 16:9 once the look code stops, no matter how long; play brings it back at once.
- * A steady scene run that began before the hold does not re-arm it early. */
+/* The pause menu (g_rfom_pause_ui) with the 3D world still drawn steadily behind it (the paused world
+ * sets no camera): locked at 16:9 once the look code stops, no matter how long; play brings it back at
+ * once. A steady scene run that began before the hold does not re-arm it early. */
 static void test_gate_pause_menu_locked(void)
 {
     const float m = (float)(W219 / A169);
-    unsigned long long t = 200000, play = t, scene = 0, run0 = 0, cam = t, held = 0;
-    for (int i = 0; i < 60; i++, t += 16) {   /* gameplay */
-        play = t; rfom_aspect_scene_stamp(&scene, &run0, t);
+    unsigned long long t = 200000, play = t, scene = 0, run0 = 0, cam = t, held = 0, since = 0;
+    int spent = 0;
+    for (int i = 0; i < 60; i++, t += 16) {   /* gameplay, camera set every frame */
+        play = t; cam = t; rfom_aspect_scene_stamp(&scene, &run0, t);
+        CHECK(!rfom_aspect_menu(0, &since, &spent, cam, t));
         CHECK(rfom_aspect_gate(&held, rfom_aspect_present_mul(m, cam, scene, t, 2000, 500, 0), 0, play, scene, run0, t, 1000) == m);
     }
-    const unsigned long long p0 = t;
+    const unsigned long long p0 = t;   /* the pause menu loads its text: the flag goes up */
     int flips = 0; float prev = m;
     for (int i = 0; i < 1000; i++, t += 16) {   /* 16 s in the pause menu */
-        if ((t - p0) % 2000 < 16) cam = t;
+        if (t - p0 < 100) cam = t;   /* the last frames of play still set the camera */
         rfom_aspect_scene_stamp(&scene, &run0, t);
         const float m0 = rfom_aspect_present_mul(m, cam, scene, t, 2000, 500, 0);
         CHECK(m0 == m);   /* without the gate the stretch would stay on */
-        const float g = rfom_aspect_gate(&held, m0, rfom_aspect_menu(1, cam, t), play, scene, run0, t, 1000);
-        if (t - p0 >= RFOM_ASPECT_PLAY_MS + RFOM_ASPECT_MENU_CAM_MS) CHECK(g == 1.0f);
+        const float g = rfom_aspect_gate(&held, m0, rfom_aspect_menu(1, &since, &spent, cam, t), play, scene, run0, t, 1000);
+        if (t - p0 >= RFOM_ASPECT_PLAY_MS) CHECK(g == 1.0f);
         if (g != prev) flips++;
         prev = g;
     }
-    CHECK(flips == 1);
+    CHECK(flips == 1 && !spent);
     /* RFOM_MENU_ASPECT=0 (rearm 0): the 0.3.1 stretch, menu or not */
     {
         unsigned long long h = 0;
         CHECK(rfom_aspect_gate(&h, m, 1, play, scene, run0, t, 0) == m);
     }
-    /* resume: the look code runs again (pause_ui is cleared by the same code, but even if not) */
+    /* resume: the look code runs again (it also clears the flag) */
     play = t;
     CHECK(rfom_aspect_gate(&held, m, 1, play, scene, run0, t, 1000) == m && !held);
+    CHECK(!rfom_aspect_menu(0, &since, &spent, cam, t) && !since);
     /* held at t while a scene run began 5 s before: re-armed only rearm_ms after the hold */
     held = 0;
     const unsigned long long h0 = t + 5000, r5 = t;
     CHECK(rfom_aspect_gate(&held, 1.0f, 0, 0, h0, r5, h0, 1000) == 1.0f && held == h0);
     CHECK(rfom_aspect_gate(&held, m, 0, 0, h0 + 500, r5, h0 + 500, 1000) == 1.0f);
     CHECK(rfom_aspect_gate(&held, m, 0, 0, h0 + 1000, r5, h0 + 1000, 1000) == m && !held);
-    /* a stale pause flag (a text load in play, then a cutscene that sets its camera every frame):
-     * the cutscene is not locked at 16:9, it re-arms like any cutscene */
-    {
-        unsigned long long u = 400000, s = 0, r = 0, h = 0, c = 0;
-        const unsigned long long pl = u - 5000;
-        int on_at = -1;
-        for (int i = 0; i < 100; i++, u += 33) {
-            c = u; rfom_aspect_scene_stamp(&s, &r, u);
-            CHECK(!rfom_aspect_menu(1, c, u));
-            const float g = rfom_aspect_gate(&h, i < 5 ? 1.0f : rfom_aspect_present_mul(m, c, s, u, 2000, 500, 0),
-                                             rfom_aspect_menu(1, c, u), pl, s, r, u, 1000);
-            if (g == m && on_at < 0) on_at = i;
-        }
-        CHECK(on_at > 0 && on_at < 40);
-        CHECK(rfom_aspect_menu(1, 0, u) && rfom_aspect_menu(1, u - 600, u) && !rfom_aspect_menu(0, 0, u));
+}
+
+/* Code review of 9d7b405: a stale pause flag (a text load in play, or restart from the pause menu, then
+ * an in-engine cutscene with no on-foot play to clear it) and a cutscene that sets its camera only every
+ * 2 s: its first camera ends the flag, and the cutscene reaches 21:9 and stays there. */
+static void test_gate_stale_pause_flag_cutscene(void)
+{
+    const float m = (float)(W219 / A169);
+    const unsigned long long u0 = 400000, pl = u0 - 1000;   /* the look code stopped a second before */
+    unsigned long long u = u0, s = 0, r = 0, h = 0, c = u0 - 1000, since = 0;
+    int spent = 0, on_at = -1;
+    for (int i = 0; i < 300; i++, u += 33) {   /* 10 s of cutscene at 30 fps */
+        if (u - u0 >= 1500 && (u - u0 - 1500) % 2000 < 33) c = u;   /* camera at 1.5 s, then every 2 s */
+        rfom_aspect_scene_stamp(&s, &r, u);
+        const float g = rfom_aspect_gate(&h, rfom_aspect_present_mul(m, c, s, u, 2000, 500, 0),
+                                         rfom_aspect_menu(1, &since, &spent, c, u), pl, s, r, u, 1000);
+        if (g == m && on_at < 0) on_at = (int)(u - u0);
+        if (on_at >= 0) CHECK(g == m);   /* once on, no flipping back */
     }
+    CHECK(spent && on_at >= 1500 && on_at <= 2600);
+    /* the flag dropped (play) and raised again (a new pause): it counts again */
+    CHECK(!rfom_aspect_menu(0, &since, &spent, c, u) && !spent);
+    CHECK(rfom_aspect_menu(1, &since, &spent, c, u + 16));
 }
 
 int main(void)
@@ -287,6 +297,7 @@ int main(void)
     test_gate_menus_stay_169();
     test_gate_cutscene_rearms();
     test_gate_pause_menu_locked();
+    test_gate_stale_pause_flag_cutscene();
     if (fails) { fprintf(stderr, "aspect_test: %d failure(s)\n", fails); return 1; }
     printf("aspect_test: all passed\n");
     return 0;
