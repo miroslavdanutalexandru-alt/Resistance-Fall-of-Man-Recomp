@@ -8,6 +8,11 @@ A native PC port of *Resistance: Fall of Man* (PS3) built by static recompilatio
 
 This is a **beta**. The campaign has been played up to Cheddar Gorge. Later levels haven't been tested. Please report what you find (see *Reporting problems*).
 
+## Unreleased
+
+### Fixes
+- **Ultrawide: the menu screen no longer flips between 21:9 and 16:9 (issue #2).** Menus and other screens drawn without player control could set a 3D camera now and then, or draw short bursts of 3D, which turned the stretch on for a moment each time. Now, once the picture is back at its 16:9 letterbox outside play, it stays there until you are in control again (the stretch returns at once) or the game has drawn 3D steadily for a second (cutscenes; a cutscene right after a loading screen may start letterboxed for that second). A pause menu with the level still drawn behind it may settle at 21:9 after that second, but no longer flips. Gameplay, aiming down sights and scopes keep the 21:9 picture as before. `RFOM_ASPECT_REARM_MS=<ms>` (default 1000) sets how long the 3D has to be steady; `RFOM_MENU_ASPECT=0` (or `RFOM_ASPECT_REARM_MS=0`) restores the 0.3.1 behaviour. *Not yet tested at 21:9; please report.*
+
 ## 0.3.1-beta
 
 Released 2026-11-25. Fixes for the reports on 0.3.0 (missing HUD on Windows 10, split-screen, ultrawide, display scaling, Setup on PCs that needed new build tools), smoother videos and frame pacing, less frame generation ghosting, an aim assist option, optional single-player cheats and a native Linux build. Run Setup over your install (or use *Update now* in the launcher); your settings, saves and game copy are kept. This update generates the game code again (new hooks for the cheats and more SPU code compiled ahead of time), so Setup takes longer than a plain update; files that come out the same are not compiled again.
