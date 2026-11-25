@@ -1,0 +1,24 @@
+name: repo-hygiene
+
+# Fails when a tracked path matches the game-file deny patterns of scripts/package_beta.ps1
+# ($strict, read from that script as text), or a tracked file is over 5 MB and not in .github/large-file-allowlist.txt.
+# Reads only file names and sizes; no repository code is run.
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  hygiene:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Deny patterns and size cap
+        run: python3 .github/scripts/repo_hygiene.py
