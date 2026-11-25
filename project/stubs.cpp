@@ -676,6 +676,9 @@ static double rfom_fov_adjust_base(double f);
 static thread_local double tl_hp = 1.0;
 static thread_local int tl_hp_lod = 0;
 static thread_local double tl_hp_aspect = 0.0;   /* the 16:9 aspect a Hor+ camera stood for (LOD fix) */
+static thread_local uint32_t tl_note_cam = 0;    /* the camera object and FOV of this setter call (rfom_fov_note) */
+static thread_local double tl_note_fov = 0.0;
+extern "C" volatile unsigned long long g_rsx_aspect_foreign_ms;   /* rsx_d3d12_backend.c: a camera not used in play was widened */
 static double rfom_target_aspect(void)
 {
     static int mode = -1;          /* 0 off, 1 auto, 2 fixed */
@@ -735,6 +738,15 @@ extern "C" double rfom_fov_adjust(double f)
             tl_hp = w; tl_hp_lod = 1; tl_hp_aspect = base;
             g_rsx_aspect_mul = mul;
             g_rsx_aspect_ms = GetTickCount64();
+            {   /* rfom_aspect_menu: a camera not seen in play (a cutscene's) ends a stale pause-menu flag */
+                static rfom_aspect_camset cs = { {0}, 0 };
+                const unsigned long long pl = g_rfom_play_ms, nw = g_rsx_aspect_ms;
+                const int in_play = pl && (nw <= pl || nw - pl < RFOM_ASPECT_PLAY_MS);
+                AcquireSRWLockExclusive(&lk);
+                const int known = rfom_aspect_cam_known(&cs, rfom_aspect_cam_sig(tl_note_cam, tl_note_fov), in_play);
+                ReleaseSRWLockExclusive(&lk);
+                if (!known) g_rsx_aspect_foreign_ms = nw;
+            }
             { static ULONGLONG t0 = 0; static unsigned n = 0; static int said = 0;   /* once: how often */
               if (said < 2) { if (!t0) t0 = g_rsx_aspect_ms; n++;
                   if (!said) { said = 1; fprintf(stderr, "[aspect] Hor+: 16:9 camera (aspect %.3f) -> %.3f, horizontal FOV tan x%.3f%c", a, t, w, 10); }
@@ -793,6 +805,7 @@ static double rfom_fov_adjust_base(double f)
 static volatile uint32_t s_rfom_view_cam = 0;
 extern "C" void rfom_fov_note(uint32_t cam, double f)
 {
+    tl_note_cam = cam; tl_note_fov = f;
     if (!(f > 1.0 && f < 179.0)) return;
     static int any = -1; if (any < 0) any = getenv("RFOM_FOV_ANYCAM") ? 1 : 0;
     if (fabs(f - 82.0) < 0.01) s_rfom_view_cam = cam;

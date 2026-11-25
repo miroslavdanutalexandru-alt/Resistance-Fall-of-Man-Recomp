@@ -891,6 +891,7 @@ extern u32 cellGcm_get_flip_mode(void);   /* cellGcmSys.c */
 extern int cellVdec_movie_active(unsigned window_ms);   /* cellVdec.c */
 volatile float               g_rsx_aspect_mul = 1.0f;
 volatile unsigned long long  g_rsx_aspect_ms = 0;
+volatile unsigned long long  g_rsx_aspect_foreign_ms = 0;   /* project/stubs.cpp: a widened camera not used in play (rfom_aspect_menu) */
 
 /* Resistance port (v136): internal render resolution. RSX_RES_SCALE=<f>
  * (1 = the PS3's 1280x720; 1.5 = 1920x1080; 2 = 2560x1440; 3 = 3840x2160).
@@ -2400,7 +2401,7 @@ static void gpt_frame_end(void)
  * draws a 3D scene; the replay loop stamps s_aspect_scene_ms with its time. RFOM_ASPECT_SCENE_HOLD (default 500 ms,
  * 0 = off) keeps the Hor+ stretch on while such frames come, after the camera hold (rfom_aspect_present_mul).
  * RFOM_ASPECT_REARM_MS (default 1000, 0 = off = 0.3.1; RFOM_MENU_ASPECT=0 = off too): the pause menu (g_rfom_pause_ui)
- * is 16:9 while the player is not in control, until a camera is set (rfom_aspect_menu), and once the stretch is off outside play (menus, loading
+ * is 16:9 while the player is not in control, until a camera not used in play is set (rfom_aspect_menu), and once the stretch is off outside play (menus, loading
  * screens), it comes back only with the player's look code running again or after that long of steady 3D scene
  * frames (s_aspect_scene_run0 = the first of the run; rfom_aspect_gate), so menus stay at their 16:9 letterbox. */
 static volatile unsigned long long s_aspect_scene_ms, s_aspect_scene_run0;
@@ -2430,7 +2431,7 @@ static float present_aspect_mul(void)
     const unsigned long long now = GetTickCount64(), cam = g_rsx_aspect_ms, scene = s_aspect_scene_ms;
     const float m0 = rfom_aspect_present_mul(g_rsx_aspect_mul, cam, scene, now, (unsigned)hold, (unsigned)shold,
                                              cellGcm_get_flip_mode() == 2);
-    const float m = rfom_aspect_gate(&held, m0, rfom_aspect_menu(g_rfom_pause_ui, &menu_since, &menu_spent, cam, now), g_rfom_play_ms, scene, s_aspect_scene_run0, now, (unsigned)rearm);
+    const float m = rfom_aspect_gate(&held, m0, rfom_aspect_menu(g_rfom_pause_ui, &menu_since, &menu_spent, g_rsx_aspect_foreign_ms, now), g_rfom_play_ms, scene, s_aspect_scene_run0, now, (unsigned)rearm);
     { static float said = 1.0f; static int n = 0;   /* the first changes, for reports */
       if (fabsf(m - said) > 0.001f && n < 40) { n++; said = m;
           const unsigned long long pl = g_rfom_play_ms;

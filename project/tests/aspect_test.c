@@ -221,32 +221,47 @@ static void test_gate_cutscene_rearms(void)
     CHECK(rfom_aspect_gate(&held, n, 0, t, 0, 0, t, 1000) == n);
 }
 
-/* The pause menu (g_rfom_pause_ui) with the 3D world still drawn steadily behind it (the paused world
- * sets no camera): locked at 16:9 once the look code stops, no matter how long; play brings it back at
- * once. A steady scene run that began before the hold does not re-arm it early. */
+/* A widened camera setter call as stubs.cpp makes it: returns its time, and stamps *foreign when the
+ * camera was not used in play. */
+static unsigned long long cam_call(rfom_aspect_camset* cs, unsigned cam, double fov, unsigned long long play,
+                                   unsigned long long now, unsigned long long* foreign)
+{
+    const int in_play = play && (now <= play || now - play < RFOM_ASPECT_PLAY_MS);
+    if (!rfom_aspect_cam_known(cs, rfom_aspect_cam_sig(cam, fov), in_play)) *foreign = now;
+    return now;
+}
+
+/* The pause menu (g_rfom_pause_ui) with the 3D world still drawn steadily behind it and the gameplay
+ * camera set again every 2 s: locked at 16:9 once the look code stops, for as long as it stays open;
+ * play brings it back at once. A steady scene run that began before the hold does not re-arm it early. */
 static void test_gate_pause_menu_locked(void)
 {
     const float m = (float)(W219 / A169);
-    unsigned long long t = 200000, play = t, scene = 0, run0 = 0, cam = t, held = 0, since = 0;
+    rfom_aspect_camset cs = { {0}, 0 };
+    unsigned long long t = 200000, play = t, scene = 0, run0 = 0, cam = t, held = 0, since = 0, foreign = 0;
     int spent = 0;
-    for (int i = 0; i < 60; i++, t += 16) {   /* gameplay, camera set every frame */
-        play = t; cam = t; rfom_aspect_scene_stamp(&scene, &run0, t);
-        CHECK(!rfom_aspect_menu(0, &since, &spent, cam, t));
+    for (int i = 0; i < 60; i++, t += 16) {   /* gameplay: view camera (82), ADS (55), a shadow view */
+        play = t; rfom_aspect_scene_stamp(&scene, &run0, t);
+        cam = cam_call(&cs, 0x30001000u, i % 10 < 7 ? 82.0 : 55.0, play, t, &foreign);
+        cam_call(&cs, 0x30002000u, 30.0, play, t, &foreign);
+        CHECK(!rfom_aspect_menu(0, &since, &spent, foreign, t));
         CHECK(rfom_aspect_gate(&held, rfom_aspect_present_mul(m, cam, scene, t, 2000, 500, 0), 0, play, scene, run0, t, 1000) == m);
     }
+    CHECK(!foreign);
     const unsigned long long p0 = t;   /* the pause menu loads its text: the flag goes up */
     int flips = 0; float prev = m;
     for (int i = 0; i < 1000; i++, t += 16) {   /* 16 s in the pause menu */
-        if (t - p0 < 100) cam = t;   /* the last frames of play still set the camera */
+        if ((t - p0) % 2000 < 16) { cam = cam_call(&cs, 0x30001000u, 82.0, play, t, &foreign);
+                                    cam_call(&cs, 0x30002000u, 30.0, play, t, &foreign); }
         rfom_aspect_scene_stamp(&scene, &run0, t);
         const float m0 = rfom_aspect_present_mul(m, cam, scene, t, 2000, 500, 0);
         CHECK(m0 == m);   /* without the gate the stretch would stay on */
-        const float g = rfom_aspect_gate(&held, m0, rfom_aspect_menu(1, &since, &spent, cam, t), play, scene, run0, t, 1000);
+        const float g = rfom_aspect_gate(&held, m0, rfom_aspect_menu(1, &since, &spent, foreign, t), play, scene, run0, t, 1000);
         if (t - p0 >= RFOM_ASPECT_PLAY_MS) CHECK(g == 1.0f);
         if (g != prev) flips++;
         prev = g;
     }
-    CHECK(flips == 1 && !spent);
+    CHECK(flips == 1 && !spent && !foreign);
     /* RFOM_MENU_ASPECT=0 (rearm 0): the 0.3.1 stretch, menu or not */
     {
         unsigned long long h = 0;
@@ -255,7 +270,7 @@ static void test_gate_pause_menu_locked(void)
     /* resume: the look code runs again (it also clears the flag) */
     play = t;
     CHECK(rfom_aspect_gate(&held, m, 1, play, scene, run0, t, 1000) == m && !held);
-    CHECK(!rfom_aspect_menu(0, &since, &spent, cam, t) && !since);
+    CHECK(!rfom_aspect_menu(0, &since, &spent, foreign, t) && !since);
     /* held at t while a scene run began 5 s before: re-armed only rearm_ms after the hold */
     held = 0;
     const unsigned long long h0 = t + 5000, r5 = t;
@@ -264,27 +279,47 @@ static void test_gate_pause_menu_locked(void)
     CHECK(rfom_aspect_gate(&held, m, 0, 0, h0 + 1000, r5, h0 + 1000, 1000) == m && !held);
 }
 
-/* Code review of 9d7b405: a stale pause flag (a text load in play, or restart from the pause menu, then
- * an in-engine cutscene with no on-foot play to clear it) and a cutscene that sets its camera only every
- * 2 s: its first camera ends the flag, and the cutscene reaches 21:9 and stays there. */
+/* Code review of 9d7b405: a stale pause flag (a text load in play, then an in-engine cutscene with no
+ * on-foot play to clear it) and a cutscene that sets its own camera only at 1.5 s and then every 2 s:
+ * that camera ends the flag, and the cutscene reaches 21:9 and stays there. A cutscene that re-uses
+ * the view camera with a new field of view counts as its own camera too. */
 static void test_gate_stale_pause_flag_cutscene(void)
 {
     const float m = (float)(W219 / A169);
-    const unsigned long long u0 = 400000, pl = u0 - 1000;   /* the look code stopped a second before */
-    unsigned long long u = u0, s = 0, r = 0, h = 0, c = u0 - 1000, since = 0;
-    int spent = 0, on_at = -1;
-    for (int i = 0; i < 300; i++, u += 33) {   /* 10 s of cutscene at 30 fps */
-        if (u - u0 >= 1500 && (u - u0 - 1500) % 2000 < 33) c = u;   /* camera at 1.5 s, then every 2 s */
-        rfom_aspect_scene_stamp(&s, &r, u);
-        const float g = rfom_aspect_gate(&h, rfom_aspect_present_mul(m, c, s, u, 2000, 500, 0),
-                                         rfom_aspect_menu(1, &since, &spent, c, u), pl, s, r, u, 1000);
-        if (g == m && on_at < 0) on_at = (int)(u - u0);
-        if (on_at >= 0) CHECK(g == m);   /* once on, no flipping back */
+    for (int variant = 0; variant < 2; variant++) {
+        rfom_aspect_camset cs = { {0}, 0 };
+        const unsigned long long u0 = 400000, pl = u0 - 1000;   /* the look code stopped a second before */
+        unsigned long long u = u0, s = 0, r = 0, h = 0, c = 0, since = 0, foreign = 0;
+        int spent = 0, on_at = -1;
+        c = cam_call(&cs, 0x30001000u, 82.0, pl, pl, &foreign);   /* the last play frame */
+        for (int i = 0; i < 300; i++, u += 33) {   /* 10 s of cutscene at 30 fps */
+            if (u - u0 >= 1500 && (u - u0 - 1500) % 2000 < 33)
+                c = variant ? cam_call(&cs, 0x30001000u, 60.0, pl, u, &foreign) : cam_call(&cs, 0x30005000u, 82.0, pl, u, &foreign);
+            rfom_aspect_scene_stamp(&s, &r, u);
+            const float g = rfom_aspect_gate(&h, rfom_aspect_present_mul(m, c, s, u, 2000, 500, 0),
+                                             rfom_aspect_menu(1, &since, &spent, foreign, u), pl, s, r, u, 1000);
+            if (g == m && on_at < 0) on_at = (int)(u - u0);
+            if (on_at >= 0) CHECK(g == m);   /* once on, no flipping back */
+        }
+        CHECK(spent && on_at >= 1500 && on_at <= 2600);
+        /* the flag dropped (play) and raised again (a new pause): it counts again */
+        CHECK(!rfom_aspect_menu(0, &since, &spent, foreign, u) && !spent);
+        CHECK(rfom_aspect_menu(1, &since, &spent, foreign, u + 16));
     }
-    CHECK(spent && on_at >= 1500 && on_at <= 2600);
-    /* the flag dropped (play) and raised again (a new pause): it counts again */
-    CHECK(!rfom_aspect_menu(0, &since, &spent, c, u) && !spent);
-    CHECK(rfom_aspect_menu(1, &since, &spent, c, u + 16));
+}
+
+/* The play camera set: most recent first, bounded; outside play nothing new is learned. */
+static void test_camset(void)
+{
+    rfom_aspect_camset cs = { {0}, 0 };
+    for (unsigned k = 0; k < 20; k++) CHECK(rfom_aspect_cam_known(&cs, rfom_aspect_cam_sig(0x1000u + k, 82.0), 1));
+    CHECK(cs.n == RFOM_ASPECT_CAMSET_N && cs.sig[0] == rfom_aspect_cam_sig(0x1000u + 19, 82.0));
+    CHECK(rfom_aspect_cam_known(&cs, rfom_aspect_cam_sig(0x1000u + 12, 82.0), 0));    /* still in the set */
+    CHECK(!rfom_aspect_cam_known(&cs, rfom_aspect_cam_sig(0x1000u + 2, 82.0), 0));    /* pushed out */
+    CHECK(!rfom_aspect_cam_known(&cs, rfom_aspect_cam_sig(0x9000u, 82.0), 0));
+    CHECK(!rfom_aspect_cam_known(&cs, rfom_aspect_cam_sig(0x9000u, 82.0), 0));        /* not learned */
+    CHECK(rfom_aspect_cam_sig(0x1000u, 82.0) == rfom_aspect_cam_sig(0x1000u, 82.001));
+    CHECK(rfom_aspect_cam_sig(0x1000u, 82.0) != rfom_aspect_cam_sig(0x1000u, 60.0));
 }
 
 int main(void)
@@ -298,6 +333,7 @@ int main(void)
     test_gate_cutscene_rearms();
     test_gate_pause_menu_locked();
     test_gate_stale_pause_flag_cutscene();
+    test_camset();
     if (fails) { fprintf(stderr, "aspect_test: %d failure(s)\n", fails); return 1; }
     printf("aspect_test: all passed\n");
     return 0;

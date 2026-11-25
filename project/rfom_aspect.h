@@ -116,19 +116,43 @@ static inline float rfom_aspect_present_mul(float mul, unsigned long long last_m
 #define RFOM_ASPECT_MENU_CAM_MS 500u
 /* The menu input of rfom_aspect_gate. The pause menu flag (g_rfom_pause_ui) is set by a text load
  * soon after play and cleared only by on-foot play or a level load, so it can outlive the pause
- * menu (restart into an in-engine intro, a text load before a cutscene or vehicle section). It
- * counts only until a widened camera is set more than RFOM_ASPECT_MENU_CAM_MS after it was raised
- * (the paused world is not re-shot; any cutscene sets its camera at least on its cuts, however
- * seldom), and that ends it for good, until the flag drops and is raised again.
- * *since: when the flag was seen raised (0 = down), *spent: it was ended by a camera;
- * cam_ms: the last widened camera (0 = none). */
+ * menu (a text load in play followed by a cutscene or vehicle section). The paused world keeps
+ * re-setting the camera(s) it had in play now and then; a cutscene sets cameras of its own (another
+ * camera object or field of view). So the flag counts only until a camera that was not used in play
+ * (rfom_aspect_cam_known) is set more than RFOM_ASPECT_MENU_CAM_MS after the flag went up
+ * (foreign_ms: the last such camera, 0 = none), and that ends it for good, until the flag drops
+ * and is raised again. *since: when the flag was seen raised (0 = down), *spent: ended. */
 static inline int rfom_aspect_menu(int pause_ui, unsigned long long* since, int* spent,
-                                   unsigned long long cam_ms, unsigned long long now_ms)
+                                   unsigned long long foreign_ms, unsigned long long now_ms)
 {
     if (!pause_ui) { *since = 0; *spent = 0; return 0; }
     if (!*since) *since = now_ms ? now_ms : 1;
-    if (cam_ms && cam_ms > *since && cam_ms - *since >= RFOM_ASPECT_MENU_CAM_MS) *spent = 1;
+    if (foreign_ms && foreign_ms > *since && foreign_ms - *since >= RFOM_ASPECT_MENU_CAM_MS) *spent = 1;
     return !*spent;
+}
+
+/* The cameras widened while the player was in control: their signatures (camera object and the
+ * field of view the game gave it), most recent first. */
+#define RFOM_ASPECT_CAMSET_N 8
+typedef struct rfom_aspect_camset { unsigned sig[RFOM_ASPECT_CAMSET_N]; unsigned n; } rfom_aspect_camset;
+static inline unsigned rfom_aspect_cam_sig(unsigned cam, double fov)
+{
+    return cam * 2654435761u ^ (unsigned)(long long)floor(fov * 100.0 + 0.5);
+}
+/* One widened camera setter call: in play (in_play), remember it and return 1; outside play,
+ * return whether it is one of the play cameras (1) or a foreign one (0, a cutscene's). */
+static inline int rfom_aspect_cam_known(rfom_aspect_camset* s, unsigned sig, int in_play)
+{
+    unsigned i = 0;
+    while (i < s->n && s->sig[i] != sig) i++;
+    if (i == s->n) {
+        if (!in_play) return 0;
+        if (s->n < RFOM_ASPECT_CAMSET_N) s->n++;
+        i = s->n - 1;
+    }
+    for (; i > 0; i--) s->sig[i] = s->sig[i - 1];
+    s->sig[0] = sig;
+    return 1;
 }
 static inline float rfom_aspect_gate(unsigned long long* held, float m, int menu, unsigned long long play_ms,
                                      unsigned long long scene_ms, unsigned long long scene_run0, unsigned long long now_ms,
