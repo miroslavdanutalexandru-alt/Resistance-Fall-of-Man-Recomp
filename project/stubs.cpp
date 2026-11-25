@@ -659,7 +659,13 @@ extern "C" void rfom_fov_set_live(double deg) { s_rfom_fov_live = deg > 0.0 ? de
  * loading screens, 2D briefing / stats screens and menus, which set no 3D camera,
  * go back to their 16:9 letterbox; it ends at once when the target aspect has been
  * 16:9 for RFOM_ASPECT_OFF_MS (default 1000), and pauses while a movie plays
- * (flip mode 2), so movies keep their 16:9 letterbox.
+ * (flip mode 2), so movies keep their 16:9 letterbox. Once it is off outside play,
+ * menus included (issue #2 on 0.3.1: the menu screen kept flipping 21:9 / 16:9),
+ * it stays off until the on-foot look code runs again (g_rfom_play_ms, < 250 ms)
+ * or a 3D scene has been drawn steadily for RFOM_ASPECT_REARM_MS (default 1000;
+ * 0 = off, the 0.3.1 behaviour, as is RFOM_MENU_ASPECT=0; rfom_aspect_gate); the
+ * pause menu (g_rfom_pause_ui) is 16:9 even with the level drawn behind it. The front end's main menu
+ * (ResistanceFoM.exe) has no camera hook and is never stretched.
  *   RFOM_ASPECT=auto (default): the game window's aspect | off | 21:9 | 32:9 | 2.39 ...
  * The hook passes the aspect as a NEGATIVE argument to rfom_fov_adjust (the
  * only per-call port function the lifted code declares there): it returns the

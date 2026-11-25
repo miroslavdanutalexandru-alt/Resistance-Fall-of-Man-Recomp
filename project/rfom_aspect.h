@@ -17,7 +17,11 @@
  * them letterboxed. So the stretch also needs a recent widened camera -- one
  * within recent_ms (RFOM_ASPECT_HOLD, default 2000; ADS / scope cameras count),
  * or 3D scene frames still being drawn since (RFOM_ASPECT_SCENE_HOLD) -- see
- * rfom_aspect_present_mul. */
+ * rfom_aspect_present_mul.
+ * Once the present is back at 16:9 outside play (a menu, loading or 2D screen), it
+ * stays there until the player is in control again or a 3D scene has been drawn
+ * steadily for a while (RFOM_ASPECT_REARM_MS) -- see rfom_aspect_gate. Without that,
+ * menus in the game program flipped between 21:9 and 16:9 (issue #2 on 0.3.1). */
 #ifndef RFOM_ASPECT_H
 #define RFOM_ASPECT_H
 
@@ -89,6 +93,60 @@ static inline float rfom_aspect_present_mul(float mul, unsigned long long last_m
     if (!recent_ms || now_ms <= last_ms || now_ms - last_ms < recent_ms) return mul;
     if (scene_hold_ms && scene_ms && (now_ms <= scene_ms || now_ms - scene_ms < scene_hold_ms)) return mul;
     return 1.0f;
+}
+
+/* Issue #2 on 0.3.1: "the menu screen keeps stretching to 21:9 then back to 16:9". Screens
+ * without player control (the pause menu and its pages, loading / briefing screens) can still
+ * get a camera setter call now and then, or a burst of depth-tested draws (the menus' 3D
+ * buttons), and each one turned the stretch on for the camera / scene hold: on, off, on ...
+ * The gate: once the stretch m (rfom_aspect_present_mul) has been off, *held is set (to that
+ * time; 0 = not held) and it stays off until either
+ *  - the player is in control: the game's on-foot look code ran within RFOM_ASPECT_PLAY_MS
+ *    (play_ms: its last run, 0 = never) -- gameplay and aiming get the stretch back at once;
+ *  - or a 3D scene has been drawn steadily for rearm_ms since the hold began (in-engine
+ *    cutscenes, vehicles): scene frames (scene_ms: the last, scene_run0: the first of the
+ *    current run, in which no two were more than RFOM_ASPECT_SCENE_GAP_MS apart) still coming.
+ * A stretch that is on stays on (in play, the gate never turns it off), except in a known
+ * menu: menu != 0 (the game's pause menu loaded its text, g_rfom_pause_ui) while the player
+ * is not in control locks it at 16:9 even with the 3D world drawn steadily behind it.
+ * rearm_ms 0 = off (RFOM_MENU_ASPECT=0 / RFOM_ASPECT_REARM_MS=0, 0.3.1: m as is). The cost:
+ * a cutscene that follows a loading screen keeps its letterbox for its first rearm_ms. */
+#define RFOM_ASPECT_PLAY_MS 250u
+#define RFOM_ASPECT_SCENE_GAP_MS 250u
+#define RFOM_ASPECT_MENU_CAM_MS 500u
+/* The menu input of rfom_aspect_gate: the pause menu flag (g_rfom_pause_ui, set by a text load
+ * soon after play) counts only while no widened camera was set within RFOM_ASPECT_MENU_CAM_MS
+ * (cam_ms: the last, 0 = none). A paused world is not re-shot every frame; a cutscene moves its
+ * camera, so a stale flag (a text load followed by a cutscene) cannot letterbox the cutscene. */
+static inline int rfom_aspect_menu(int pause_ui, unsigned long long cam_ms, unsigned long long now_ms)
+{
+    return pause_ui && (!cam_ms || (now_ms > cam_ms && now_ms - cam_ms >= RFOM_ASPECT_MENU_CAM_MS));
+}
+static inline float rfom_aspect_gate(unsigned long long* held, float m, int menu, unsigned long long play_ms,
+                                     unsigned long long scene_ms, unsigned long long scene_run0, unsigned long long now_ms,
+                                     unsigned rearm_ms)
+{
+    if (!rearm_ms) return m;
+    const int play = play_ms && (now_ms <= play_ms || now_ms - play_ms < RFOM_ASPECT_PLAY_MS);
+    if (menu && !play) { *held = now_ms ? now_ms : 1; return 1.0f; }   /* renewed: scene runs count from the menu's last frame */
+    if (m == 1.0f) { if (!*held) *held = now_ms ? now_ms : 1; return 1.0f; }
+    if (!*held) return m;
+    if (play) { *held = 0; return m; }
+    /* a steady scene counts from the hold on: the 3D world still drawn behind a menu does not re-arm at once */
+    const unsigned long long r0 = scene_run0 > *held ? scene_run0 : *held;
+    if (scene_ms && scene_run0 && scene_ms >= r0 && scene_ms - r0 >= rearm_ms
+        && (now_ms <= scene_ms || now_ms - scene_ms < RFOM_ASPECT_SCENE_GAP_MS)) { *held = 0; return m; }
+    return 1.0f;
+}
+
+/* The replay loop's stamp of a 3D scene frame at now_ms: *last = its time, *run0 = the first frame
+ * of the current steady run (restarted after a gap of more than RFOM_ASPECT_SCENE_GAP_MS). */
+static inline void rfom_aspect_scene_stamp(volatile unsigned long long* last, volatile unsigned long long* run0,
+                                           unsigned long long now_ms)
+{
+    const unsigned long long l = *last;
+    if (!l || !*run0 || now_ms < l || now_ms - l > RFOM_ASPECT_SCENE_GAP_MS) *run0 = now_ms;
+    *last = now_ms;
 }
 
 #endif

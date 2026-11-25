@@ -2398,8 +2398,12 @@ static void gpt_frame_end(void)
  * the swap chain, letterboxed to its aspect, and present. */
 /* RFOM_ASPECT_SCENE_DRAWS (default 32, 0 = off): a guest frame with this many depth-tested, depth-writing draws
  * draws a 3D scene; the replay loop stamps s_aspect_scene_ms with its time. RFOM_ASPECT_SCENE_HOLD (default 500 ms,
- * 0 = off) keeps the Hor+ stretch on while such frames come, after the camera hold (rfom_aspect_present_mul). */
-static volatile unsigned long long s_aspect_scene_ms;
+ * 0 = off) keeps the Hor+ stretch on while such frames come, after the camera hold (rfom_aspect_present_mul).
+ * RFOM_ASPECT_REARM_MS (default 1000, 0 = off = 0.3.1; RFOM_MENU_ASPECT=0 = off too): the pause menu (g_rfom_pause_ui)
+ * is 16:9 while the player is not in control and no camera is being set (rfom_aspect_menu), and once the stretch is off outside play (menus, loading
+ * screens), it comes back only with the player's look code running again or after that long of steady 3D scene
+ * frames (s_aspect_scene_run0 = the first of the run; rfom_aspect_gate), so menus stay at their 16:9 letterbox. */
+static volatile unsigned long long s_aspect_scene_ms, s_aspect_scene_run0;
 static u32 s_aspect_scene_n;
 static u32 aspect_scene_draws(void)
 {
@@ -2413,17 +2417,25 @@ static float present_aspect_mul(void)
     /* project/rfom_aspect.h: while a widened camera (gameplay, ADS, scope) was set within RFOM_ASPECT_HOLD ms
      * (default 2000, 0 = no timeout), or 3D scene frames keep coming after it (RFOM_ASPECT_SCENE_HOLD), so 2D
      * screens are letterboxed again but gameplay keeps the stretch between camera setter calls (issue #2). */
-    static int hold = -1, shold = -1;
+    static int hold = -1, shold = -1, rearm = -1;
+    static unsigned long long held = 0;
     if (hold < 0) { const char* e = getenv("RFOM_ASPECT_HOLD"); hold = e ? atoi(e) : 2000; if (hold < 0) hold = 0; }
     if (shold < 0) { const char* e = getenv("RFOM_ASPECT_SCENE_HOLD"); shold = e && *e ? atoi(e) : 500; if (shold < 0) shold = 0;
                      if (!aspect_scene_draws()) shold = 0; }
+    if (rearm < 0) { const char* e = getenv("RFOM_ASPECT_REARM_MS"); rearm = e && *e ? atoi(e) : 1000; if (rearm < 0) rearm = 0;
+                     e = getenv("RFOM_MENU_ASPECT"); if (e && *e && !atoi(e)) rearm = 0; }   /* RFOM_MENU_ASPECT=0: 0.3.1 */
+    extern volatile unsigned long long g_rfom_play_ms;   /* cellPad.c / project/stubs.cpp: the on-foot look code last ran */
+    extern volatile int g_rfom_pause_ui;                 /* cellPad.c / project/stubs.cpp: the pause menu loaded its text */
     const unsigned long long now = GetTickCount64(), cam = g_rsx_aspect_ms, scene = s_aspect_scene_ms;
-    const float m = rfom_aspect_present_mul(g_rsx_aspect_mul, cam, scene, now, (unsigned)hold, (unsigned)shold,
-                                            cellGcm_get_flip_mode() == 2);
+    const float m0 = rfom_aspect_present_mul(g_rsx_aspect_mul, cam, scene, now, (unsigned)hold, (unsigned)shold,
+                                             cellGcm_get_flip_mode() == 2);
+    const float m = rfom_aspect_gate(&held, m0, rfom_aspect_menu(g_rfom_pause_ui, cam, now), g_rfom_play_ms, scene, s_aspect_scene_run0, now, (unsigned)rearm);
     { static float said = 1.0f; static int n = 0;   /* the first changes, for reports */
       if (fabsf(m - said) > 0.001f && n < 40) { n++; said = m;
-          fprintf(stderr, "[aspect] present stretch x%.3f (camera set %lld ms ago, 3D scene %lld ms ago)%c", (double)m,
-                  cam ? (long long)(now - cam) : -1LL, scene ? (long long)(now - scene) : -1LL, 10); } }
+          const unsigned long long pl = g_rfom_play_ms;
+          fprintf(stderr, "[aspect] present stretch x%.3f (camera set %lld ms ago, 3D scene %lld ms ago, look code %lld ms ago)%s%c", (double)m,
+                  cam ? (long long)(now - cam) : -1LL, scene ? (long long)(now - scene) : -1LL, pl ? (long long)(now - pl) : -1LL,
+                  m != m0 ? ": held at 16:9 until play or a steady 3D scene (RFOM_ASPECT_REARM_MS)" : "", 10); } }
     return m;
 }
 
@@ -13101,7 +13113,7 @@ static void render_frame_impl(void)
                 if (((dr->cmask >> 4) & RSX_X_DBOUNDS) && (!f_db_ok || f_db[0] != dr->dbmin || f_db[1] != dr->dbmax)) {
                     mtrp_dbounds(dr->dbmin, dr->dbmax); f_db[0] = dr->dbmin; f_db[1] = dr->dbmax; f_db_ok = 1; }
                 if ((dr->cull & 0x700u) == 0x700u && ++s_aspect_scene_n == aspect_scene_draws())
-                    s_aspect_scene_ms = GetTickCount64();   /* this frame draws a 3D scene (Hor+ present stretch) */
+                    rfom_aspect_scene_stamp(&s_aspect_scene_ms, &s_aspect_scene_run0, GetTickCount64());   /* this frame draws a 3D scene (Hor+ present stretch) */
                 if (cur_rt < 0 && hud169_on()) {   /* RSX_HUD_FIX (old: RFOM_HUD_169) */
                     u32 hk;
                     if ((dr->cull & 0x100u) && (dr->cull & 0x400u)) s_hud169_scene = 1;
