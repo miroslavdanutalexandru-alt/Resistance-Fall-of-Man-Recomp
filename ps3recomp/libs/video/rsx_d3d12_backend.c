@@ -2423,7 +2423,8 @@ static float present_aspect_mul(void)
     if (shold < 0) { const char* e = getenv("RFOM_ASPECT_SCENE_HOLD"); shold = e && *e ? atoi(e) : 500; if (shold < 0) shold = 0;
                      if (!aspect_scene_draws()) shold = 0; }
     if (rearm < 0) { const char* e = getenv("RFOM_ASPECT_REARM_MS"); rearm = e && *e ? atoi(e) : 1000; if (rearm < 0) rearm = 0;
-                     e = getenv("RFOM_MENU_ASPECT"); if (e && *e && !atoi(e)) rearm = 0; }   /* RFOM_MENU_ASPECT=0: 0.3.1 */
+                     e = getenv("RFOM_MENU_ASPECT"); if (e && *e && !atoi(e)) rearm = 0;     /* RFOM_MENU_ASPECT=0: 0.3.1 */
+                     if (!aspect_scene_draws()) rearm = 0; }   /* no scene stamps to re-arm from: 0.3.1 */
     extern volatile unsigned long long g_rfom_play_ms;   /* cellPad.c / project/stubs.cpp: the on-foot look code last ran */
     const unsigned long long now = GetTickCount64(), cam = g_rsx_aspect_ms, scene = s_aspect_scene_ms;
     const float m0 = rfom_aspect_present_mul(g_rsx_aspect_mul, cam, scene, now, (unsigned)hold, (unsigned)shold,
