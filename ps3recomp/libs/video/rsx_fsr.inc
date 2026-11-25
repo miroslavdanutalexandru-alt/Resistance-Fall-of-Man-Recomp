@@ -627,7 +627,8 @@ static int fsr_vm_near(int vs_idx, const char* csrc, u32 fr)
  * frame -- its fragment program or a texture changed (animated material, display, muzzle glow on the weapon) --
  * looks for last frame's draws of the same program and mesh size under any material, verified the same way with a
  * tighter limit (0.05 ndc). Match type 8 (purple).
- * RSX_DLSS_MV_REMATCH_N (default 256): at most this many draws a frame are re-matched (FIFO thread cost). */
+ * RSX_DLSS_MV_REMATCH_N (default 256) / RSX_DLSS_MV_REMATCH_US (default 500): at most this many draws / microseconds a frame
+ * are spent re-matching (FIFO thread cost); the rest keep the old camera-only motion ("over budget"). */
 static int fsr_mv_rematch_on(void)
 {
     static int v = -1;
@@ -717,8 +718,37 @@ static int fsr_rm_camera(u32 fr, double M[16])
 }
 /* Re-match: pick one of cand[0..nc) (previous-frame slots of ring pr) as this draw's previous-frame draw, or -1.
  * *vl = the pick won on the view-locked (stayed on screen) term. */
+/* RSX_DLSS_MV_REMATCH_US (default 500, 0 = no limit): FIFO-thread time a frame may spend re-matching, in TSC ticks */
+static u64 fsr_rm_tsc_cap(void)
+{
+    static int us = -1; static u64 t0, cap; static LARGE_INTEGER q0, qf;
+    if (us < 0) { us = dlss_env_i("RSX_DLSS_MV_REMATCH_US", 500, 0, 100000); QueryPerformanceFrequency(&qf); QueryPerformanceCounter(&q0); t0 = __rdtsc(); }
+    if (!us) return 0;
+    if (!cap) {   /* TSC rate from the first >= 50 ms after start-up (3 GHz until then) */
+        LARGE_INTEGER q1; QueryPerformanceCounter(&q1);
+        const double s = qf.QuadPart ? (double)(q1.QuadPart - q0.QuadPart) / (double)qf.QuadPart : 0.0;
+        if (s < 0.05) return (u64)us * 3000u;
+        cap = (u64)((double)(__rdtsc() - t0) / s * 1e-6 * us); if (!cap) cap = 1;
+    }
+    return cap;
+}
+static int fsr_rematch_body(int vs_idx, const char* csrc, const float* epi, const u32* rows, u32 nr, u32 fr, u32 ring, u32 slot,
+                            const u32* cand, int nc, double lim, int* vl);
 static int fsr_rematch(int vs_idx, const char* csrc, const float* epi, const u32* rows, u32 nr, u32 fr, u32 ring, u32 slot,
                        const u32* cand, int nc, double lim, int* vl)
+{
+    static u32 tf; static u64 used;   /* FIFO thread only */
+    *vl = 0;
+    if (tf != fr) { tf = fr; used = 0; }
+    const u64 cap = fsr_rm_tsc_cap();
+    if (cap && used >= cap) { s_mvr_st[MVR_RM_BUDGET]++; return -1; }
+    const u64 t0 = __rdtsc();
+    const int r = fsr_rematch_body(vs_idx, csrc, epi, rows, nr, fr, ring, slot, cand, nc, lim, vl);
+    used += __rdtsc() - t0;
+    return r;
+}
+static int fsr_rematch_body(int vs_idx, const char* csrc, const float* epi, const u32* rows, u32 nr, u32 fr, u32 ring, u32 slot,
+                            const u32* cand, int nc, double lim, int* vl)
 {
     *vl = 0;
     if (nc <= 0 || vs_idx < 0 || vs_idx >= s_d3d.vp_vs_n || !nr) return -1;
