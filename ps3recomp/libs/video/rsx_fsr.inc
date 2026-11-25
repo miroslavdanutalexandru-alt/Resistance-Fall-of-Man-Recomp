@@ -266,8 +266,14 @@ static u32   s_fsr_lnext[FSR_RING][FSR_HIST_SLOTS];
 /* record-side object-motion counters for the "[DLSS] object motion/600" line (PORT_STATS_LOG=1) */
 enum { MVR_RM_OK, MVR_RM_VL, MVR_LOOSE_OK, MVR_RM_UNCLEAR, MVR_RM_NOPROBE, MVR_RM_NOEVAL, MVR_RM_NOREF, MVR_RM_BUDGET,
        MVR_AMB_DROP, MVR_NOKEY, MVR_LOOSE_FAIL, MVR_CAM_SPLIT, MVR_CAM_FILL,
-       MVR_CO_RIGID, MVR_CO_SKIN, MVR_CO_NOEVAL, MVR_CO_UNK, MVR_CO_NEAR, MVR_N };
+       MVR_CO_RIGID, MVR_CO_SKIN, MVR_CO_NOEVAL, MVR_CO_UNK, MVR_CO_NEAR, MVR_RM_NEARX, MVR_N };
 static volatile u32 s_mvr_st[MVR_N];
+/* why a draw kept camera-only motion (dr->fsr_why): stage << 4 | re-match failure */
+enum { MVW_NONE, MVW_BUDGET, MVW_UNCLEAR, MVW_NOPROBE, MVW_NOEVAL, MVW_NOREF, MVW_NOCAND, MVW_OFF, MVW_N };
+enum { MVWS_NONE, MVWS_AMBIG, MVWS_LOOSE, MVWS_NOLOOSE, MVWS_OTHER, MVWS_N };
+static int s_rm_why;   /* FIFO thread: the last fsr_rematch failure (MVW_*) */
+/* camera-only draws whose origin is within RSX_DLSS_VIEWMODEL_W of the eye (weapon / arms), by stage and failure */
+static volatile u32 s_mvn_st[MVWS_N][MVW_N], s_mvn_w[7];
 /* render-side: scene draws the motion pass did not replay, by reason (fsr_mv_replay) */
 enum { MVS_DRAWN, MVS_BLEND_RX, MVS_MODUL, MVS_COLOUR_OFF, MVS_DEPTH_OFF, MVS_CUTOUT, MVS_SUBVP, MVS_FPKILL, MVS_NOPSO, MVS_LATE, MVS_N };
 static u32 s_mvs_st[MVS_N];
@@ -627,8 +633,11 @@ static int fsr_vm_near(int vs_idx, const char* csrc, u32 fr)
  * frame -- its fragment program or a texture changed (animated material, display, muzzle glow on the weapon) --
  * looks for last frame's draws of the same program and mesh size under any material, verified the same way with a
  * tighter limit (0.05 ndc). Match type 8 (purple).
- * RSX_DLSS_MV_REMATCH_N (default 256) / RSX_DLSS_MV_REMATCH_US (default 500): at most this many draws / microseconds a frame
- * are spent re-matching (FIFO thread cost); the rest keep the old camera-only motion ("over budget"). */
+ * RSX_DLSS_MV_REMATCH_N (default 256) / RSX_DLSS_MV_REMATCH_US (default 2000): at most this many draws / microseconds a frame
+ * are spent re-matching (FIFO thread cost); the rest keep the old camera-only motion ("over budget") -- except draws
+ * whose origin is within RSX_DLSS_VIEWMODEL_W of the eye (weapon / arms, drawn after the world): still re-matched.
+ * RSX_DLSS_MV_DIAG=1 (diagnostic, default 0): every scene draw's origin is probed (clip x, y, w) and, while frame
+ * generation is on, every 3rd frame's draws within 4 units of the eye are logged ([FG-MVN] lines, at most 300 frames). */
 static int fsr_mv_rematch_on(void)
 {
     static int v = -1;
@@ -653,6 +662,7 @@ static int fsr_mv_loose_on(void)
                                                                                : "camera motion (RSX_DLSS_MV_LOOSE=0)", 10); }
     return v;
 }
+static int fsr_mv_diag(void) { static int v = -1; if (v < 0) { v = dlss_env_i("RSX_DLSS_MV_DIAG", 0, 0, 1); if (v) fprintf(stderr, "[DLSS] RSX_DLSS_MV_DIAG=1: every draw's origin probed, [FG-MVN] lines while frame generation is on%c", 10); } return v; }
 static int fsr_mv_rm_n(void) { static int v = -1; if (v < 0) v = dlss_env_i("RSX_DLSS_MV_REMATCH_N", 256, 0, 8192); return v; }
 static double fsr_mv_rm_ratio(void)
 {
@@ -718,11 +728,11 @@ static int fsr_rm_camera(u32 fr, double M[16])
 }
 /* Re-match: pick one of cand[0..nc) (previous-frame slots of ring pr) as this draw's previous-frame draw, or -1.
  * *vl = the pick won on the view-locked (stayed on screen) term. */
-/* RSX_DLSS_MV_REMATCH_US (default 500, 0 = no limit): FIFO-thread time a frame may spend re-matching, in TSC ticks */
+/* RSX_DLSS_MV_REMATCH_US (default 2000, 0 = no limit): FIFO-thread time a frame may spend re-matching, in TSC ticks */
 static u64 fsr_rm_tsc_cap(void)
 {
     static int us = -1; static u64 t0, cap; static LARGE_INTEGER q0, qf;
-    if (us < 0) { us = dlss_env_i("RSX_DLSS_MV_REMATCH_US", 500, 0, 100000); QueryPerformanceFrequency(&qf); QueryPerformanceCounter(&q0); t0 = __rdtsc(); }
+    if (us < 0) { us = dlss_env_i("RSX_DLSS_MV_REMATCH_US", 2000, 0, 100000); QueryPerformanceFrequency(&qf); QueryPerformanceCounter(&q0); t0 = __rdtsc(); }
     if (!us) return 0;
     if (!cap) {   /* TSC rate from the first >= 50 ms after start-up (3 GHz until then) */
         LARGE_INTEGER q1; QueryPerformanceCounter(&q1);
@@ -734,6 +744,21 @@ static u64 fsr_rm_tsc_cap(void)
 }
 static int fsr_rematch_body(int vs_idx, const char* csrc, const float* epi, const u32* rows, u32 nr, u32 fr, u32 ring, u32 slot,
                             const u32* cand, int nc, double lim, int* vl);
+static int fsr_rm_fail(int mvr, int why) { s_mvr_st[mvr]++; s_rm_why = why; return -1; }
+/* the draw's object origin (one vertex-program run) lies within RSX_DLSS_VIEWMODEL_W of the eye: weapon / arms */
+static int fsr_rm_near_quick(int vs_idx, const char* csrc, const float* epi)
+{
+    const float vm = fsr_vm_w();
+    if (!fsr_mv_viewlock_on() || !(vm > 0.0f) || vs_idx < 0 || vs_idx >= s_d3d.vp_vs_n) return 0;
+    const VPVSEntry* ve = &s_d3d.vp_vs[vs_idx];
+    if (!ve->ucode || !ve->ucode_n) return 0;
+    CamProg* pg = fsr_cam_prog(ve);
+    if (pg->pk == 2) return 0;
+    fsr_prog_st(ve, pg, csrc);
+    float o[4], q[4];
+    if (!fsr_probe(ve, pg, (const float*)csrc, epi, 0, o, q)) return 0;
+    return (o[0] != 0.0f || o[1] != 0.0f || o[2] != 0.0f || o[3] != 0.0f) && rfom_viewmodel_near(o[0], o[1], o[3], vm);
+}
 static int fsr_rematch(int vs_idx, const char* csrc, const float* epi, const u32* rows, u32 nr, u32 fr, u32 ring, u32 slot,
                        const u32* cand, int nc, double lim, int* vl)
 {
@@ -741,7 +766,15 @@ static int fsr_rematch(int vs_idx, const char* csrc, const float* epi, const u32
     *vl = 0;
     if (tf != fr) { tf = fr; used = 0; }
     const u64 cap = fsr_rm_tsc_cap();
-    if (cap && used >= cap) { s_mvr_st[MVR_RM_BUDGET]++; return -1; }
+    s_rm_why = MVW_NONE;
+    if (cap && used >= cap) {   /* over budget: the weapon and arms (drawn after the world) still get re-matched */
+        static u32 nf, nn;
+        if (nf != fr) { nf = fr; nn = 0; }
+        if (nn >= 64u) return fsr_rm_fail(MVR_RM_BUDGET, MVW_BUDGET);
+        nn++;
+        if (!fsr_rm_near_quick(vs_idx, csrc, epi)) return fsr_rm_fail(MVR_RM_BUDGET, MVW_BUDGET);
+        s_mvr_st[MVR_RM_NEARX]++;
+    }
     const u64 t0 = __rdtsc();
     const int r = fsr_rematch_body(vs_idx, csrc, epi, rows, nr, fr, ring, slot, cand, nc, lim, vl);
     used += __rdtsc() - t0;
@@ -751,21 +784,21 @@ static int fsr_rematch_body(int vs_idx, const char* csrc, const float* epi, cons
                             const u32* cand, int nc, double lim, int* vl)
 {
     *vl = 0;
-    if (nc <= 0 || vs_idx < 0 || vs_idx >= s_d3d.vp_vs_n || !nr) return -1;
+    if (nc <= 0 || vs_idx < 0 || vs_idx >= s_d3d.vp_vs_n || !nr) { s_rm_why = MVW_NOCAND; return -1; }
     const VPVSEntry* ve = &s_d3d.vp_vs[vs_idx];
-    if (!ve->ucode || !ve->ucode_n) { s_mvr_st[MVR_RM_NOEVAL]++; return -1; }
+    if (!ve->ucode || !ve->ucode_n) return fsr_rm_fail(MVR_RM_NOEVAL, MVW_NOEVAL);
     static u32 bf, bn;   /* FIFO thread only */
     if (bf != fr) { bf = fr; bn = 0; }
-    if (bn >= (u32)fsr_mv_rm_n()) { s_mvr_st[MVR_RM_BUDGET]++; return -1; }
+    if (bn >= (u32)fsr_mv_rm_n()) return fsr_rm_fail(MVR_RM_BUDGET, MVW_BUDGET);
     bn++;
     CamProg* pg = fsr_cam_prog(ve);
-    if (pg->pk == 2) { s_mvr_st[MVR_RM_NOEVAL]++; return -1; }
+    if (pg->pk == 2) return fsr_rm_fail(MVR_RM_NOEVAL, MVW_NOEVAL);
     fsr_prog_st(ve, pg, csrc);
     const float* cc = (const float*)csrc;
     /* the probe point: the origin, else the first unit point in front of the eye */
     float o[4], q[4], o0[4] = { 0, 0, 0, 0 }; int k = -1;
     for (int t = 0; t < 5 && k < 0; t++) {
-        if (!fsr_probe(ve, pg, cc, epi, t, o, q)) { pg->pk = 2; s_mvr_st[MVR_RM_NOEVAL]++; return -1; }
+        if (!fsr_probe(ve, pg, cc, epi, t, o, q)) { pg->pk = 2; return fsr_rm_fail(MVR_RM_NOEVAL, MVW_NOEVAL); }
         pg->pk = 1;
         if (rfom_mv_pt(q).ok) k = t;
         if (t == 0) {   /* cache: next frame's draws of this object find it without re-running it */
@@ -773,7 +806,7 @@ static int fsr_rematch_body(int vs_idx, const char* csrc, const float* epi, cons
             memcpy(s_fsr_pc[ring][slot], q, sizeof q); s_fsr_pcf[ring][slot] = fr + 1u;
         }
     }
-    if (k < 0) { s_mvr_st[MVR_RM_NOPROBE]++; return -1; }
+    if (k < 0) return fsr_rm_fail(MVR_RM_NOPROBE, MVW_NOPROBE);
     const RfomMvPt pc = rfom_mv_pt(q);
     const float vm = fsr_vm_w();
     const int near_eye = fsr_mv_viewlock_on() && vm > 0.0f && (o0[0] != 0.0f || o0[1] != 0.0f || o0[2] != 0.0f || o0[3] != 0.0f) &&
@@ -792,7 +825,7 @@ static int fsr_rematch_body(int vs_idx, const char* csrc, const float* epi, cons
     { double M[16], out[2];
       if (fsr_rm_camera(fr, M) && vpcpu_reproj(M, pc.x, pc.y, (double)q[2] / q[3], out)) {
           rs[nrs].x = out[0]; rs[nrs].y = out[1]; rs[nrs].w = 0.0; rs[nrs].ok = 1; nrs++; } }
-    if (!nrs && !near_eye) { s_mvr_st[MVR_RM_NOREF]++; return -1; }
+    if (!nrs && !near_eye) return fsr_rm_fail(MVR_RM_NOREF, MVW_NOREF);
     double sc[8]; int vlw[8];
     if (nc > 8) nc = 8;
     const u32 pr = (fr - 1u) % FSR_RING;
@@ -815,7 +848,7 @@ static int fsr_rematch_body(int vs_idx, const char* csrc, const float* epi, cons
         if (near_eye) { const double d = rfom_mv_pt_dist(p, pc); if (d >= 0.0 && (sc[i] < 0.0 || d < sc[i])) { sc[i] = d; vlw[i] = 1; } }
     }
     const int b = rfom_mv_rematch_pick(sc, nc, fsr_mv_rm_ratio(), lim);
-    if (b < 0) { s_mvr_st[MVR_RM_UNCLEAR]++; return -1; }
+    if (b < 0) return fsr_rm_fail(MVR_RM_UNCLEAR, MVW_UNCLEAR);
     *vl = vlw[b];
     return b;
 }
@@ -964,6 +997,8 @@ static void fsr_record_impl(D3D12DrawRecord* dr, int vs_idx, char* dst, const ch
     }
     u64 prev_off = cur_off;                     /* no match: "did not move" */
     dr->fsr_mt = 0; dr->fsr_chain = 0; dr->fsr_bd = -1.0f; dr->fsr_slot = slot; dr->fsr_pslot = 0xFFFFFFFFu;
+    dr->fsr_why = 0; dr->fsr_o[0] = dr->fsr_o[1] = dr->fsr_o[2] = 0.0f;
+    int mvw = 0;   /* why camera-only (MVWS_* << 4 | MVW_*) */
     const int pm = s_fsr_map_cur ^ 1;
     FsrMapE* ce = fsr_find(s_fsr_map[s_fsr_map_cur], s_fsr_map_gen[s_fsr_map_cur], h, 1);
     const u32 ord = ce ? ce->n++ : 0xFFFFFFFFu;
@@ -1059,7 +1094,8 @@ static void fsr_record_impl(D3D12DrawRecord* dr, int vs_idx, char* dst, const ch
                                                           (const float (*)[FSR_SIG_ROWS * 4])s_fsr_sig[pr], sig, cd, 4);
                             const int r = fsr_rematch(vs_idx, csrc, epi, rows, nr, fr, ring, slot, cd, nc, 0.5, &vl);
                             if (r >= 0) { best = cd[r]; dr->fsr_mt = vl ? 7 : 6; s_mvr_st[vl ? MVR_RM_VL : MVR_RM_OK]++; }
-                        }
+                            else mvw = MVWS_AMBIG << 4 | s_rm_why;
+                        } else mvw = MVWS_AMBIG << 4 | MVW_OFF;
                         if (best == 0xFFFFFFFFu) s_mvr_st[MVR_AMB_DROP]++;
                     }
                   }
@@ -1079,30 +1115,50 @@ static void fsr_record_impl(D3D12DrawRecord* dr, int vs_idx, char* dst, const ch
             const int r = fsr_rematch(vs_idx, csrc, epi, rows, nr, fr, ring, slot, cd, nc, 0.05, &vl);
             if (r >= 0) { prev_off = ((u64)pr * s_fsr_slots + cd[r]) * FSR_HIST_STRIDE; dr->fsr_mt = 8; dr->fsr_pslot = cd[r];
                           s_fsr_st_match++; s_mvr_st[MVR_LOOSE_OK]++; }
-            else s_mvr_st[MVR_LOOSE_FAIL]++;
-        }
-    }
+            else { s_mvr_st[MVR_LOOSE_FAIL]++; mvw = MVWS_LOOSE << 4 | s_rm_why; }
+        } else mvw = MVWS_NOLOOSE << 4;
+    } else if (prev_off == cur_off && nokey) mvw = MVWS_NOLOOSE << 4 | MVW_OFF;
     if (prev_off == cur_off && objmv != 2) {   /* no previous-frame match: camera motion, not "did not move" */
         const u64 co = fsr_cam_prev(vs_idx, csrc, epi, rows, nr, fr, ring);
         if (co != ~0ull) { prev_off = co; dr->fsr_mt = 4; s_fsr_st_cam++; }
     }
     if ((dr->fsr_mt == 0 || dr->fsr_mt == 4) && objmv == 1 && port_stats_log()) {   /* what is still camera-only */
         s_mvr_st[dr->fsr_mt == 4 ? MVR_CAM_SPLIT : MVR_CAM_FILL]++;
+        if (!mvw) mvw = MVWS_OTHER << 4;
         if (nokey) s_mvr_st[MVR_NOKEY]++;
         if (vs_idx >= 0 && vs_idx < s_d3d.vp_vs_n && s_d3d.vp_vs[vs_idx].ucode && s_d3d.vp_vs[vs_idx].ucode_n) {
             const VPVSEntry* ve = &s_d3d.vp_vs[vs_idx];
             CamProg* pg = fsr_cam_prog(ve);
             fsr_prog_st(ve, pg, csrc);
             s_mvr_st[pg->pk == 2 ? MVR_CO_NOEVAL : pg->st == 1 ? MVR_CO_RIGID : MVR_CO_SKIN]++;
-            static u32 nf, nn;   /* near-the-eye probes: at most 64 a frame */
+            static u32 nf, nn;   /* near-the-eye probes: at most 512 a frame */
             if (nf != fr) { nf = fr; nn = 0; }
-            if (pg->pk != 2 && nn < 64u) {
+            if (pg->pk != 2 && nn < 512u) {
                 nn++;
                 float o[4], q[4];
-                if (fsr_probe(ve, pg, (const float*)csrc, epi, 0, o, q) && (o[0] != 0.0f || o[1] != 0.0f || o[2] != 0.0f || o[3] != 0.0f) &&
-                    rfom_viewmodel_near(o[0], o[1], o[3], fsr_vm_w() > 0.0f ? fsr_vm_w() : 1.0f)) s_mvr_st[MVR_CO_NEAR]++;
+                if (fsr_probe(ve, pg, (const float*)csrc, epi, 0, o, q) && (o[0] != 0.0f || o[1] != 0.0f || o[2] != 0.0f || o[3] != 0.0f)) {
+                    const float w = o[3];
+                    s_mvn_w[!(w >= 0.0f) ? 0 : w < 0.5f ? 1 : w < 1.0f ? 2 : w < 2.0f ? 3 : w < 5.0f ? 4 : w < 20.0f ? 5 : 6]++;
+                    if (rfom_viewmodel_near(o[0], o[1], o[3], fsr_vm_w() > 0.0f ? fsr_vm_w() : 1.0f)) {
+                        s_mvr_st[MVR_CO_NEAR]++;
+                        s_mvn_st[(mvw >> 4) % MVWS_N][(mvw & 15) % MVW_N]++;
+                    }
+                }
             }
         } else s_mvr_st[MVR_CO_UNK]++;
+    }
+    if (dr->fsr_mt == 0 || dr->fsr_mt == 4) dr->fsr_why = (u8)(mvw ? mvw : MVWS_OTHER << 4);
+    if (fsr_mv_diag() && vs_idx >= 0 && vs_idx < s_d3d.vp_vs_n && s_d3d.vp_vs[vs_idx].ucode && s_d3d.vp_vs[vs_idx].ucode_n) {
+        static u32 df, dn;   /* RSX_DLSS_MV_DIAG: every draw's origin, at most 4096 a frame */
+        if (df != fr) { df = fr; dn = 0; }
+        const VPVSEntry* ve = &s_d3d.vp_vs[vs_idx];
+        CamProg* pg = fsr_cam_prog(ve);
+        if (pg->pk != 2 && dn < 4096u) {
+            dn++;
+            fsr_prog_st(ve, pg, csrc);
+            float o[4], q[4];
+            if (fsr_probe(ve, pg, (const float*)csrc, epi, 0, o, q)) { dr->fsr_o[0] = o[0]; dr->fsr_o[1] = o[1]; dr->fsr_o[2] = o[3]; }
+        }
     }
     { const u64 hf = s_fsr_hfull[ring][slot], hv = s_fsr_hvar[ring][slot];   /* v189 exact tables */
       FsrMapE* xf = fsr_find(s_fsr_exf[s_fsr_map_cur], s_fsr_map_gen[s_fsr_map_cur], fsr_mix(h, hf), 1);
@@ -3114,8 +3170,22 @@ static void fsr_dispatch(void)
                       m[MVR_CO_RIGID], m[MVR_CO_SKIN], m[MVR_CO_NOEVAL], m[MVR_CO_UNK], m[MVR_CO_NEAR],
                       s[MVS_DRAWN], s[MVS_BLEND_RX], s[MVS_MODUL], s[MVS_COLOUR_OFF], s[MVS_DEPTH_OFF], s[MVS_CUTOUT],
                       s[MVS_SUBVP], s[MVS_FPKILL], s[MVS_NOPSO], s[MVS_LATE], 10);
+              volatile u32 (*n)[MVW_N] = s_mvn_st; volatile u32* wb = s_mvn_w;
+              u32 na = 0, nl = 0;
+              for (int i = 0; i < MVW_N; i++) { na += n[MVWS_AMBIG][i]; nl += n[MVWS_LOOSE][i]; }
+              fprintf(stderr, "[DLSS] camera-only near the eye/600: ambiguous %u (over budget %u, unclear %u, no probe %u, not evaluable %u,"
+                              " no reference %u, no candidates %u, re-match off %u) | material changed %u (loose: over budget %u, unclear %u,"
+                              " no reference %u, other %u; no loose candidate %u, loose off %u) | other %u | over budget but near the eye: re-matched"
+                              " anyway %u | camera-only origin depth: behind %u, <0.5 %u, <1 %u, <2 %u, <5 %u, <20 %u, farther %u%c",
+                      na, n[MVWS_AMBIG][MVW_BUDGET], n[MVWS_AMBIG][MVW_UNCLEAR], n[MVWS_AMBIG][MVW_NOPROBE], n[MVWS_AMBIG][MVW_NOEVAL],
+                      n[MVWS_AMBIG][MVW_NOREF], n[MVWS_AMBIG][MVW_NOCAND], n[MVWS_AMBIG][MVW_OFF],
+                      nl, n[MVWS_LOOSE][MVW_BUDGET], n[MVWS_LOOSE][MVW_UNCLEAR], n[MVWS_LOOSE][MVW_NOREF],
+                      nl - n[MVWS_LOOSE][MVW_BUDGET] - n[MVWS_LOOSE][MVW_UNCLEAR] - n[MVWS_LOOSE][MVW_NOREF],
+                      n[MVWS_NOLOOSE][MVW_NONE], n[MVWS_NOLOOSE][MVW_OFF], n[MVWS_OTHER][MVW_NONE], m[MVR_RM_NEARX],
+                      wb[0], wb[1], wb[2], wb[3], wb[4], wb[5], wb[6], 10);
           }
           for (int i = 0; i < MVR_N; i++) s_mvr_st[i] = 0;
+          memset((void*)s_mvn_st, 0, sizeof s_mvn_st); memset((void*)s_mvn_w, 0, sizeof s_mvn_w);
           memset(s_mvs_st, 0, sizeof s_mvs_st);
           s_fsr_st_rec = s_fsr_st_match = s_fsr_st_over = s_fsr_st_wait = s_fsr_st_exact = s_fsr_st_cam = s_fsr_st_amb = s_fsr_st_vm = s_fsr_st_common = s_fsr_st_zr = 0; s_fsr_st_tsc = 0; nr = gap = 0;
       } }

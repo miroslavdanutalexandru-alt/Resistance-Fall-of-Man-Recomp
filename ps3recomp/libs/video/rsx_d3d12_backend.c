@@ -468,7 +468,8 @@ typedef struct {
     u32   fsr_frame, fsr_prev;
     float fsr_jnx, fsr_jny;
     float fsr_up;   /* DLSS upscaling: share of the scene surface this jittered draw renders to (0 = not jittered) */
-    u8 fsr_mt; u16 fsr_chain; float fsr_bd; u32 fsr_slot, fsr_pslot;   /* v184 diag: how the previous frame was matched */
+    u8 fsr_mt; u8 fsr_why; u16 fsr_chain; float fsr_bd; u32 fsr_slot, fsr_pslot;   /* v184 diag: how the previous frame was matched */
+    float fsr_o[3];   /* RSX_DLSS_MV_DIAG: the object's origin in clip space (x, y, w), w = 0: not probed */
     /* v189: NV3089 copy out of a GPU surface (is_clear record, clear_mask 0):
      * source surface offset and image size, start and step in source pixels. */
     int   is_blit;
