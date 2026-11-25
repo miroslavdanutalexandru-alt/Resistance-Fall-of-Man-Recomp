@@ -595,6 +595,34 @@ static void test_camrep()
 	for (int i = 0; i < 8; ++i) rfom_camrep_step(&u, 0.045, 0.004, 0.05);  // TOL2 0.05: floor capped at the old 0.05
 	CHECK(!u.out && u.score == 0);
 }
+// RSX_DLSS_MV_REMATCH / _VIEWLOCK / _LOOSE: probe points and the candidate pick
+static void test_mv_rematch()
+{
+	const float a[4] = { 0.5f, -0.25f, 0.3f, 2.0f }, b[4] = { 0.5f, -0.25f, 0.3f, 4.0f };
+	RfomMvPt pa = rfom_mv_pt(a), pb = rfom_mv_pt(b);
+	CHECK(pa.ok && pa.x == 0.25 && pa.y == -0.125 && pa.w == 2.0);
+	CHECK(rfom_mv_pt_dist(pa, pa) == 0.0);
+	CHECK(rfom_mv_pt_dist(pa, pb) > 0.6);                  // same direction, twice as far: the depth term
+	const float behind[4] = { 0.1f, 0.1f, 0.1f, -1.0f };
+	CHECK(!rfom_mv_pt(behind).ok && rfom_mv_pt_dist(rfom_mv_pt(behind), pa) < 0.0);
+	volatile float z0 = 0.0f; const float nan4[4] = { z0 / z0, 0.0f, 0.0f, 1.0f };
+	CHECK(!rfom_mv_pt(nan4).ok);
+	RfomMvPt cam = pa; cam.w = 0.0; cam.x += 0.01;           // through the solved camera: no depth term
+	CHECK(rfom_mv_pt_dist(pa, cam) < 0.02);
+	const double s1[4] = { 0.01, 0.3, -1.0, 0.4 };           // a door near where it was, its copies elsewhere
+	CHECK(rfom_mv_rematch_pick(s1, 4, 0.5, 0.5) == 0);
+	const double s2[3] = { 0.2, 0.25, 0.9 };                 // two copies equally plausible: no pick
+	CHECK(rfom_mv_rematch_pick(s2, 3, 0.5, 0.5) == -1);
+	const double s3[2] = { 0.6, 5.0 };                       // clear but too far
+	CHECK(rfom_mv_rematch_pick(s3, 2, 0.5, 0.5) == -1);
+	const double s4[2] = { 0.0, 0.00001 };                   // drawn twice on the same spot last frame
+	CHECK(rfom_mv_rematch_pick(s4, 2, 0.5, 0.5) == 0);
+	const double s5[1] = { 0.04 };                           // single candidate (loose): limit only
+	CHECK(rfom_mv_rematch_pick(s5, 1, 0.5, 0.05) == 0);
+	CHECK(rfom_mv_rematch_pick(s5, 1, 0.5, 0.03) == -1);
+	const double s6[2] = { -1.0, -1.0 };
+	CHECK(rfom_mv_rematch_pick(s6, 2, 0.5, 0.5) == -1);
+}
 #endif
 
 int main()
@@ -614,6 +642,7 @@ int main()
 	test_vote_majority();
 	test_nn_ambiguous();
 	test_camrep();
+	test_mv_rematch();
 #endif
 	std::printf("fg_logic_test: %d checks, %d failed\n", g_checks, g_fail);
 	return g_fail ? 1 : 0;

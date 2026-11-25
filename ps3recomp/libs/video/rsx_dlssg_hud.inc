@@ -82,17 +82,17 @@ static void fg_hud_mv_dump(const D3D12DrawRecord* draws, u32 nd)
 {
     if (s_fgd_on && (s_fg_ready || s_f3_ready))   /* RFOM_FG_DIAG: this present's matching counts */
         for (u32 d = 0; d < nd && d < MAX_DRAWS; d++)
-            if (draws[d].fsr == 1) s_fgdf.m[draws[d].fsr_mt < 6 ? draws[d].fsr_mt : 0]++;
+            if (draws[d].fsr == 1) s_fgdf.m[draws[d].fsr_mt < 6 ? draws[d].fsr_mt : draws[d].fsr_mt <= 8 ? 3 : 0]++;   /* 6-8: re-matched nearest */
     if (!s_fg_hmv_pend) return;
-    u32 c[6] = {0}, ns = 0;
+    u32 c[9] = {0}, ns = 0;
     for (u32 d = 0; d < nd && d < MAX_DRAWS; d++)
-        if (draws[d].fsr == 1) { ns++; c[draws[d].fsr_mt < 6 ? draws[d].fsr_mt : 0]++; }
+        if (draws[d].fsr == 1) { ns++; c[draws[d].fsr_mt < 9 ? draws[d].fsr_mt : 0]++; }
     if (!ns) return;
     s_fg_hmv_pend = 0;
-    fprintf(stderr, "[FG-MV] upscaler frame %u: %u scene draws: exact %u instance %u nearest %u camera-split %u ambiguous %u"
-                    " unmatched %u (frame generation %s)%c", (unsigned)s_fsr_frame_r, ns, c[1], c[2], c[3], c[4], c[5], c[0],
+    fprintf(stderr, "[FG-MV] upscaler frame %u: %u scene draws: exact %u instance %u nearest %u camera-split %u ambiguous %u re-matched %u view-locked %u loose %u"
+                    " unmatched %u (frame generation %s)%c", (unsigned)s_fsr_frame_r, ns, c[1], c[2], c[3], c[4], c[5], c[6], c[7], c[8], c[0],
             s_fg_on || s_f3_on ? "on" : "off", 10);
-    fprintf(stderr, "[FG-MV] d mt(0 none,1 exact,2 exact-instance,3 nearest,4 camera-split,5 ambiguous nearest) chain bd slot pslot fp vs tex0 tex1 count%c", 10);
+    fprintf(stderr, "[FG-MV] d mt(0 none,1 exact,2 exact-instance,3 nearest,4 camera-split,5 ambiguous nearest,6 re-matched,7 view-locked,8 loose) chain bd slot pslot fp vs tex0 tex1 count%c", 10);
     for (u32 d = 0; d < nd && d < MAX_DRAWS; d++) {
         const D3D12DrawRecord* dr = &draws[d];
         if (dr->fsr != 1) continue;

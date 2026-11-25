@@ -203,4 +203,41 @@ static inline int rfom_viewmodel_near(double x, double y, double w, double thr)
     return (w < 0 ? -w : w) < thr && (x < 0 ? -x : x) < 2.0 * thr && (y < 0 ? -y : y) < 2.0 * thr;
 }
 
+/* RSX_DLSS_MV_REMATCH (rsx_fsr.inc fsr_rematch): an object's probe point as one draw puts it on screen -- ndc x, y
+ * and clip w from the post-viewport clip position c[4]. ok = 0: not finite, all zero, or at / behind the eye. */
+typedef struct { double x, y, w; int ok; } RfomMvPt;
+static inline RfomMvPt rfom_mv_pt(const float* c)
+{
+    RfomMvPt p; p.x = p.y = p.w = 0.0; p.ok = 0;
+    for (int k = 0; k < 4; k++) if (!(c[k] == c[k]) || c[k] > 3.0e38f || c[k] < -3.0e38f) return p;
+    if (!(c[3] > 1e-4f)) return p;
+    p.x = (double)c[0] / c[3]; p.y = (double)c[1] / c[3]; p.w = c[3];
+    p.ok = p.x < 1e6 && p.x > -1e6 && p.y < 1e6 && p.y > -1e6;
+    return p;
+}
+/* ndc |dx| + |dy|, plus the relative change of w when both carry one (a point reprojected through the solved camera
+ * has w = 0: no depth term). -1 = either point unusable. */
+static inline double rfom_mv_pt_dist(RfomMvPt a, RfomMvPt b)
+{
+    if (!a.ok || !b.ok) return -1.0;
+    const double dx = a.x - b.x, dy = a.y - b.y;
+    double d = (dx < 0 ? -dx : dx) + (dy < 0 ? -dy : dy);
+    if (a.w > 0.0 && b.w > 0.0) { const double m = a.w > b.w ? a.w : b.w, dw = a.w - b.w; d += (dw < 0 ? -dw : dw) / m; }
+    return d;
+}
+/* Which previous-frame candidate is this draw's object: s[i] = how far candidate i's probe point lies from where the
+ * object should have been last frame (< 0: unusable). The best is taken when it is within lim and clearly ahead of
+ * the runner-up (best <= ratio * runner-up), or when both sit on the same spot (the object drawn twice last frame).
+ * -1 = no confident pick (the caller keeps the old camera-only motion). */
+static inline int rfom_mv_rematch_pick(const double* s, int n, double ratio, double lim)
+{
+    int b = -1;
+    for (int i = 0; i < n; i++) if (s[i] >= 0.0 && (b < 0 || s[i] < s[b])) b = i;
+    if (b < 0 || !(s[b] <= lim)) return -1;
+    double s2 = -1.0;
+    for (int i = 0; i < n; i++) if (i != b && s[i] >= 0.0 && (s2 < 0.0 || s[i] < s2)) s2 = s[i];
+    if (s2 < 0.0 || s[b] <= ratio * s2 || s2 <= 1e-4) return b;
+    return -1;
+}
+
 #endif
