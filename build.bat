@@ -5,6 +5,8 @@ for %%A in (%*) do if /i "%%~A"=="nopause" set "NOPAUSE=1"
 cd /d "%~dp0"
 if not exist logs mkdir logs
 if not exist recompiled_game\ppu_recomp.h (echo The game code has not been generated yet - run Setup.bat first. & goto fail)
+rem Without the lifted SPU code (project\spu\<image>\, not in git) CMake still builds, but the front end hangs at a level load.
+if not exist project\spu\pm_wwsjob\spu_recomp.c (echo The SPU code has not been generated yet ^(project\spu^) - run Setup.bat first. & goto fail)
 rem A game window left open locks the .exe and the link fails -- close any that are still running.
 rem Close only a copy of ResistanceFoMGame.exe started from THIS folder (never one from another checkout).
 powershell -NoProfile -Command "$d=[IO.Path]::GetFullPath('%~dp0'); $k=0; Get-Process ResistanceFoMGame -EA 0 | ?{ $_.Path -and $_.Path.StartsWith($d,'OrdinalIgnoreCase') } | ForEach-Object { Stop-Process -Id $_.Id -Force; $k=1 }; if($k){ 'Closed a ResistanceFoMGame.exe that was still running.' }"
