@@ -106,61 +106,21 @@ static inline float rfom_aspect_present_mul(float mul, unsigned long long last_m
  *  - or a 3D scene has been drawn steadily for rearm_ms since the hold began (in-engine
  *    cutscenes, vehicles): scene frames (scene_ms: the last, scene_run0: the first of the
  *    current run, in which no two were more than RFOM_ASPECT_SCENE_GAP_MS apart) still coming.
- * A stretch that is on stays on (in play, the gate never turns it off), except in a known
- * menu: menu != 0 (the game's pause menu loaded its text, g_rfom_pause_ui) while the player
- * is not in control locks it at 16:9 even with the 3D world drawn steadily behind it.
+ * A stretch that is on stays on (in play, the gate never turns it off). So a screen without
+ * player control settles one way and stays: 16:9 (2D screens, menus that draw 3D only in bursts),
+ * or 21:9 after rearm_ms of steady 3D (cutscenes; also a pause menu that keeps drawing the level
+ * behind it) -- no flipping either way. There is no reliable "pause menu open" signal from the
+ * game, so menus are not forced to 16:9 beyond that.
  * rearm_ms 0 = off (RFOM_MENU_ASPECT=0 / RFOM_ASPECT_REARM_MS=0, 0.3.1: m as is). The cost:
  * a cutscene that follows a loading screen keeps its letterbox for its first rearm_ms. */
 #define RFOM_ASPECT_PLAY_MS 250u
 #define RFOM_ASPECT_SCENE_GAP_MS 250u
-#define RFOM_ASPECT_MENU_CAM_MS 500u
-/* The menu input of rfom_aspect_gate. The pause menu flag (g_rfom_pause_ui) is set by a text load
- * soon after play and cleared only by on-foot play or a level load, so it can outlive the pause
- * menu (a text load in play followed by a cutscene or vehicle section). The paused world keeps
- * re-setting the camera(s) it had in play now and then; a cutscene sets cameras of its own (another
- * camera object or field of view). So the flag counts only until a camera that was not used in play
- * (rfom_aspect_cam_known) is set more than RFOM_ASPECT_MENU_CAM_MS after the flag went up
- * (foreign_ms: the last such camera, 0 = none), and that ends it for good, until the flag drops
- * and is raised again. *since: when the flag was seen raised (0 = down), *spent: ended. */
-static inline int rfom_aspect_menu(int pause_ui, unsigned long long* since, int* spent,
-                                   unsigned long long foreign_ms, unsigned long long now_ms)
-{
-    if (!pause_ui) { *since = 0; *spent = 0; return 0; }
-    if (!*since) *since = now_ms ? now_ms : 1;
-    if (foreign_ms && foreign_ms > *since && foreign_ms - *since >= RFOM_ASPECT_MENU_CAM_MS) *spent = 1;
-    return !*spent;
-}
-
-/* The cameras widened while the player was in control: their signatures (camera object and the
- * field of view the game gave it), most recent first. */
-#define RFOM_ASPECT_CAMSET_N 8
-typedef struct rfom_aspect_camset { unsigned sig[RFOM_ASPECT_CAMSET_N]; unsigned n; } rfom_aspect_camset;
-static inline unsigned rfom_aspect_cam_sig(unsigned cam, double fov)
-{
-    return cam * 2654435761u ^ (unsigned)(long long)floor(fov * 100.0 + 0.5);
-}
-/* One widened camera setter call: in play (in_play), remember it and return 1; outside play,
- * return whether it is one of the play cameras (1) or a foreign one (0, a cutscene's). */
-static inline int rfom_aspect_cam_known(rfom_aspect_camset* s, unsigned sig, int in_play)
-{
-    unsigned i = 0;
-    while (i < s->n && s->sig[i] != sig) i++;
-    if (i == s->n) {
-        if (!in_play) return 0;
-        if (s->n < RFOM_ASPECT_CAMSET_N) s->n++;
-        i = s->n - 1;
-    }
-    for (; i > 0; i--) s->sig[i] = s->sig[i - 1];
-    s->sig[0] = sig;
-    return 1;
-}
-static inline float rfom_aspect_gate(unsigned long long* held, float m, int menu, unsigned long long play_ms,
+static inline float rfom_aspect_gate(unsigned long long* held, float m, unsigned long long play_ms,
                                      unsigned long long scene_ms, unsigned long long scene_run0, unsigned long long now_ms,
                                      unsigned rearm_ms)
 {
     if (!rearm_ms) return m;
     const int play = play_ms && (now_ms <= play_ms || now_ms - play_ms < RFOM_ASPECT_PLAY_MS);
-    if (menu && !play) { *held = now_ms ? now_ms : 1; return 1.0f; }   /* renewed: scene runs count from the menu's last frame */
     if (m == 1.0f) { if (!*held) *held = now_ms ? now_ms : 1; return 1.0f; }
     if (!*held) return m;
     if (play) { *held = 0; return m; }

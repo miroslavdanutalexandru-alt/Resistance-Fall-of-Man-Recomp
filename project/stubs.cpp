@@ -659,12 +659,12 @@ extern "C" void rfom_fov_set_live(double deg) { s_rfom_fov_live = deg > 0.0 ? de
  * loading screens, 2D briefing / stats screens and menus, which set no 3D camera,
  * go back to their 16:9 letterbox; it ends at once when the target aspect has been
  * 16:9 for RFOM_ASPECT_OFF_MS (default 1000), and pauses while a movie plays
- * (flip mode 2), so movies keep their 16:9 letterbox. Once it is off outside play,
- * menus included (issue #2 on 0.3.1: the menu screen kept flipping 21:9 / 16:9),
- * it stays off until the on-foot look code runs again (g_rfom_play_ms, < 250 ms)
- * or a 3D scene has been drawn steadily for RFOM_ASPECT_REARM_MS (default 1000;
- * 0 = off, the 0.3.1 behaviour, as is RFOM_MENU_ASPECT=0; rfom_aspect_gate); the
- * pause menu (g_rfom_pause_ui) is 16:9 even with the level drawn behind it. The front end's main menu
+ * (flip mode 2), so movies keep their 16:9 letterbox. Once it is off outside play
+ * (issue #2 on 0.3.1: the menu screen kept flipping 21:9 / 16:9), it stays off
+ * until the on-foot look code runs again (g_rfom_play_ms, < 250 ms) or a 3D scene
+ * has been drawn steadily for RFOM_ASPECT_REARM_MS (default 1000; 0 = off, the
+ * 0.3.1 behaviour, as is RFOM_MENU_ASPECT=0; rfom_aspect_gate), so screens without
+ * player control settle one way and stay. The front end's main menu
  * (ResistanceFoM.exe) has no camera hook and is never stretched.
  *   RFOM_ASPECT=auto (default): the game window's aspect | off | 21:9 | 32:9 | 2.39 ...
  * The hook passes the aspect as a NEGATIVE argument to rfom_fov_adjust (the
@@ -676,9 +676,6 @@ static double rfom_fov_adjust_base(double f);
 static thread_local double tl_hp = 1.0;
 static thread_local int tl_hp_lod = 0;
 static thread_local double tl_hp_aspect = 0.0;   /* the 16:9 aspect a Hor+ camera stood for (LOD fix) */
-static thread_local uint32_t tl_note_cam = 0;    /* the camera object and FOV of this setter call (rfom_fov_note) */
-static thread_local double tl_note_fov = 0.0;
-extern "C" volatile unsigned long long g_rsx_aspect_foreign_ms;   /* rsx_d3d12_backend.c: a camera not used in play was widened */
 static double rfom_target_aspect(void)
 {
     static int mode = -1;          /* 0 off, 1 auto, 2 fixed */
@@ -738,15 +735,6 @@ extern "C" double rfom_fov_adjust(double f)
             tl_hp = w; tl_hp_lod = 1; tl_hp_aspect = base;
             g_rsx_aspect_mul = mul;
             g_rsx_aspect_ms = GetTickCount64();
-            {   /* rfom_aspect_menu: a camera not seen in play (a cutscene's) ends a stale pause-menu flag */
-                static rfom_aspect_camset cs = { {0}, 0 };
-                const unsigned long long pl = g_rfom_play_ms, nw = g_rsx_aspect_ms;
-                const int in_play = pl && (nw <= pl || nw - pl < RFOM_ASPECT_PLAY_MS);
-                AcquireSRWLockExclusive(&lk);
-                const int known = rfom_aspect_cam_known(&cs, rfom_aspect_cam_sig(tl_note_cam, tl_note_fov), in_play);
-                ReleaseSRWLockExclusive(&lk);
-                if (!known) g_rsx_aspect_foreign_ms = nw;
-            }
             { static ULONGLONG t0 = 0; static unsigned n = 0; static int said = 0;   /* once: how often */
               if (said < 2) { if (!t0) t0 = g_rsx_aspect_ms; n++;
                   if (!said) { said = 1; fprintf(stderr, "[aspect] Hor+: 16:9 camera (aspect %.3f) -> %.3f, horizontal FOV tan x%.3f%c", a, t, w, 10); }
@@ -805,7 +793,6 @@ static double rfom_fov_adjust_base(double f)
 static volatile uint32_t s_rfom_view_cam = 0;
 extern "C" void rfom_fov_note(uint32_t cam, double f)
 {
-    tl_note_cam = cam; tl_note_fov = f;
     if (!(f > 1.0 && f < 179.0)) return;
     static int any = -1; if (any < 0) any = getenv("RFOM_FOV_ANYCAM") ? 1 : 0;
     if (fabs(f - 82.0) < 0.01) s_rfom_view_cam = cam;
@@ -1977,7 +1964,7 @@ static void prompts_apply(uint32_t base, uint32_t end, int mode, uint32_t* blkp,
       const char* b = strrchr(mp, '\\'); b = b ? b + 1 : mp;
       /* v162b: not when the pause menu loads its text (play was running a moment ago) -- Space there is Cross */
       const ULONGLONG t = GetTickCount64();
-      if (_stricmp(b, "ResistanceFoM.exe") && (!g_rfom_play_ms || t - g_rfom_play_ms > 3000)) { g_rfom_space_start = 1; g_rfom_pause_ui = 0; }   /* a level load ends any pause menu */
+      if (_stricmp(b, "ResistanceFoM.exe") && (!g_rfom_play_ms || t - g_rfom_play_ms > 3000)) g_rfom_space_start = 1;
       else if (_stricmp(b, "ResistanceFoM.exe")) g_rfom_pause_ui = 1; }   /* v162c: text loaded mid-play = the pause menu */
     for (uint32_t i = 1; fe_menu && mode == 0 && i < end; i++) {
         if (p[i - 1] != 0 || p[i] == 0) continue;
