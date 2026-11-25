@@ -523,7 +523,7 @@ if(PS3RECOMP_BUILD_TESTS)
     # the lane scheduler's targeted wakes (dependency order, no lost kicks).
     if(WIN32)
         add_executable(test_spurs_mt tests/test_spurs_mt.c)
-        target_link_libraries(test_spurs_mt PRIVATE Synchronization)
+        target_link_libraries(test_spurs_mt PRIVATE synchronization)
         add_test(NAME spurs_mt COMMAND test_spurs_mt)
         set_tests_properties(spurs_mt PROPERTIES TIMEOUT 120)
         # rsx_texpack.inc's HD UI pack (RSX_HD_UI): lookup by the upload's key, staging of every level, fallbacks on

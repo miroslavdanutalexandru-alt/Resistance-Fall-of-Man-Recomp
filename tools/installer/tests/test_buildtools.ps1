@@ -236,11 +236,12 @@ $plan = @(Remove-SetupTools -DryRun)
 Check ($plan.Count -eq 8 -and -not $script:Uninst.Count -and -not $script:Native.Count -and (Test-Path "$Cache\llvm")) 'dry run: lists everything, changes nothing'
 Check (Test-BtNeedsAdmin $plan) 'winget / direct entries need administrator rights'
 Check (-not (Test-BtNeedsAdmin @('portable|clang', 'pip|x|y'))) 'portable / pip entries do not'
-Set-BtManifest @('winget|LLVM.LLVM', 'winget|Microsoft.VisualStudio.2022.BuildTools', 'pip|C:\Windows\System32\cmd.exe|pycryptodome', 'gitconfig|safe.directory|F:/Porty/x', 'portable|clang', 'portable|vs', 'portable|python')
+Set-BtManifest @('winget|LLVM.LLVM', 'winget|Microsoft.VisualStudio.2022.BuildTools', 'pip|C:\Windows\System32\cmd.exe|pycryptodome', 'pip|C:\Windows\System32\cmd.exe|pyuv|bsp', 'gitconfig|safe.directory|F:/Porty/x', 'portable|clang', 'portable|vs', 'portable|python')
 $left = @(Remove-SetupTools)
 Check (@($script:Uninst -match 'uninstall --id LLVM\.LLVM -e').Count) 'winget uninstall LLVM'
 Check (@($script:Native | Where-Object { $_ -contains '--unset-all' -and $_ -contains 'F:/Porty/x' -and $_ -contains '--fixed-value' }).Count) 'safe.directory entry removed with git config --fixed-value --unset-all'
 Check (@($script:Native | Where-Object { $_ -contains 'uninstall' -and $_ -contains 'pycryptodome' }).Count) 'pip uninstall pycryptodome'
+Check (@($script:Native | Where-Object { $_ -contains 'uninstall' -and $_ -contains 'pycryptodome' -and $_ -contains '--break-system-packages' }).Count -eq 0 -and @($script:Native | Where-Object { $_ -contains 'pyuv' -and $_ -contains '--break-system-packages' }).Count -eq 1) 'pip|...|bsp (uv-managed Python, issue #16) uninstalls with --break-system-packages, a plain entry without'
 Check (-not (Test-Path "$Cache\llvm") -and -not (Test-Path "$Cache\msvc") -and -not (Test-Path "$Cache\shims") -and -not (Test-Path "$Cache\python")) 'portable folders deleted'
 Check ($left.Count -eq 1 -and $left[0] -eq 'winget|Microsoft.VisualStudio.2022.BuildTools' -and @(Get-BtManifest) -contains $left[0]) 'a failed uninstall stays in the manifest'
 $script:Uninst = @()

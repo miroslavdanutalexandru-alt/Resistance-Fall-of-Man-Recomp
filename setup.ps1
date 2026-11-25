@@ -737,10 +737,20 @@ if ($LASTEXITCODE -ne 0) {
     # the portable Python (tools_cache\python) keeps its packages inside itself; a system Python gets a --user install
     $portablePy = $py.StartsWith((Get-BtCache) + '\', [StringComparison]::OrdinalIgnoreCase)
     $pipArgs = @('-m', 'pip', 'install') + $(if ($portablePy) { @() } else { @('--user') }) + @('--quiet', '--disable-pip-version-check', 'pycryptodome')
-    & $py @pipArgs 2>&1 | Out-Host
+    $pipOut = @(& $py @pipArgs 2>&1 | ForEach-Object { if ($_ -is [Management.Automation.ErrorRecord]) { $_.Exception.Message } else { "$_" } })
+    $pipOut | Out-Host
     & $py -c "import Crypto" 2>$null | Out-Null
+    $bsp = $false
+    if ($LASTEXITCODE -ne 0 -and ($pipOut -join "`n") -match 'externally-managed-environment') {
+        # a Python managed by uv or a Linux distribution refuses pip installs (PEP 668, GitHub issue #16):
+        # pycryptodome has no dependencies, so it goes into that Python anyway, and Setup.bat -RemoveTools takes it out again
+        Info "This Python is managed by another tool (for example uv): installing pycryptodome into it with --break-system-packages."
+        & $py -m pip install --quiet --disable-pip-version-check --break-system-packages pycryptodome 2>&1 | Out-Host
+        & $py -c "import Crypto" 2>$null | Out-Null
+        $bsp = $true
+    }
     if ($LASTEXITCODE -ne 0) { Fail "Could not install the Python package pycryptodome." }
-    if (-not $portablePy) { Add-BtManifest "pip|$py|pycryptodome" }
+    if (-not $portablePy) { Add-BtManifest ("pip|$py|pycryptodome" + $(if ($bsp) { '|bsp' } else { '' })) }
 }
 # portable mode (chosen now or before) gets the portable CMake, never a system-wide one
 function Install-CMakeTool {

@@ -6,7 +6,7 @@
 #                              one line per thing Setup itself installed or changed, so it can be undone:
 #                                winget|<id>                 installed with winget
 #                                direct|<id>                 installed from the pinned official download (prereqs.ps1)
-#                                pip|<python.exe>|<package>  a Python package installed with pip
+#                                pip|<python.exe>|<package>[|bsp]  a Python package installed with pip (bsp: --break-system-packages)
 #                                gitconfig|safe.directory|<folder>   added by tools\fetch_rpcs3.ps1
 #                                portable|<key>              a portable tool in tools_cache\
 #                              Tools that were already on the PC are never listed (and never removed).
@@ -547,7 +547,9 @@ function Remove-SetupTools([switch]$DryRun, [string]$Cache = (Get-BtCache)) {
             switch ($f[0]) {
                 'pip' {
                     Write-BtMsg "Python package $($f[2]): $($f[1]) -m pip uninstall -y $($f[2])"
-                    if (-not $DryRun -and (Test-Path -LiteralPath $f[1])) { [void](Invoke-BtNative $f[1] @('-m', 'pip', 'uninstall', '-y', '--disable-pip-version-check', $f[2])) }
+                    # |bsp: installed with --break-system-packages (a uv / distribution-managed Python, PEP 668)
+                    $bsp = @(if ($f.Count -gt 3 -and $f[3] -eq 'bsp') { '--break-system-packages' })
+                    if (-not $DryRun -and (Test-Path -LiteralPath $f[1])) { [void](Invoke-BtNative $f[1] (@('-m', 'pip', 'uninstall', '-y', '--disable-pip-version-check') + $bsp + @($f[2]))) }
                 }
                 'gitconfig' {
                     Write-BtMsg "Git setting: git config --global --fixed-value --unset-all $($f[1]) `"$($f[2])`""

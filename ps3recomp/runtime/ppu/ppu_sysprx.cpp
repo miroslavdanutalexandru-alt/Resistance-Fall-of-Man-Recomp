@@ -364,7 +364,7 @@ static void sys_lwcond_create(ppu_context* ctx)
 }
 static void sys_lwcond_destroy(ppu_context* ctx)    { ctx->gpr[3] = 0; }
 #ifdef _WIN32
-#pragma comment(lib, "Synchronization.lib")   /* WaitOnAddress */
+#pragma comment(lib, "synchronization.lib")   /* WaitOnAddress; lowercase for the case-sensitive Linux / xwin SDK */
 #endif
 /* PS3_LWCOND_WAKE (default on; =0 = the old Sleep(1) poll, signals no-ops;
  * ported from R2/R3): the wait below is a bounded park (lwc_wait_ms). A signal
