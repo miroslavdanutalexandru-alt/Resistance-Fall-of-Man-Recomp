@@ -519,6 +519,12 @@ if(PS3RECOMP_BUILD_TESTS)
         target_compile_features(test_ini_migrate PRIVATE cxx_std_17)
         add_test(NAME ini_migrate COMMAND test_ini_migrate)
     endif()
+    # port_gamefiles.h (the launchers' Game files folder setting): folder checks, picked-folder fixes, which folder wins.
+    if(WIN32 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../project/tests/gamefiles_test.cpp")
+        add_executable(test_gamefiles ../project/tests/gamefiles_test.cpp)
+        target_include_directories(test_gamefiles PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../project")
+        add_test(NAME gamefiles COMMAND test_gamefiles WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
+    endif()
     # spurs_mt.h: SPU lane pool sizing / CPU placement, and a threaded model of
     # the lane scheduler's targeted wakes (dependency order, no lost kicks).
     if(WIN32)

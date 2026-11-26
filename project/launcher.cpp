@@ -40,6 +40,7 @@ namespace Gdiplus { using std::min; using std::max; }
 #include "rfom_autoconfig.h"
 #include "rfom_achievements.h"
 #include "port_ini_migrate.h"
+#include "port_gamefiles.h"
 
 #ifdef _MSC_VER
 #pragma comment(lib, "gdiplus.lib")
@@ -261,14 +262,24 @@ static int g_fov = FOV_DEF;
 
 static std::string path_of(const char* name) { return std::string(g_dir) + "\\" + name; }
 
+// Game files folder (Saves & tools page; port_gamefiles.h): settings.ini gamefiles=, settings.bat PORT_GAMEFILES.
+// Empty = <port>\gamefiles. Required files: tools\installer\game_profile.psd1 Required.
+static std::string g_gamefiles;
+static const char* const k_gf_required[] = { "PS3_GAME/PARAM.SFO", "PS3_GAME/USRDIR/EBOOT.BIN", "PS3_GAME/USRDIR/game.self",
+                                             "PS3_GAME/USRDIR/game.psarc", nullptr };
+static const char* const k_gf_title_ids[] = { "BCUS98107", nullptr };
+static std::string gf_dir(int* source = nullptr) { return port_gamefiles_effective(g_dir, g_gamefiles, source); }
+static std::string gf_path(const char* rel) { return gf_dir() + "\\" + rel; }
+
 static void load_settings()
 {
     for (auto& s : g_set) s.sel = s.def;
     g_fov = FOV_DEF;
+    g_gamefiles.clear();
     FILE* f = fopen(path_of("settings.ini").c_str(), "r");
     if (!f) { g_first_run = true; return; }
     std::vector<std::string> lines;
-    char line[256];
+    char line[1024];
     while (fgets(line, sizeof line, f)) { line[strcspn(line, "\r\n")] = 0; lines.push_back(line); }
     fclose(f);
     // renamed keys (port_ini_migrate.h): copied to the new name and written back; the old line stays as a fallback
@@ -287,6 +298,7 @@ static void load_settings()
             v = (char*)(*v && strcmp(v, "0") ? "1" : "0");
         }
         if (!strcmp(line, "fov")) { int x = atoi(v); if (x >= FOV_MIN && x <= FOV_MAX) g_fov = x; }
+        if (!strcmp(line, "gamefiles")) g_gamefiles = port_gamefiles_path_problem(v).empty() ? port_gamefiles_clean(v) : "";
         for (auto& s : g_set)
             if (!strcmp(s.key, line))
                 for (size_t i = 0; i < s.choices.size(); i++)
@@ -302,10 +314,12 @@ static bool save_settings()
     if (!f) return false;
     for (auto& s : g_set) fprintf(f, "%s=%s\n", s.key, s.choices[s.sel].value);
     fprintf(f, "fov=%d\n", g_fov);
+    fprintf(f, "gamefiles=%s\n", g_gamefiles.c_str());
     fclose(f);
     f = fopen(path_of("settings.bat").c_str(), "w");
     if (!f) return false;
     fprintf(f, "@echo off\nrem Written by Launcher.exe -- change these in the launcher.\n");
+    fprintf(f, "set \"PORT_GAMEFILES=%s\"\n", g_gamefiles.c_str());
     fprintf(f, "set \"RSX_DISPLAY=%s\"\n", val(S_DISPLAY));
     fprintf(f, "set \"RSX_WINDOW=%s\"\n", val(S_WINDOW));
     fprintf(f, "set \"RSX_RES_SCALE=%s\"\n", val(S_RES));
@@ -1586,6 +1600,13 @@ static std::string game_files_missing()
         return "The game is not built yet (" + exe + " is missing). Run Setup.bat first.";
     if (!exists(path_of("game\\EBOOT.elf")))
         return "The game program game\\EBOOT.elf is missing. Run Setup.bat again to decrypt it from your copy.";
+    int src = PORT_GF_DEFAULT;
+    const std::string gf = gf_dir(&src), bad = port_gamefiles_problem(gf, k_gf_required);
+    if (!bad.empty())
+        return "Your game files were not found. " + bad + "\n\n" +
+               (src == PORT_GF_ENV ? "This folder comes from the PS3_VFS_ROOT environment variable."
+                : src == PORT_GF_SETTING ? "This folder is set in Saves & tools > Game files folder. Is its drive connected?"
+                                         : "Run Setup.bat again, or set Saves & tools > Game files folder if you moved them.");
     return "";
 }
 
@@ -1694,7 +1715,14 @@ static DWORD WINAPI scan_thread(LPVOID)
     if (rc == 1 && !cancelled) {
         AcquireSRWLockExclusive(&g_scan_lock); g_scan.ran = true; g_scan.phase = "scan"; ReleaseSRWLockExclusive(&g_scan_lock);
         PostMessageA(g_hw, WM_SCAN_PROGRESS, 0, 0);
-        rc = scan_exec("\"" + exe + "\" --game \"" + g_dir + "\" --out \"" + out + "\" --backend r1d3d12 --progress", INFINITE, log);
+        // a game files folder elsewhere (Saves & tools): shaderscan reads <--game>\gamefiles or <--game> itself, and the
+        // programs from <port>\game; with --game = that folder only the EBOOT is given (--eboot), not game.elf
+        int gsrc = PORT_GF_DEFAULT;
+        const std::string gf = gf_dir(&gsrc);
+        const std::string game_arg = gsrc == PORT_GF_DEFAULT || port_gamefiles_same(gf, path_of("gamefiles"))
+            ? "--game \"" + std::string(g_dir) + "\""
+            : "--game \"" + gf + "\" --eboot \"" + path_of("game\\EBOOT.elf") + "\"";
+        rc = scan_exec("\"" + exe + "\" " + game_arg + " --out \"" + out + "\" --backend r1d3d12 --progress", INFINITE, log);
     } else rc = 0;
     g_scan.exit_code = rc;
     if (log) fclose(log);
@@ -1801,7 +1829,10 @@ static DWORD WINAPI hdui_thread(LPVOID)
     FILE* log = fopen(path_of("logs\\hd_ui_pack.log").c_str(), "w");
     AcquireSRWLockExclusive(&g_scan_lock); g_scan.ran = true; g_scan.phase = "read"; ReleaseSRWLockExclusive(&g_scan_lock);
     PostMessageA(g_hw, WM_SCAN_PROGRESS, 0, 0);
-    g_scan.exit_code = scan_exec("\"" + hdui_exe() + "\"", INFINITE, log);
+    int gsrc = PORT_GF_DEFAULT;
+    const std::string gf = gf_dir(&gsrc);     // a game files folder elsewhere (Saves & tools): tell HDUIPack where
+    g_scan.exit_code = scan_exec("\"" + hdui_exe() + "\"" + (gsrc == PORT_GF_DEFAULT ? std::string() : " --game \"" + gf + "\""),
+                                 INFINITE, log);
     // Cancel ended it (and with it the upscaler) on purpose: its "upscaler running" marker must not read as a PC that
     // froze while upscaling once the PC restarts
     if (g_scan.cancel) DeleteFileA(path_of("tools\\upscaler\\upscaler_running.txt").c_str());
@@ -2176,7 +2207,8 @@ static void dark_titlebar(HWND hw)
 
 // "Launcher.exe --play" (RecompLauncher, recomplauncher.json): no window. Rewrites settings.bat from settings.ini (the
 // RecompLauncher may have changed it), runs the shader scan, starts run.bat hidden and waits until the game has closed.
-// Exit codes: 0 = played, 3 = not built yet or game\EBOOT.elf missing (run Setup), 4 = run.bat could not start.
+// Exit codes: 0 = played, 3 = not built yet, game\EBOOT.elf or the game files missing (run Setup, or check the game
+// files folder), 4 = run.bat could not start.
 static int play_headless()
 {
     load_settings();

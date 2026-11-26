@@ -665,6 +665,7 @@ static std::string lx_local_id()
 {
     std::vector<unsigned char> b;
     char id[32];
+    if (lx_read_file(gf_path("PS3_GAME\\PARAM.SFO"), b) && pcx_sfo_get(b.data(), b.size(), "TITLE_ID", id, sizeof id) && strlen(id) == 9) return id;
     for (const char* p : { "game\\PS3_GAME\\PARAM.SFO", "gamefiles\\PS3_GAME\\PARAM.SFO", "PS3_GAME\\PARAM.SFO", "game\\PARAM.SFO" })
         if (lx_read_file(path_of(p), b) && pcx_sfo_get(b.data(), b.size(), "TITLE_ID", id, sizeof id) && strlen(id) == 9) return id;
     for (auto& e : lx_list(lx_save_dir(), false))
@@ -820,14 +821,109 @@ static std::string lx_last_bench()
     return s;
 }
 
+// ---- Game files folder (port_gamefiles.h) ---------------------------------------------------------------------
+// The folder with the player's copy of the game (PS3_GAME). Default <port>\gamefiles; another one is kept in
+// settings.ini gamefiles= / settings.bat PORT_GAMEFILES, which run.bat (PS3_VFS_ROOT) and setup.ps1 (updates) read.
+// The game also writes the PS3 hard-drive folders cache\<id> (rebuilt when missing) and game\<id> (its own data, R1:
+// quick.sav and settings) there; saved games are elsewhere (lx_save_dir).
+static std::string lx_gf_note()
+{
+    int src = PORT_GF_DEFAULT;
+    const std::string gf = gf_dir(&src);
+    std::string s = gf + (src == PORT_GF_ENV ? "   (from the PS3_VFS_ROOT environment variable, which wins over this setting)"
+                          : src == PORT_GF_SETTING ? "" : "   (the default: Setup copied your game here)");
+    if (!port_gamefiles_problem(gf, k_gf_required).empty()) s += "\nNot found or not complete: Play will not start until it is.";
+    return s;
+}
+static void lx_gf_apply(const std::string& dir)   // dir: a checked, complete game files folder
+{
+    const std::string old = gf_dir(), stored = port_gamefiles_same(dir, path_of("gamefiles")) ? "" : port_gamefiles_clean(dir);
+    std::string id = port_gamefiles_title_id(dir);
+    if (id.size() != 9) id = k_gf_title_ids[0];
+    // the game's own data on the PS3 hard drive (game\<id>): offered to the new folder when it has none, so the
+    // game does not start as on a new PS3. cache\<id> is only a cache: the game fills it again.
+    const std::string from = old + "\\game\\" + id, to = dir + "\\game\\" + id;
+    if (!port_gamefiles_same(old, dir) && port_gamefiles_is_dir(from)) {
+        LxEntry e; lx_scan(from, e);
+        LxEntry t; if (port_gamefiles_is_dir(to)) lx_scan(to, t);
+        if (e.files > 0 && t.files == 0) {
+            const int r = MessageBoxA(g_hw, ("Copy the game's data (game\\" + id + ", " + lx_size(e.bytes) + ": its settings and "
+                "the quick save) from\n" + old + "\nto the new folder?\n\nYes = copy (recommended). No = the game starts there "
+                "as on a new PS3. Your saved games are not in this folder and stay where they are.").c_str(),
+                "Game files folder", MB_YESNOCANCEL | MB_ICONQUESTION);
+            if (r == IDCANCEL) return;
+            if (r == IDYES) {
+                SHCreateDirectoryExA(NULL, (dir + "\\game").c_str(), NULL);
+                HCURSOR was = SetCursor(LoadCursor(NULL, IDC_WAIT));
+                const bool ok = lx_copy_tree(from, to);
+                SetCursor(was);
+                if (!ok) {
+                    lx_delete_tree(to);   // it was empty: do not leave half of it
+                    MessageBoxA(g_hw, ("Could not copy " + from + " to " + to + ". Is the folder writable? Nothing was changed.").c_str(),
+                                "Game files folder", MB_ICONERROR);
+                    return;
+                }
+            }
+        }
+    }
+    // the PS3 hard-drive folders the game expects (as Setup makes them); this also checks the folder is writable
+    const std::string cache = dir + "\\cache\\" + id, gdata = dir + "\\game\\" + id + "\\USRDIR";
+    SHCreateDirectoryExA(NULL, cache.c_str(), NULL); SHCreateDirectoryExA(NULL, gdata.c_str(), NULL);
+    if (!port_gamefiles_is_dir(cache) || !port_gamefiles_is_dir(gdata)) {
+        MessageBoxA(g_hw, ("The game writes to its game files folder (cache\\" + id + ", game\\" + id + "), but this one is not "
+                           "writable:\n" + dir + "\n\nPick a folder you can write to. Nothing was changed.").c_str(),
+                    "Game files folder", MB_ICONERROR);
+        return;
+    }
+    g_gamefiles = stored;
+    if (!save_settings()) { MessageBoxA(g_hw, "Could not write settings.ini / settings.bat.", "Game files folder", MB_ICONERROR); return; }
+    int src = PORT_GF_DEFAULT; gf_dir(&src);
+    if (src == PORT_GF_ENV)
+        MessageBoxA(g_hw, "Saved. But PS3_VFS_ROOT is set in your environment, and it wins over this setting: remove it "
+                          "(Windows: Edit environment variables) to use the folder picked here.", "Game files folder", MB_ICONWARNING);
+    toast(stored.empty() ? "Game files: the default folder (gamefiles)." : "Game files folder: " + stored);
+}
+static void lx_gf_pick()
+{
+    const std::string pick = lx_pick_folder(L"Pick your game files folder (the one with PS3_GAME in it)");
+    if (pick.empty()) return;
+    const std::string dir = port_gamefiles_normalize(pick);
+    const std::string bad_path = port_gamefiles_same(dir, path_of("gamefiles")) ? "" : port_gamefiles_path_problem(dir);
+    const std::string bad = !bad_path.empty() ? bad_path : port_gamefiles_problem(dir, k_gf_required);
+    if (!bad.empty()) { MessageBoxA(g_hw, (bad + "\n\nNothing was changed.").c_str(), "Game files folder", MB_ICONERROR); return; }
+    const std::string id = port_gamefiles_title_id(dir);
+    bool known = false;
+    for (const char* const* k = k_gf_title_ids; *k; k++) known = known || id == *k;
+    if (!known && MessageBoxA(g_hw, ("This copy of the game is " + (id.empty() ? std::string("of an unknown version") : id) +
+                                     ", but the port is made for " + k_gf_title_ids[0] + " (the version Setup checks). Use it anyway?").c_str(),
+                              "Game files folder", MB_YESNO | MB_ICONWARNING) != IDYES) return;
+    lx_gf_apply(dir);
+}
+static void lx_gf_default()
+{
+    const std::string def = path_of("gamefiles");
+    if (!port_gamefiles_problem(def, k_gf_required).empty()) {
+        if (MessageBoxA(g_hw, ("The default folder has no complete copy of the game:\n" + def + "\n\nUse it anyway? Play will not "
+                               "start until Setup copies your game there (or you pick a folder again).").c_str(),
+                        "Game files folder", MB_YESNO | MB_ICONWARNING) != IDYES) return;
+        g_gamefiles.clear();
+        if (!save_settings()) MessageBoxA(g_hw, "Could not write settings.ini / settings.bat.", "Game files folder", MB_ICONERROR);
+        else toast("Game files: the default folder (gamefiles).");
+        return;
+    }
+    lx_gf_apply(def);
+}
+
 enum { BT_X_BACKUP = 100, BT_X_OPEN_SAVES, BT_X_OPEN_BACKUPS, BT_X_BENCH, BT_X_BENCH_LOGS, BT_X_RESTORE, BT_X_DELETE,
-       BT_X_IMPORT, BT_X_MOD_UP, BT_X_MOD_DOWN, BT_X_MOD_TOGGLE, BT_X_OPEN_MODS, BT_X_HDUI_MAKE, BT_X_HDUI_REMOVE };
+       BT_X_IMPORT, BT_X_MOD_UP, BT_X_MOD_DOWN, BT_X_MOD_TOGGLE, BT_X_OPEN_MODS, BT_X_HDUI_MAKE, BT_X_HDUI_REMOVE,
+       BT_X_GF_PICK, BT_X_GF_DEFAULT, BT_X_GF_OPEN };
 
 static void lx_layout_tools(float x, float& y, float w)
 {
     lx_refresh(false);
     deco(D_H1, RectF(x, y, w, SF(34)), "Saves & tools"); y += SF(36);
-    deco(D_INTRO, RectF(x, y, w, SF(20)), "Back up, restore and import saved games, manage mods, and measure performance.");
+    deco(D_INTRO, RectF(x, y, w, SF(20)), "Back up, restore and import saved games, manage mods, choose where your game files "
+                                          "are, and measure performance.");
     y += SF(40);
     deco(D_H2, RectF(x, y, w, SF(22)), "SAVED GAMES"); y += SF(30);
     if (g_lx_saves.empty()) { deco(D_NOTE, RectF(x, y, w, SF(22)), "No saved games yet."); y += SF(30); }
@@ -906,6 +1002,19 @@ static void lx_layout_tools(float x, float& y, float w)
         hr.title = "Remove HD UI pack"; hr.help = "Deletes mods\\hd_ui and turns HD UI pack off."; hr.disabled = !have;
         y += SF(56);
     }
+    deco(D_H2, RectF(x, y, w, SF(22)), "GAME FILES FOLDER"); y += SF(30);
+    deco(D_NOTE, RectF(x, y, w, SF(40)), lx_gf_note());
+    y += SF(44);
+    {
+        Widget& gp = add(W_BUTTON, RectF(x, y, SF(190), SF(38)), BT_X_GF_PICK);
+        gp.title = "Choose folder..."; gp.help = "Where your copy of the game is (the folder with PS3_GAME in it), if you moved "
+            "it out of gamefiles. Play, updates and Setup use it. Checked before it is saved.";
+        Widget& gd = add(W_BUTTON, RectF(x + SF(202), y, SF(150), SF(38)), BT_X_GF_DEFAULT);
+        gd.title = "Use default"; gd.help = "Back to gamefiles in the game folder."; gd.disabled = g_gamefiles.empty();
+        Widget& go = add(W_BUTTON, RectF(x + SF(364), y, SF(150), SF(38)), BT_X_GF_OPEN);
+        go.title = "Open folder"; go.help = "Opens the game files folder in Explorer.";
+        y += SF(56);
+    }
     deco(D_H2, RectF(x, y, w, SF(22)), "BENCHMARK"); y += SF(30);
     deco(D_NOTE, RectF(x, y, w, SF(60)), "Starts the game with your settings and continues your campaign from the title "
                                          "screen by itself; in the level it waits 45 s, measures for 60 s, writes logs\\bench\\ "
@@ -970,6 +1079,12 @@ static bool lx_click(int id, int sub)
         hdui_start();
     } else if (id == BT_X_HDUI_REMOVE) {
         hdui_remove();
+    } else if (id == BT_X_GF_PICK) {
+        lx_gf_pick();
+    } else if (id == BT_X_GF_DEFAULT) {
+        lx_gf_default();
+    } else if (id == BT_X_GF_OPEN) {
+        ShellExecuteA(g_hw, "open", gf_dir().c_str(), NULL, NULL, SW_SHOWNORMAL);
     } else if (id == BT_X_BENCH) {
         if (MessageBoxA(g_hw, "Run the benchmark now?\n\nThe game starts, continues your campaign by itself, measures for 60 "
                               "seconds in the level and closes. Don't press anything while it runs.", "Benchmark",

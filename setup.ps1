@@ -22,6 +22,9 @@
 #                         and installs no build tools without -InstallTools / -PortableTools (it stops and lists them;
 #                         when the portable tools were chosen before, it fetches the missing ones into tools_cache\)
 #   -GameCopyMode Copy|Move   with -Unattended: copy or move a game folder on the same drive (default Copy)
+#   -GameFiles "<folder>"  the game files folder (the copy with PS3_GAME in it), when it is not gamefiles\ here.
+#                         Without it: PS3_VFS_ROOT (environment), else the launcher's Saves & tools > Game files
+#                         folder (settings.ini gamefiles=), else gamefiles\ - the same order as run.bat.
 #   Build tools (Python, CMake, Ninja, LLVM, Visual Studio Build Tools, Git): Setup lists the missing ones, why they are
 #   needed and where they come from, and asks before it installs anything. What it installs is recorded in
 #   tools_cache\installed_by_setup.txt (tools that were already on the PC are never recorded or removed).
@@ -44,6 +47,7 @@ param(
     [switch]$AcceptSdkLicenses, # accept the DLSS / XeSS licences without asking
     [switch]$Unattended,        # Setup.exe: no prompts (see above)
     [ValidateSet('', 'Copy', 'Move')][string]$GameCopyMode = '',
+    [string]$GameFiles = '',    # the game files folder when it is not gamefiles\ (see above)
     [switch]$InstallTools,      # install missing build tools system-wide without asking
     [switch]$PortableTools,     # put missing build tools into tools_cache\ instead (experimental)
     [switch]$AcceptMicrosoftLicense,   # with -PortableTools: Microsoft's licence for the MSVC libraries / Windows SDK
@@ -136,6 +140,26 @@ function Fail($t) {
 }
 # Finding, checking and copying the player's game copy (shared with the installer and the other ports).
 . (Join-Path $Port 'tools\installer\gamefiles.ps1')
+# The game files folder (the copy of the disc, PS3_GAME\...): -GameFiles, else PS3_VFS_ROOT from the environment,
+# else the launcher's Game files folder (settings.ini gamefiles=), else gamefiles\ in this folder (run.bat's order,
+# project\port_gamefiles.h). Updates run Setup with -Unattended, so this is how they find a folder the player moved.
+function Resolve-GameFilesDir {
+    $d = ''; $src = ''
+    if ($GameFiles) { $d = $GameFiles; $src = '-GameFiles' }
+    elseif ($env:PS3_VFS_ROOT) { $d = $env:PS3_VFS_ROOT; $src = 'the PS3_VFS_ROOT environment variable' }
+    else {
+        $ini = Join-Path $Port 'settings.ini'
+        $l = if (Test-Path -LiteralPath $ini) { @(Get-Content -LiteralPath $ini -ErrorAction SilentlyContinue | Where-Object { $_ -like 'gamefiles=*' }) | Select-Object -Last 1 }
+        if ($l -and $l.Substring(10).Trim()) { $d = $l.Substring(10).Trim(); $src = "the launcher's Game files folder (settings.ini)" }
+    }
+    $def = Join-Path $Port 'gamefiles'
+    if (-not $d) { return [pscustomobject]@{ Dir = $def; Source = ''; Custom = $false } }
+    $d = $d.Replace('/', '\'); if ($d.Length -gt 3) { $d = $d.TrimEnd('\') }
+    try { $d = [IO.Path]::GetFullPath($d) } catch {}
+    [pscustomobject]@{ Dir = $d; Source = $src; Custom = ($d.TrimEnd('\') -ne $def) }
+}
+$GameFilesInfo = Resolve-GameFilesDir
+$GameFilesDir = $GameFilesInfo.Dir
 # Build repair (fresh configuration, first error) and disk-space helpers.
 . (Join-Path $Port 'tools\build_doctor.ps1')
 # Progress bars, time estimates and logs\setup_timings.json (the step durations on this PC, for the next estimates).
@@ -423,9 +447,9 @@ function Test-ThisPC([switch]$Full) {
     if (-not ($gpus -match 'RTX')) { Chk-Note "NVIDIA DLSS needs a GeForce RTX card; on this PC use AMD FSR 3.1 or Intel XeSS." }
 
     $haveGame = $true
-    foreach ($n in $UsrFiles) { if (-not (Test-Path (Join-Path $Port "gamefiles\PS3_GAME\USRDIR\$n"))) { $haveGame = $false } }
+    foreach ($n in $UsrFiles) { if (-not (Test-Path -LiteralPath (Join-Path $GameFilesDir "PS3_GAME\USRDIR\$n"))) { $haveGame = $false } }
     # the rest of the game too (PARAM.SFO, game.psarc): a copy with only the EBOOT starts to a black screen
-    if (@($GameProfile.Required | Where-Object { -not (Test-Path -LiteralPath (Join-Path $Port "gamefiles\$_")) }).Count) { $haveGame = $false }
+    if (@($GameProfile.Required | Where-Object { -not (Test-Path -LiteralPath (Join-Path $GameFilesDir $_)) }).Count) { $haveGame = $false }
     try {
         $drv = New-Object IO.DriveInfo ([IO.Path]::GetPathRoot($Port))
         $free = [math]::Floor($drv.AvailableFreeSpace / 1GB)
@@ -499,7 +523,11 @@ function Test-ThisPC([switch]$Full) {
     elseif ($NoOptionalSdks) { Chk-Note "AMD FidelityFX frame generation: skipped (-NoOptionalSdks)." }
     else { Chk-Todo "Optional: download AMD FidelityFX frame generation 2.3.0 (~40 MB, MIT, FSR 3 Frame Generation)." }
 
-    if ($haveGame) { Chk-Ok "Game files: gamefiles\" } else { Chk-Todo "Ask for your copy of the game ($TitleId) and copy it into gamefiles\ ($GameGB GB)." }
+    if ($GameFilesInfo.Custom) {
+        if ($haveGame) { Chk-Ok "Game files: $GameFilesDir (from $($GameFilesInfo.Source))" }
+        else { Chk-Warn "Game files: $GameFilesDir (from $($GameFilesInfo.Source)) is missing or incomplete. Connect its drive, or pick the folder again in the launcher (Saves & tools > Game files folder)." }
+    }
+    elseif ($haveGame) { Chk-Ok "Game files: gamefiles\" } else { Chk-Todo "Ask for your copy of the game ($TitleId) and copy it into gamefiles\ ($GameGB GB)." }
     $dec = $true
     foreach ($n in $Sha1.Keys) { $p = Join-Path $Port "game\$n"; if (-not (Test-Path $p) -or (Sha1Of $p) -ne $Sha1[$n]) { $dec = $false } }
     if ($dec) { Chk-Ok "Decrypted program file(s): game\ (version checked)" } else { Chk-Todo "Decrypt the game's program file(s) into game\ and check the version." }
@@ -782,16 +810,19 @@ Info "Visual Studio C++ tools, LLVM, CMake, Ninja: OK"
 
 # ---------------------------------------------------------------- 2. game copy
 Step "2/5  Your copy of the game"
-$gf = Join-Path $Port 'gamefiles'
+$gf = $GameFilesDir
 $usr = Join-Path $gf 'PS3_GAME\USRDIR'
 if ((Test-Path -LiteralPath "$gf.copying") -or -not (Test-Path (Join-Path $usr 'EBOOT.BIN')) -or -not (Test-Path (Join-Path $usr 'game.self')) -or @($GameProfile.Required | Where-Object { -not (Test-Path -LiteralPath (Join-Path $gf $_)) }).Count) {
+    # a folder the player chose (launcher / PS3_VFS_ROOT) is never filled by Setup: it is their copy, maybe on a drive
+    # that is not connected now
+    if ($GameFilesInfo.Custom -and $GameFilesInfo.Source -ne '-GameFiles') { Fail "Your game files folder $gf (set by $($GameFilesInfo.Source)) is missing or not complete. Connect its drive, or pick the folder again in the launcher (Saves & tools > Game files folder), or choose Use default there to copy the game into gamefiles\ again." }
     if ($Unattended -and -not $Game) { Fail "The game copy is missing or was not copied completely, and no -Game path was given. Pick your game in Setup.exe again." }
     $err = Install-GameFiles $GameProfile $Game $gf $Port -Mode $GameCopyMode
     if ($err) { Fail $err }
 }
 # the PS3's hard-drive cache and game-data folders the game expects to exist
 New-Item -ItemType Directory -Force -Path (Join-Path $gf "cache\$TitleId"), (Join-Path $gf "game\$TitleId\USRDIR") | Out-Null
-Info "Game files: $gf"
+Info "Game files: $gf$(if ($GameFilesInfo.Custom) { " (from $($GameFilesInfo.Source))" })"
 
 # ---------------------------------------------------------------- 3. decrypt
 Step "3/5  Decrypting the game program files"

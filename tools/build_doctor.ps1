@@ -141,8 +141,11 @@ function Remove-SetupLeftovers([string]$Port, [string]$TitleId = '') {
 # Where the space in the port folder goes. Large folders setup does not make are listed separately: an extra copy of
 # the game or a second, nested copy of the port (an update unpacked into a subfolder) shows up there.
 function Show-DiskUsage([string]$Port) {
+    # setup.ps1's game files folder (Resolve-GameFilesDir): another folder in use = gamefiles\ here is an unused copy
+    $gfi = Get-Variable GameFilesInfo -ValueOnly -ErrorAction SilentlyContinue
+    $gfRow = if ($gfi -and $gfi.Custom) { "Unused game copy (gamefiles; the game uses $($gfi.Dir))" } else { 'Your game files (gamefiles)' }
     $known = [ordered]@{
-        'Your game files (gamefiles)'                 = @('gamefiles')
+        $gfRow                                        = @('gamefiles')
         'Compiled game (build folders, kept so updates rebuild only what changed)' = @('build', 'build_game', 'build_rpcs3')
         'Generated game code (recompiled)'            = @('recompiled', 'recompiled_game', 'project')
         'Code generator work folder (build_regen)'    = @('build_regen')
