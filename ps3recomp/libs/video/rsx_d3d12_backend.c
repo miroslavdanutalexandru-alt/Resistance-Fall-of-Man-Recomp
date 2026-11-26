@@ -2079,6 +2079,7 @@ static int sc_get_buffers(void)
 }
 
 #include "rsx_osd.inc"   /* in-swapchain toasts / F3 overlay (rfom_pcfeat.cpp) */
+#include "rsx_r1live.inc" /* R1_LIVE=1: live A/B of the frame-generation motion fixes (tools/r1live.py) */
 #include "rsx_dlssg.inc" /* DLSS Frame Generation through Streamline (RFOM_DLSS_FG) */
 
 static int blit_init(void)

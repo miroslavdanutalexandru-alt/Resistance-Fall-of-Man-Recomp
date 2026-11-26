@@ -202,7 +202,7 @@ static void fsr_camera(float* n, float* f, float* fov)
 static void fsr_jitter(u32 frame, float* jx, float* jy)
 {
     static int jon = -1; if (jon < 0) { const char* e = getenv("RSX_FSR_JITTER"); jon = e ? atoi(e) : 1; }
-    if (!jon || s_fsr_ab >= 2) { *jx = *jy = 0.0f; return; }   /* 4 too */   /* v184 diag: RSX_FSR_JITTER=0 / Home modes 2,3 */
+    if (!jon || s_fsr_ab >= 2 || R1L('h')) { *jx = *jy = 0.0f; return; }   /* 4 too */   /* v184 diag: RSX_FSR_JITTER=0 / Home modes 2,3 */
     /* 8 phases at 1x, 8 x (output/render)^2 when upscaling (NVIDIA's guidance) */
     const float f = g_up_frac;
     u32 ph = (u32)(8.0f / (f * f) + 0.5f); if (ph < 8u) ph = 8u; if (ph > 72u) ph = 72u;
@@ -339,6 +339,31 @@ static float fsr_match_ratio(void)
     return v;
 }
 static volatile u64 s_fsr_st_tsc;                 /* record-thread TSC ticks spent in fsr_record */
+/* R1_LIVE (rsx_r1live.inc): draws recorded with no previous-frame map (never reset), and the cumulative counters --
+ * render thread, every FSR dispatch and just before the 600-frame stats reset (reset = 1) */
+static volatile u32 s_r1l_nohist;
+static void r1l_collect(int reset)
+{
+    if (!s_r1l_on) return;
+    static u32 last[R1C_N];
+    u32 v[R1C_N]; memset(v, 0, sizeof v);
+    volatile u32* m = s_mvr_st;
+    v[R1C_KEY_NEAR] = m[MVR_KEY_NEAR]; v[R1C_KEY_PROBE] = m[MVR_KEY_PROBE]; v[R1C_NEARX] = m[MVR_RM_NEARX];
+    v[R1C_RM_BUDGET] = m[MVR_RM_BUDGET]; v[R1C_NEAR_CAM] = m[MVR_CO_NEAR];
+    v[R1C_NEAR_BUDGET] = s_mvn_st[MVWS_AMBIG][MVW_BUDGET] + s_mvn_st[MVWS_LOOSE][MVW_BUDGET];
+    v[R1C_NEAR_UNCLEAR] = s_mvn_st[MVWS_AMBIG][MVW_UNCLEAR] + s_mvn_st[MVWS_LOOSE][MVW_UNCLEAR];
+    v[R1C_NEAR_NOLOOSE] = s_mvn_st[MVWS_NOLOOSE][MVW_NONE] + s_mvn_st[MVWS_NOLOOSE][MVW_OFF];
+    v[R1C_NEAR_OTHER] = s_mvn_st[MVWS_OTHER][MVW_NONE];
+    v[R1C_RM_OK] = m[MVR_RM_OK]; v[R1C_RM_VL] = m[MVR_RM_VL]; v[R1C_LOOSE_OK] = m[MVR_LOOSE_OK]; v[R1C_LOOSE_FAIL] = m[MVR_LOOSE_FAIL];
+    v[R1C_NOKEY] = m[MVR_NOKEY]; v[R1C_NOHIST] = s_r1l_nohist; v[R1C_CAM_ONLY] = m[MVR_CAM_SPLIT] + m[MVR_CAM_FILL];
+    v[R1C_AMB_DROP] = m[MVR_AMB_DROP]; v[R1C_RM_UNCLEAR] = m[MVR_RM_UNCLEAR];
+    v[R1C_LATE] = s_mvs_st[MVS_LATE]; v[R1C_NOPSO] = s_mvs_st[MVS_NOPSO]; v[R1C_REC] = s_fsr_st_rec;
+    volatile u32* c = s_r1l_blk + 16;
+    for (int i = R1C_KEY_NEAR; i < R1C_N; i++) {
+        c[i] += v[i] - last[i];
+        last[i] = reset && i != R1C_NOHIST ? 0u : v[i];
+    }
+}
 static volatile u32 s_fsr_disp_frame; static volatile ULONGLONG s_fsr_disp_ms;   /* v184: last FSR dispatch (render thread) */
 /* RSX_DLSS_OBJMV (all three upscalers): 1 = per-object motion (previous-frame draw
  * matching) with camera motion for draws that have no match (default); 0 = camera
@@ -349,7 +374,7 @@ static int fsr_objmv(void)
     static int v = -1;
     if (v < 0) { const char* e = getenv("RSX_DLSS_OBJMV"); v = e ? atoi(e) : 1; if (v < 0 || v > 2) v = 1;
                  if (fsr_mode()) fprintf(stderr, "[FSR] object motion: %s%c", v == 0 ? "camera only" : v == 2 ? "per object, unmatched still" : "per object + camera fallback", 10); }
-    return v;
+    return R1L('f') ? 0 : v;
 }
 /* RSX_DLSS_DEBUG: what the upscaler is fed, drawn over its output (render-res
  * inputs stretched to the screen, 35% scene luminance behind):
@@ -370,7 +395,7 @@ static int fsr_dbg_view(void)
         if (v < 0 || v > 3) v = 0;
         if (v) fprintf(stderr, "[FSR] debug view %d (RSX_DLSS_DEBUG)%c", v, 10);
     }
-    return v;
+    return s_r1l_tint ? 3 : v;
 }
 static float fsr_dbg_scale(void)
 {
@@ -646,7 +671,7 @@ static int fsr_mv_rematch_on(void)
     if (v < 0) { v = dlss_env_i("RSX_DLSS_MV_REMATCH", 1, 0, 1);
                  fprintf(stderr, "[DLSS] ambiguous object matches: %s%c", v ? "re-matched by screen position (RSX_DLSS_MV_REMATCH=0: dropped)"
                                                                            : "dropped for camera motion (RSX_DLSS_MV_REMATCH=0)", 10); }
-    return v;
+    return v && !R1L('d');
 }
 static int fsr_mv_viewlock_on(void)
 {
@@ -654,7 +679,7 @@ static int fsr_mv_viewlock_on(void)
     if (v < 0) { v = dlss_env_i("RSX_DLSS_MV_VIEWLOCK", 1, 0, 1);
                  fprintf(stderr, "[DLSS] view-locked draws (weapon / arms): %s%c", v ? "matched to the draw that stayed on screen (RSX_DLSS_MV_VIEWLOCK=0: off)"
                                                                                     : "off (RSX_DLSS_MV_VIEWLOCK=0)", 10); }
-    return v;
+    return v && !R1L('c');
 }
 static int fsr_mv_loose_on(void)
 {
@@ -662,10 +687,10 @@ static int fsr_mv_loose_on(void)
     if (v < 0) { v = dlss_env_i("RSX_DLSS_MV_LOOSE", 1, 0, 1);
                  fprintf(stderr, "[DLSS] draws whose material changed: %s%c", v ? "matched by program and mesh, verified by position (RSX_DLSS_MV_LOOSE=0: off)"
                                                                                : "camera motion (RSX_DLSS_MV_LOOSE=0)", 10); }
-    return v;
+    return v && !R1L('d');
 }
 static int fsr_mv_diag(void) { static int v = -1; if (v < 0) { v = dlss_env_i("RSX_DLSS_MV_DIAG", 0, 0, 1); if (v) fprintf(stderr, "[DLSS] RSX_DLSS_MV_DIAG=1: every draw's origin probed, [FG-MVN] lines while frame generation is on%c", 10); } return v; }
-static int fsr_mv_rm_n(void) { static int v = -1; if (v < 0) v = dlss_env_i("RSX_DLSS_MV_REMATCH_N", 256, 0, 8192); return v; }
+static int fsr_mv_rm_n(void) { static int v = -1; if (v < 0) v = dlss_env_i("RSX_DLSS_MV_REMATCH_N", 256, 0, 8192); return R1L('e') ? 8192 : v; }
 static double fsr_mv_rm_ratio(void)
 {
     static double v = -1.0;
@@ -735,7 +760,7 @@ static u64 fsr_rm_tsc_cap(void)
 {
     static int us = -1; static u64 t0, cap; static LARGE_INTEGER q0, qf;
     if (us < 0) { us = dlss_env_i("RSX_DLSS_MV_REMATCH_US", 2000, 0, 100000); QueryPerformanceFrequency(&qf); QueryPerformanceCounter(&q0); t0 = __rdtsc(); }
-    if (!us) return 0;
+    if (!us || R1L('e')) return 0;
     if (!cap) {   /* TSC rate from the first >= 50 ms after start-up (3 GHz until then) */
         LARGE_INTEGER q1; QueryPerformanceCounter(&q1);
         const double s = qf.QuadPart ? (double)(q1.QuadPart - q0.QuadPart) / (double)qf.QuadPart : 0.0;
@@ -1028,7 +1053,7 @@ static void fsr_record_impl(D3D12DrawRecord* dr, int vs_idx, char* dst, const ch
     const u32 ord = ce ? ce->n++ : 0xFFFFFFFFu;
     const int objmv = fsr_objmv();
     int kn = 0;   /* fsr_key_near: 2 = this key is view-attached (weapon / arms), 1 = not, 0 = unknown */
-    if (ce && objmv == 1 && fsr_mv_rematch_on() && fsr_mv_viewlock_on() && fsr_vm_w() > 0.0f) {
+    if (ce && objmv == 1 && fsr_mv_rematch_on() && fsr_mv_viewlock_on() && fsr_vm_w() > 0.0f && !R1L('b')) {   /* R1_LIVE b: 6b84476 */
         if (ord == 0) {
             const FsrMapE* pe = s_fsr_map_frame[pm] == fr - 1u ? fsr_find(s_fsr_map[pm], s_fsr_map_gen[pm], h, 0) : NULL;
             u8 v = pe ? pe->vn : 0;
@@ -1038,6 +1063,7 @@ static void fsr_record_impl(D3D12DrawRecord* dr, int vs_idx, char* dst, const ch
         kn = ce->vn;
     }
     int nokey = 0;   /* the key had no draw last frame (new object, or its material changed) */
+    if (objmv && s_fsr_map_frame[pm] != fr - 1u) s_r1l_nohist++;
     if (objmv && s_fsr_map_frame[pm] == fr - 1u) {
         FsrMapE* e = fsr_find(s_fsr_map[pm], s_fsr_map_gen[pm], h, 0);
         nokey = !e || !e->val;
@@ -1156,7 +1182,7 @@ static void fsr_record_impl(D3D12DrawRecord* dr, int vs_idx, char* dst, const ch
         const u64 co = fsr_cam_prev(vs_idx, csrc, epi, rows, nr, fr, ring);
         if (co != ~0ull) { prev_off = co; dr->fsr_mt = 4; s_fsr_st_cam++; }
     }
-    if ((dr->fsr_mt == 0 || dr->fsr_mt == 4) && objmv == 1 && port_stats_log()) {   /* what is still camera-only */
+    if ((dr->fsr_mt == 0 || dr->fsr_mt == 4) && objmv == 1 && (port_stats_log() || s_r1l_on)) {   /* what is still camera-only */
         s_mvr_st[dr->fsr_mt == 4 ? MVR_CAM_SPLIT : MVR_CAM_FILL]++;
         if (!mvw) mvw = MVWS_OTHER << 4;
         if (nokey) s_mvr_st[MVR_NOKEY]++;
@@ -2931,6 +2957,7 @@ static void cam_fill(u32 rw, u32 rh, float vw, float vh, const double* M, float 
 static void fsr_dispatch(void)
 {
     s_rs_epoch++;
+    r1l_collect(0);
     { static int hw = 0; const int hd = rsx_debug_keys() && (GetAsyncKeyState(VK_HOME) & 0x8000) != 0;   /* PORT_DEBUG_KEYS=1 */
       if (hd && !hw) {
           s_fsr_ab = (s_fsr_ab + 1) % 6;
@@ -3219,6 +3246,7 @@ static void fsr_dispatch(void)
                       m[MVR_KEY_NEAR], m[MVR_KEY_PROBE],
                       wb[0], wb[1], wb[2], wb[3], wb[4], wb[5], wb[6], 10);
           }
+          r1l_collect(1);
           for (int i = 0; i < MVR_N; i++) s_mvr_st[i] = 0;
           memset((void*)s_mvn_st, 0, sizeof s_mvn_st); memset((void*)s_mvn_w, 0, sizeof s_mvn_w);
           memset(s_mvs_st, 0, sizeof s_mvs_st);
