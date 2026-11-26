@@ -1095,6 +1095,7 @@ static void ml_opts_watch(uint32_t player)
     memcpy(last, cur, sizeof last); have = 1;
 }
 extern "C" volatile unsigned long long g_rfom_play_ms;
+extern "C" volatile unsigned long g_rfom_play_frames;
 extern "C" volatile int g_rfom_pause_ui;
 extern "C" volatile int g_rfom_space_start;
 /* Issue #14: hooked into three vehicle input functions (game.json), at the
@@ -1537,6 +1538,13 @@ extern "C" void rfom_mouselook_pre(uint32_t player)
           if (n++ < 40) fprintf(stderr, "[script] player sequence %s%s\n", sc ? "started: 30 fps pacing" : "ended: full frame rate", ""); } }
     g_rfom_space_start = 0;   /* v160v: in play */
     g_rfom_play_ms = GetTickCount64();   /* v162: in-game menu mode is off while this is fresh */
+    { g_rfom_play_frames = g_rfom_play_frames + 1; }   /* cellPad.c zoom hold: frames in play */
+    /* PAD_AIM_TEST_SLOW_MS=<1..200>: test only -- each frame in play takes that much longer (issue #37:
+     * the zoom hold's click must survive long frames) */
+    { static int slow = -1; if (slow < 0) { const char* e = getenv("PAD_AIM_TEST_SLOW_MS"); slow = e ? atoi(e) : 0;
+                                            if (slow < 0 || slow > 200) slow = 0;
+                                            if (slow) fprintf(stderr, "[controls] PAD_AIM_TEST_SLOW_MS: +%d ms a frame in play\n", slow); }
+      if (slow) Sleep((DWORD)slow); }
     g_rfom_pause_ui = 0;
     /* v167 diag: Shift+F10 records the player object (first 16 KB, every frame,
      * 30 s) to logs\\player_trace.bin, to find where position / velocity live.
