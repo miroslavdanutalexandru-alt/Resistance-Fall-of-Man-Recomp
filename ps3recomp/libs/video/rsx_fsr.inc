@@ -2785,6 +2785,99 @@ void fsr_cap_dump(const char* dir, u32 fi, u32 nd)
     }
     fprintf(stderr, "[FSR] capture: motion/depth dumped (Home mode %d)%c", s_fsr_ab, 10);
 }
+/* RSX_MV_DUMP=<K> (2..64; unset / 0 = off): offline motion-vector quality dumps (tools/fgq_r1.py), the R2/R3 keys:
+ * Pause (RSX_MV_DUMP_KEY=<Windows VK code>), RSX_MV_DUMP_AFTER=<s> (once, s seconds after the first scene),
+ * RSX_MV_DUMP_AUTO=<s> (every s seconds of play, up to 6 bursts) or a file logs\mvdump.now (checked once a second,
+ * renamed mvdump.done) arm a burst of K consecutive scene frames. Each stores what the upscaler / frame generation were
+ * handed -- colour, depth r32f, motion vectors rg16f (UV, previous - current) -- plus the motion pass's depth before
+ * the camera fill, whose value is the pixel's source (4 no draw, -1-z no match, -3-z ambiguous, 0..1 matched):
+ * <RSX_MV_DUMP_DIR, default logs\mvdump>\burstNN\fNN_{col,z,zpre,mv}.raw (16-byte header: w h pitch dxgi, rows padded
+ * to 256 bytes) and a JSON line per frame in frames.jsonl (camera matrix the fill used, jitter, sizes). Copies ride
+ * the frame's command list; the readback at present waits for the GPU (a short stall per dumped frame only). */
+typedef struct { ID3D12Resource* r; D3D12_RESOURCE_STATES st; u32 w, h, f; } MvdTex;
+static MvdTex s_mvd_t[4];   /* render thread: colour, depth, depth before the fill, motion */
+static const char* const s_mvd_nm[4] = { "col", "z", "zpre", "mv" };
+static int s_mvd_k = -1, s_mvd_key = 0x13, s_mvd_left, s_mvd_idx, s_mvd_auto_n, s_mvd_have, s_mvd_keywas;
+static double s_mvd_after = -1.0, s_mvd_auto = 0.0;
+static u32 s_mvd_burst;
+static ULONGLONG s_mvd_t0, s_mvd_tauto, s_mvd_tchk;
+static char s_mvd_meta[2048];
+static char s_mvd_dir[260] = "logs\\mvdump";
+static int fsr_mvd_on(void)
+{
+    if (s_mvd_k < 0) {
+        const char* e = getenv("RSX_MV_DUMP");
+        s_mvd_k = (e && *e && atoi(e) > 0) ? (atoi(e) < 2 ? 2 : atoi(e) > 64 ? 64 : atoi(e)) : 0;
+        if ((e = getenv("RSX_MV_DUMP_KEY")) && *e) s_mvd_key = (int)strtol(e, NULL, 0);
+        if ((e = getenv("RSX_MV_DUMP_AFTER")) && *e) s_mvd_after = atof(e);
+        if ((e = getenv("RSX_MV_DUMP_AUTO")) && *e) s_mvd_auto = atof(e);
+        if ((e = getenv("RSX_MV_DUMP_DIR")) && *e) snprintf(s_mvd_dir, sizeof s_mvd_dir, "%s", e);
+        if (s_mvd_k) fprintf(stderr, "[mvdump] RSX_MV_DUMP=%d: key 0x%X / logs\\mvdump.now%s%s arm a burst of %d scene frames -> %s%c", s_mvd_k, s_mvd_key,
+                             s_mvd_after >= 0.0 ? ", once after RSX_MV_DUMP_AFTER s" : "", s_mvd_auto > 0.0 ? ", every RSX_MV_DUMP_AUTO s" : "", s_mvd_k, s_mvd_dir, 10);
+    }
+    return s_mvd_k > 0;
+}
+static void fsr_mvd_arm(const char* why)
+{
+    if (s_mvd_left) return;
+    s_mvd_left = s_mvd_k; s_mvd_idx = 0; s_mvd_burst++;
+    char d[300]; CreateDirectoryA(s_mvd_dir, NULL);
+    snprintf(d, sizeof d, "%s\\burst%02u", s_mvd_dir, s_mvd_burst); CreateDirectoryA(d, NULL);
+    fprintf(stderr, "[mvdump] burst %u armed (%s): next %d scene frames%c", s_mvd_burst, why, s_mvd_k, 10);
+}
+/* fsr_dispatch: 1 = dump this scene frame */
+static int fsr_mvd_frame(void)
+{
+    if (!fsr_mvd_on()) return 0;
+    if (!s_mvd_t0) { s_mvd_t0 = s_mvd_tauto = GetTickCount64(); }
+    const ULONGLONG now = GetTickCount64();
+    if (s_mvd_after >= 0.0 && now - s_mvd_t0 >= (ULONGLONG)(s_mvd_after * 1000.0)) { s_mvd_after = -1.0; fsr_mvd_arm("RSX_MV_DUMP_AFTER"); }
+    if (s_mvd_auto > 0.0 && s_mvd_auto_n < 6 && now - s_mvd_tauto >= (ULONGLONG)(s_mvd_auto * 1000.0)) {
+        s_mvd_tauto = now; s_mvd_auto_n++; fsr_mvd_arm("RSX_MV_DUMP_AUTO"); }
+    return s_mvd_left > 0 && !s_mvd_have;
+}
+/* copy src (its state tracked in *st) into dump texture i; both end in COPY_SOURCE */
+static void fsr_mvd_copy(int i, ID3D12Resource* src, D3D12_RESOURCE_STATES* st)
+{
+    if (!src) return;
+    MvdTex* t = &s_mvd_t[i];
+    D3D12_RESOURCE_DESC d; src->lpVtbl->GetDesc(src, &d);
+    if (t->r && (t->w != (u32)d.Width || t->h != d.Height || t->f != (u32)d.Format)) { grave_defer(t->r); t->r = NULL; }
+    if (!t->r) {
+        t->r = fsr_tex((u32)d.Width, d.Height, d.Format, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST, NULL);
+        if (!t->r) return;
+        t->st = D3D12_RESOURCE_STATE_COPY_DEST; t->w = (u32)d.Width; t->h = d.Height; t->f = (u32)d.Format;
+    }
+    fsr_barrier(src, st, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    fsr_barrier(t->r, &t->st, D3D12_RESOURCE_STATE_COPY_DEST);
+    s_d3d.cmd_list->lpVtbl->CopyResource(s_d3d.cmd_list, t->r, src);
+    fsr_barrier(t->r, &t->st, D3D12_RESOURCE_STATE_COPY_SOURCE);
+}
+/* render_frame_impl, every presented frame: triggers, and the readback of a dumped frame */
+static void fsr_mvd_present(u32 fi)
+{
+    if (!fsr_mvd_on()) return;
+    { const int dn = (GetAsyncKeyState(s_mvd_key) & 0x8000) != 0;
+      if (dn && !s_mvd_keywas) fsr_mvd_arm("key");
+      s_mvd_keywas = dn; }
+    { const ULONGLONG now = GetTickCount64();
+      if (now - s_mvd_tchk > 1000) { s_mvd_tchk = now;
+          if (GetFileAttributesA("logs\\mvdump.now") != INVALID_FILE_ATTRIBUTES) {
+              MoveFileExA("logs\\mvdump.now", "logs\\mvdump.done", MOVEFILE_REPLACE_EXISTING); fsr_mvd_arm("logs\\mvdump.now"); } } }
+    if (!s_mvd_have) return;
+    s_mvd_have = 0;
+    char path[400];
+    for (int i = 0; i < 4; i++) {
+        if (!s_mvd_t[i].r) continue;
+        snprintf(path, sizeof path, "%s\\burst%02u\\f%02d_%s.raw", s_mvd_dir, s_mvd_burst, s_mvd_idx, s_mvd_nm[i]);
+        cap_readback_write(s_mvd_t[i].r, s_mvd_t[i].w, s_mvd_t[i].h, s_mvd_t[i].f, D3D12_RESOURCE_STATE_COPY_SOURCE, fi, path);
+    }
+    snprintf(path, sizeof path, "%s\\burst%02u\\frames.jsonl", s_mvd_dir, s_mvd_burst);
+    FILE* f = fopen(path, "a");
+    if (f) { fprintf(f, "{\"f\": %d, %s}\n", s_mvd_idx, s_mvd_meta); fclose(f); }
+    s_mvd_idx++;
+    if (--s_mvd_left <= 0) { s_mvd_left = 0; fprintf(stderr, "[mvdump] burst %u written: %d frames in %s\\burst%02u%c", s_mvd_burst, s_mvd_idx, s_mvd_dir, s_mvd_burst, 10); }
+}
 /* ---- RFOM_DLSS_CAM: camera solve (render thread) and the camera fill ---- */
 static ID3D12RootSignature* s_cf_rs; static ID3D12PipelineState* s_cf_pso; static ID3D12DescriptorHeap* s_cf_heap;
 static UINT s_cf_inc; static u32 s_cf_ring; static int s_cf_fail;
@@ -3047,6 +3140,8 @@ static void fsr_dispatch(void)
     const float uf = (s_fsr_up_r > 0.0f && s_fsr_up_r < 1.0f) ? s_fsr_up_r : 1.0f;
     const u32 rw = uf < 1.0f ? (u32)((float)w * uf + 0.5f) : w, rh = uf < 1.0f ? (u32)((float)h * uf + 0.5f) : h;
     ID3D12GraphicsCommandList* cl = s_d3d.cmd_list;
+    const int mvd = fsr_mvd_frame();   /* RSX_MV_DUMP: the motion pass's depth before the fill (each pixel's source) */
+    if (mvd) fsr_mvd_copy(2, s_fsr_z, &s_fsr_z_st);
     /* RFOM_DLSS_CAM: exact camera motion into the pixels no matched draw covered */
     int cam_cut = 0;
     double fg_M[16]; int fg_has_M = 0;   /* DLSS-G: the camera the fill used (none = no camera motion) */
@@ -3092,6 +3187,19 @@ static void fsr_dispatch(void)
     fsr_barrier(s_fsr_z, &s_fsr_z_st, rd);
     fsr_barrier(s_fsr_rx, &s_fsr_rx_st, rd);
     fsr_barrier(s_fsr_out, &s_fsr_out_st, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    if (mvd) {   /* RSX_MV_DUMP: what the upscaler / frame generation are handed */
+        fsr_mvd_copy(0, rt->res, &rt->st); fsr_mvd_copy(1, s_fsr_z, &s_fsr_z_st); fsr_mvd_copy(3, s_fsr_mv, &s_fsr_mv_st);
+        off_rt_transition(slot, rd); fsr_barrier(s_fsr_mv, &s_fsr_mv_st, rd); fsr_barrier(s_fsr_z, &s_fsr_z_st, rd);
+        float jx = 0.0f, jy = 0.0f; fsr_jitter(s_fsr_frame_r, &jx, &jy);
+        int n = snprintf(s_mvd_meta, sizeof s_mvd_meta, "\"frame\": %u, \"w\": %u, \"h\": %u, \"rw\": %u, \"rh\": %u, \"col_dxgi\": %u, \"jit_px\": [%.6f, %.6f], "
+                         "\"fill\": %d, \"fill_jit_ndc\": [%.8f, %.8f], \"cut\": %d, \"fg\": %d, \"t_ms\": %llu, \"M\": ",
+                         s_fsr_frame_r, w, h, rw, rh, (u32)rt->dxgi, jx, jy, s_cf_armed, fg_j[0], fg_j[1], cam_cut, s_fg_on, (unsigned long long)GetTickCount64());
+        if (fg_has_M) { n += snprintf(s_mvd_meta + n, sizeof s_mvd_meta - n, "[");
+                        for (int i = 0; i < 16 && n < (int)sizeof s_mvd_meta - 32; i++) n += snprintf(s_mvd_meta + n, sizeof s_mvd_meta - n, "%s%.10g", i ? ", " : "", fg_M[i]);
+                        snprintf(s_mvd_meta + n, sizeof s_mvd_meta - n, "]"); }
+        else snprintf(s_mvd_meta + n, sizeof s_mvd_meta - n, "null");
+        s_mvd_have = 1;
+    }
 
     struct ffxDispatchDescUpscale dd; memset(&dd, 0, sizeof dd);
     dd.header.type = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;

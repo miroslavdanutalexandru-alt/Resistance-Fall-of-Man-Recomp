@@ -13652,6 +13652,7 @@ skip_dump_consider: ;
         }
       } }
 
+    if (s_present_this_frame && !s_in_midflush) fsr_mvd_present(fi);   /* RSX_MV_DUMP (off by default) */
     if (s_present_this_frame && !s_in_midflush) { fx_scale_frame_end(); fsr_frame_end(); ssao_frame_end(); }   /* v165 */
     /* v173 diag (PORT_DEBUG_KEYS=1 only): Ctrl+F12 logs a one-line summary of each of the next 900
      * presented frames to logs\framelog.txt (draw counts per target, distinct
