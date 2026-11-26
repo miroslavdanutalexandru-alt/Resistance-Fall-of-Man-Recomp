@@ -622,6 +622,16 @@ static void test_mv_rematch()
 	CHECK(rfom_mv_rematch_pick(s5, 1, 0.5, 0.03) == -1);
 	const double s6[2] = { -1.0, -1.0 };
 	CHECK(rfom_mv_rematch_pick(s6, 2, 0.5, 0.5) == -1);
+	// view-still: an unmatched near-eye draw that stayed where last frame's view-attached pieces were
+	CHECK(rfom_va_still(0.01, 0.3) == 1);    // gun steady on screen during a fast turn
+	CHECK(rfom_va_still(0.07, 0.4) == 1);    // sway/bob, still far less than the camera moved
+	CHECK(rfom_va_still(0.3, 0.3) == 0);     // near world object: moved with the camera
+	CHECK(rfom_va_still(0.05, 0.02) == 0);   // slow turn: not clearly closer to the anchor than the camera path
+	CHECK(rfom_va_still(0.01, 0.0) == 1);    // camera still
+	CHECK(rfom_va_still(-1.0, 0.3) == 0);    // no anchor last frame
+	CHECK(rfom_va_still(0.02, -1.0) == 1);   // no solved camera: tight limit only
+	CHECK(rfom_va_still(0.05, -1.0) == 0);
+	CHECK(rfom_va_still(0.09, 2.0) == 0);    // hard limit
 }
 #endif
 

@@ -4,8 +4,9 @@
  *       [5] match tint on, [6] active variant (char), [7] request (client writes: 'a'..'h' variant, '+' / '-' tint),
  *       [8] counter count; u32 counters from byte 64 (R1C_*, cumulative, never reset).
  * Variants (R1_LIVE_VAR = start variant, default a):
- *   a  6b5bbd7 fix: view-attached keys (weapon / arms) re-matched past the re-match caps
- *   b  old (6b84476): no key probes, only the 64-a-frame near-eye check once over the time cap; draw cap applies
+ *   a  current fix: RSX_DLSS_MV_VIEWSTILL (unmatched view-attached draws still) + 6b5bbd7 (re-matched past the caps)
+ *   b  old (6b84476): no key probes, no view-still, only the 64-a-frame near-eye check over the time cap
+ *   i  6b5bbd7 only (view-still off)
  *   c  view-lock off            d  re-match + loose off (camera-only for ambiguous / material-changed draws)
  *   e  fix, no re-match caps    f  camera-only motion for every draw (RSX_DLSS_OBJMV=0)
  *   g  frame generation off     h  upscaler jitter off
@@ -14,9 +15,9 @@
 
 enum { R1C_FRAMES, R1C_FG_FRAMES, R1C_KEY_NEAR, R1C_KEY_PROBE, R1C_NEARX, R1C_RM_BUDGET, R1C_NEAR_CAM, R1C_NEAR_BUDGET,
        R1C_NEAR_UNCLEAR, R1C_NEAR_NOLOOSE, R1C_NEAR_OTHER, R1C_RM_OK, R1C_RM_VL, R1C_LOOSE_OK, R1C_LOOSE_FAIL, R1C_NOKEY,
-       R1C_NOHIST, R1C_CAM_ONLY, R1C_AMB_DROP, R1C_RM_UNCLEAR, R1C_LATE, R1C_NOPSO, R1C_REC, R1C_N };
+       R1C_NOHIST, R1C_CAM_ONLY, R1C_AMB_DROP, R1C_RM_UNCLEAR, R1C_LATE, R1C_NOPSO, R1C_REC, R1C_VA_STILL, R1C_VA_WORLD, R1C_N };
 #define R1L_MAGIC 0x564C3152u
-#define R1L_VARS "abcdefgh"
+#define R1L_VARS "abcdefghi"
 
 static volatile int s_r1l_on;     /* R1_LIVE=1 and the mapping exists */
 static volatile int s_r1l_var;    /* active variant letter (0 = live off: every R1L() test is false) */
@@ -28,7 +29,7 @@ static int s_r1l_osd_ok;          /* the letter reached the OSD (it may come up 
 static const char* r1l_name(int v)
 {
     switch (v) {
-    case 'a': return "fix (6b5bbd7)";
+    case 'a': return "fix (view-still + 6b5bbd7)";
     case 'b': return "old (6b84476)";
     case 'c': return "view-lock off";
     case 'd': return "re-match+loose off";
@@ -36,6 +37,7 @@ static const char* r1l_name(int v)
     case 'f': return "camera-only MV";
     case 'g': return "FG off";
     case 'h': return "SR jitter off";
+    case 'i': return "6b5bbd7 only";
     }
     return "?";
 }

@@ -15,12 +15,12 @@ import ctypes, ctypes.wintypes as wt, subprocess, sys, time, struct
 MAGIC = 0x564C3152
 NAMES = ["frames", "fg_frames", "key_near", "key_probe", "nearx", "rm_budget", "near_cam", "near_budget",
          "near_unclear", "near_noloose", "near_other", "rm_ok", "rm_vl", "loose_ok", "loose_fail", "nokey",
-         "nohist", "cam_only", "amb_drop", "rm_unclear", "late", "nopso", "rec"]
-SHORT = ["key_near", "nearx", "rm_budget", "near_cam", "near_budget", "near_unclear", "near_noloose", "near_other",
+         "nohist", "cam_only", "amb_drop", "rm_unclear", "late", "nopso", "rec", "va_still", "va_world"]
+SHORT = ["va_still", "va_world", "key_near", "nearx", "rm_budget", "near_cam", "near_budget", "near_unclear", "near_noloose", "near_other",
          "rm_ok", "rm_vl", "loose_fail", "nokey", "nohist", "cam_only", "late"]
-VARS = {"a": "fix (6b5bbd7): view-attached keys past the re-match caps", "b": "old (6b84476)", "c": "view-lock off",
+VARS = {"a": "fix: view-still + 6b5bbd7", "b": "old (6b84476)", "c": "view-lock off",
         "d": "re-match + loose off", "e": "fix, no re-match caps", "f": "camera-only motion", "g": "FG off",
-        "h": "SR jitter off"}
+        "h": "SR jitter off", "i": "6b5bbd7 only (view-still off)"}
 EXES = ("ResistanceFoMGame.exe", "ResistanceFoM.exe")
 k32 = ctypes.WinDLL("kernel32", use_last_error=True)
 k32.OpenFileMappingW.restype = wt.HANDLE

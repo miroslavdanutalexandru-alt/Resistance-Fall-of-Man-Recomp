@@ -239,5 +239,15 @@ static inline int rfom_mv_rematch_pick(const double* s, int n, double ratio, dou
     if (s2 < 0.0 || s[b] <= ratio * s2 || s2 <= 1e-4) return b;
     return -1;
 }
+/* RSX_DLSS_MV_VIEWSTILL (rsx_fsr.inc fsr_va_still): a near-eye draw about to get camera-only motion. obs = how far its
+ * probe point lies from the nearest view-attached point of last frame (weapon / arms pieces share one origin), cam =
+ * how far from where the camera alone would have put it last frame (-1 = unknown). 1 = it followed the view, not the
+ * world: zero screen motion is its motion (a first-person weapon), camera motion would smear it across the turn. */
+static inline int rfom_va_still(double obs, double cam)
+{
+    if (!(obs >= 0.0) || obs > 0.08) return 0;
+    if (!(cam >= 0.0)) return obs <= 0.03;
+    return obs <= 0.02 + 0.5 * cam;
+}
 
 #endif
