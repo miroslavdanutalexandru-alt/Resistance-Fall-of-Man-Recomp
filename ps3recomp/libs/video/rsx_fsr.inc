@@ -2887,7 +2887,7 @@ static const char s_cf_hlsl[] =
 "Texture2D<float> dep : register(t0);\n"
 "RWTexture2D<float2> mvo : register(u0);\n"
 "RWTexture2D<float> zo : register(u1);\n"
-"cbuffer K : register(b0) { float4 m0, m1, m2, m3; float4 j; uint4 f; };\n"   /* j = jitter ndc xy, render w h; f = has depth, has M, rw, rh */
+"cbuffer K : register(b0) { float4 m0, m1, m2, m3; float4 j; uint4 f; float4 g; };\n"   /* j = jitter ndc xy, render w h; f = has depth, has M, rw, rh; g.x = zero-motion depth floor */
 "[numthreads(8, 8, 1)] void main(uint3 id : SV_DispatchThreadID) {\n"
 "    if (id.x >= f.z || id.y >= f.w) return;\n"
 "    float z = zo[id.xy];\n"
@@ -2895,7 +2895,9 @@ static const char s_cf_hlsl[] =
 "    if (z == 4.0) d = f.x ? dep[id.xy] : 1.0;\n"      /* no draw wrote here: the scene's depth */
 "    else if (z <= -0.5 && z > -2.5) d = saturate(-1.0 - z);\n"     /* a draw with no previous-frame match: its depth */
 "    else if (z <= -2.5 && z > -4.5) { d = saturate(-3.0 - z); if (!f.y) { zo[id.xy] = d; return; } }\n"   /* ambiguous match: its own motion unless there is a camera */
-"    else { if (!(z >= 0.0 && z <= 1.0)) zo[id.xy] = saturate(z); return; }\n"   /* never hand the upscaler / FG a depth outside 0..1 */
+"    else if (!(z >= 0.0 && z <= 1.0)) { zo[id.xy] = saturate(z); return; }\n"   /* never hand the upscaler / FG a depth outside 0..1 */
+"    else if (f.y && z >= g.x && all(mvo[id.xy] == float2(0, 0))) d = z;\n"   /* matched, exactly zero motion, far: camera motion (see RSX_DLSS_MV_ZEROFIX) */
+"    else return;\n"
 "    zo[id.xy] = d;\n"
 "    float2 mv = float2(0, 0);\n"
 "    if (f.y) {\n"
@@ -2915,7 +2917,7 @@ static int cf_init(void)
     rg[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; rg[0].NumDescriptors = 1; rg[0].BaseShaderRegister = 0; rg[0].OffsetInDescriptorsFromTableStart = 0;
     rg[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV; rg[1].NumDescriptors = 2; rg[1].BaseShaderRegister = 0; rg[1].OffsetInDescriptorsFromTableStart = 1;
     D3D12_ROOT_PARAMETER rp[2]; memset(rp, 0, sizeof rp);
-    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS; rp[0].Constants.ShaderRegister = 0; rp[0].Constants.Num32BitValues = 24;
+    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS; rp[0].Constants.ShaderRegister = 0; rp[0].Constants.Num32BitValues = 28;
     rp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE; rp[1].DescriptorTable.NumDescriptorRanges = 2; rp[1].DescriptorTable.pDescriptorRanges = rg;
     rp[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
@@ -3105,13 +3107,27 @@ static void cam_fill(u32 rw, u32 rh, float vw, float vh, const double* M, float 
       uv.Format = DXGI_FORMAT_R16G16_FLOAT; s_d3d.device->lpVtbl->CreateUnorderedAccessView(s_d3d.device, s_fsr_mv, NULL, &uv, c1);
       c1.ptr += s_cf_inc;
       uv.Format = DXGI_FORMAT_R32_FLOAT;    s_d3d.device->lpVtbl->CreateUnorderedAccessView(s_d3d.device, s_fsr_z, NULL, &uv, c1); }
-    u32 k[24]; memset(k, 0, sizeof k);
+    /* RSX_DLSS_MV_ZEROFIX (default 1): a matched draw whose previous constants equal its current ones
+     * gets exactly zero motion. R1 world draws (floors, facades) do that while the camera turns -- the
+     * view transform is not in their constants -- so they ghosted under FG (mvdump: 22-48% of the
+     * bad pixels, all at depth >= 0.95). Such pixels at depth >= RSX_DLSS_MV_ZEROFIX_Z (default 0.5;
+     * the weapon sits at ~0.18) take the camera motion instead. */
+    static float zfz = -1.0f;
+    if (zfz < 0.0f) {
+        const int on = dlss_env_i("RSX_DLSS_MV_ZEROFIX", 1, 0, 1);
+        const char* e = getenv("RSX_DLSS_MV_ZEROFIX_Z"); float t = e ? (float)atof(e) : 0.5f;
+        if (!(t >= 0.0f && t <= 1.0f)) t = 0.5f;
+        zfz = on ? t : 2.0f;
+        fprintf(stderr, "[DLSS] zero-motion far draws: %s (z >= %.2f)%c", on ? "camera motion" : "kept (RSX_DLSS_MV_ZEROFIX=0)", t, 10);
+    }
+    u32 k[28]; memset(k, 0, sizeof k);
     if (M) for (int i = 0; i < 16; i++) { const float f = (float)M[i]; memcpy(&k[i], &f, 4); }
     { const float jj[4] = { jnx, jny, vw, vh }; memcpy(&k[16], jj, 16); }
     k[20] = dres ? 1u : 0u; k[21] = M ? 1u : 0u; k[22] = rw; k[23] = rh;
+    memcpy(&k[24], &zfz, 4);
     cl->lpVtbl->SetDescriptorHeaps(cl, 1, &s_cf_heap);
     cl->lpVtbl->SetComputeRootSignature(cl, s_cf_rs);
-    cl->lpVtbl->SetComputeRoot32BitConstants(cl, 0, 24, k, 0);
+    cl->lpVtbl->SetComputeRoot32BitConstants(cl, 0, 28, k, 0);
     cl->lpVtbl->SetComputeRootDescriptorTable(cl, 1, gh);
     cl->lpVtbl->SetPipelineState(cl, s_cf_pso);
     cl->lpVtbl->Dispatch(cl, (rw + 7u) / 8u, (rh + 7u) / 8u, 1u);

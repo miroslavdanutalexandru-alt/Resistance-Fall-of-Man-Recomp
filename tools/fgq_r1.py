@@ -17,8 +17,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import fgq  # noqa: E402
 
 NAMES = {0: "no draw->camera", 1: "no match->camera", 2: "ambiguous", 3: "matched=camera", 4: "matched own", 5: "matched zero"}
-DT = {2: np.float32, 10: np.float16, 16: np.float16, 41: np.float32, 28: np.uint8, 87: np.uint8, 24: np.uint32}
-CH = {2: 4, 10: 4, 16: 2, 41: 1, 28: 4, 87: 4, 24: 1}
+DT = {2: np.float32, 10: np.float16, 16: np.float32, 34: np.float16, 41: np.float32, 28: np.uint8, 87: np.uint8, 24: np.uint32}
+CH = {2: 4, 10: 4, 16: 2, 34: 2, 41: 1, 28: 4, 87: 4, 24: 1}
 
 
 def load_raw(path):
@@ -56,6 +56,11 @@ def camera_mv(meta, d):
         mx = np.where(ok, (p[..., 0] / p[..., 3] - nx) * 0.5, 0.0)
         my = np.where(ok, (p[..., 1] / p[..., 3] - ny) * -0.5, 0.0)
     return np.stack([mx, my], -1).astype(np.float32)
+
+
+def measure(c0, c1, mv, sign):
+    big = max(np.percentile(np.abs(mv[..., 0]) * mv.shape[1], 99.5), np.percentile(np.abs(mv[..., 1]) * mv.shape[0], 99.5)) > 16
+    return (fgq.analyse_ctf if big else fgq.analyse)(c0, c1, mv, sign=sign)
 
 
 def classes(meta, zpre, z, mv):
@@ -105,14 +110,14 @@ def main():
         if sg is None:   # the first pair decides the sign convention
             best = None
             for s in (1.0, -1.0):
-                r = fgq.analyse(c0, c1, mv, sign=s)
+                r = measure(c0, c1, mv, s)
                 w = fgq.report(r)["within"]
                 if best is None or w > best[0]:
                     best = (w, s, r)
             sg, r = best[1], best[2]
-            print("sign %+d (within-1px %.1f%% vs %.1f%% the other way)" % (sg, 100 * best[0], 100 * fgq.report(fgq.analyse(c0, c1, mv, sign=-sg))["within"]))
+            print("sign %+d (within-1px %.1f%% vs %.1f%% the other way)" % (sg, 100 * best[0], 100 * fgq.report(measure(c0, c1, mv, -sg))["within"]))
         else:
-            r = fgq.analyse(c0, c1, mv, sign=sg)
+            r = measure(c0, c1, mv, sg)
         cl = classes(mb, zpre, z, mv)
         o = fgq.report(r, cl, NAMES)
         v = r["valid"]; ok = v & (r["err"] <= 1.0)

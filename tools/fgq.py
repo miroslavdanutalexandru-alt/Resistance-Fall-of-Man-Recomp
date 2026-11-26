@@ -90,3 +90,71 @@ def report(r, classes=None, names=None, px=1.0):
                          float((ok & m).sum() / max(1, (v & m).sum())), float((bad & m).sum() / tb)))
         out["classes"] = rows
     return out
+
+def down(a, f):
+    H, W = a.shape[:2]; h, w = H // f, W // f
+    return a[:h * f, :w * f].reshape(h, f, w, f).mean(axis=(1, 3))
+
+def gather(a, y, x):
+    H, W = a.shape
+    return a[np.clip(y, 0, H - 1), np.clip(x, 0, W - 1)]
+
+def analyse_ctf(c0, c1, mv1, f=4, pr=3, tex_thr=0.01, sign=1.0, Rf=4):
+    """analyse() for large motion: full search on a 1/f pyramid level (window from the MVs' p99.5), then a
+    +-Rf refinement at full resolution around each pixel's coarse match. Same outputs as analyse()."""
+    H, W = c1.shape[:2]
+    l0 = tonemap(luma(c0)).astype(np.float32); l1 = tonemap(luma(c1)).astype(np.float32)
+    mx = sign * mv1[..., 0] * W; my = sign * mv1[..., 1] * H
+    yy, xx = np.mgrid[0:H, 0:W]
+    wl = bilinear(l0.astype(np.float64), yy + my, xx + mx)
+    e_mv = np.abs(l1 - wl); e_0 = np.abs(l1 - l0)
+    d0, d1 = down(l0, f), down(l1, f)
+    R = int(min(64, np.ceil(max(np.percentile(np.abs(mx), 99.5), np.percentile(np.abs(my), 99.5)) / f) + 3))
+    h, w = d1.shape
+    best = np.full((h, w), np.inf, np.float32); bdy = np.zeros((h, w), np.int32); bdx = np.zeros((h, w), np.int32)
+    ssd = lambda dy, dx: box((d1 - shift(d0, dy, dx)) ** 2, 2).astype(np.float32)
+    for dy in range(-R, R + 1):
+        for dx in range(-R, R + 1):
+            s = ssd(dy, dx); m = s < best; best[m] = s[m]; bdy[m] = dy; bdx[m] = dx
+    second = np.full((h, w), np.inf, np.float32)
+    for dy in range(-R, R + 1):
+        for dx in range(-R, R + 1):
+            s = ssd(dy, dx); far = (np.abs(dy - bdy) > 1) | (np.abs(dx - bdx) > 1)
+            m = far & (s < second); second[m] = s[m]
+    unamb_c = (second > 2.0 * best + 1e-7) & (np.abs(bdx) < R) & (np.abs(bdy) < R)
+    up = lambda a: np.repeat(np.repeat(a, f, 0), f, 1)
+    pad = lambda a: np.pad(a, ((0, H - a.shape[0]), (0, W - a.shape[1])), mode="edge")
+    cy = pad(up(bdy * f)); cx = pad(up(bdx * f)); unamb_c = pad(up(unamb_c.astype(np.uint8))) > 0
+    # refine around the coarse match and around the motion vector's own prediction; the lower SSD wins
+    fbest = np.full((H, W), np.inf, np.float32); ex = np.zeros((H, W)); ey = np.zeros((H, W)); edge = np.zeros((H, W), bool)
+    for ccy, ccx in ((cy, cx), (np.rint(my).astype(np.int32), np.rint(mx).astype(np.int32))):
+        maps = {}
+        cb = np.full((H, W), np.inf, np.float32); fy = np.zeros((H, W), np.int32); fx = np.zeros((H, W), np.int32)
+        for dy in range(-Rf - 1, Rf + 2):
+            for dx in range(-Rf - 1, Rf + 2):
+                s = box((l1 - gather(l0, yy + ccy + dy, xx + ccx + dx)) ** 2, pr).astype(np.float32)
+                maps[(dy, dx)] = s
+                if abs(dy) <= Rf and abs(dx) <= Rf:
+                    m = s < cb; cb[m] = s[m]; fy[m] = dy; fx[m] = dx
+        def nbv(oy, ox):
+            o = np.full((H, W), np.inf, np.float32)
+            for (a, b), s in maps.items():
+                m = (fy + oy == a) & (fx + ox == b); o[m] = s[m]
+            return o
+        xm, xp, ym, yp = nbv(0, -1), nbv(0, 1), nbv(-1, 0), nbv(1, 0)
+        with np.errstate(all="ignore"):
+            dnx = xm - 2 * cb + xp; dny = ym - 2 * cb + yp
+            sx = np.where(dnx > 0, 0.5 * (xm - xp) / dnx, 0.0); sy = np.where(dny > 0, 0.5 * (ym - yp) / dny, 0.0)
+        w_ = cb < fbest
+        fbest[w_] = cb[w_]
+        ex[w_] = (ccx + fx + np.clip(sx, -0.5, 0.5))[w_]; ey[w_] = (ccy + fy + np.clip(sy, -0.5, 0.5))[w_]
+        edge[w_] = ((np.abs(fy) >= Rf) | (np.abs(fx) >= Rf))[w_]
+    var = box(l1 ** 2, pr) - box(l1, pr) ** 2
+    textured = var > tex_thr ** 2
+    inb = (yy + ey >= 0) & (yy + ey <= H - 1) & (xx + ex >= 0) & (xx + ex <= W - 1)
+    valid = textured & unamb_c & (best_up := pad(up(best)) < 0.25 * pad(up(box(d1 ** 2, 2) - box(d1, 2) ** 2)) + 1e-6) & (fbest < 0.25 * var + 1e-6) & inb \
+        & ~edge
+    jx = float(np.median((ex - mx)[valid])) if valid.any() else 0.0; jy = float(np.median((ey - my)[valid])) if valid.any() else 0.0
+    if abs(jx) > 1.0 or abs(jy) > 1.0: jx = jy = 0.0
+    err = np.hypot(ex - mx - jx, ey - my - jy)
+    return dict(e_mv=e_mv, e_0=e_0, err=err, valid=valid, ex=ex, ey=ey, mx=mx, my=my, jx=jx, jy=jy, R=R * f)
