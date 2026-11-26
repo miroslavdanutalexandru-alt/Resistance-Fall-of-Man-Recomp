@@ -239,7 +239,8 @@ static int fsr_hist_init(void)
     return 1;
 }
 
-typedef struct { u64 key; u32 val; u32 gen; u32 n; } FsrMapE;   /* n: v189 draws of this key so far (ordinal) */
+typedef struct { u64 key; u32 val; u32 gen; u32 n; u8 vn; } FsrMapE;   /* n: v189 draws of this key so far (ordinal);
+                                                                         vn: s_fsr_map only, the key is view-attached (fsr_key_near) */
 static FsrMapE s_fsr_map[2][FSR_MAP_N];  static u32 s_fsr_map_gen[2], s_fsr_map_frame[2];
 static FsrMapE s_fsr_occ[FSR_MAP_N];     static u32 s_fsr_occ_gen;
 /* v189: exact-match lookups by (key, hfull) and (key, hvar), same generations as
@@ -266,7 +267,7 @@ static u32   s_fsr_lnext[FSR_RING][FSR_HIST_SLOTS];
 /* record-side object-motion counters for the "[DLSS] object motion/600" line (PORT_STATS_LOG=1) */
 enum { MVR_RM_OK, MVR_RM_VL, MVR_LOOSE_OK, MVR_RM_UNCLEAR, MVR_RM_NOPROBE, MVR_RM_NOEVAL, MVR_RM_NOREF, MVR_RM_BUDGET,
        MVR_AMB_DROP, MVR_NOKEY, MVR_LOOSE_FAIL, MVR_CAM_SPLIT, MVR_CAM_FILL,
-       MVR_CO_RIGID, MVR_CO_SKIN, MVR_CO_NOEVAL, MVR_CO_UNK, MVR_CO_NEAR, MVR_RM_NEARX, MVR_N };
+       MVR_CO_RIGID, MVR_CO_SKIN, MVR_CO_NOEVAL, MVR_CO_UNK, MVR_CO_NEAR, MVR_RM_NEARX, MVR_KEY_NEAR, MVR_KEY_PROBE, MVR_N };
 static volatile u32 s_mvr_st[MVR_N];
 /* why a draw kept camera-only motion (dr->fsr_why): stage << 4 | re-match failure */
 enum { MVW_NONE, MVW_BUDGET, MVW_UNCLEAR, MVW_NOPROBE, MVW_NOEVAL, MVW_NOREF, MVW_NOCAND, MVW_OFF, MVW_N };
@@ -286,7 +287,7 @@ static FsrMapE* fsr_find(FsrMapE* t, u32 gen, u64 key, int insert)
 {
     u32 i = (u32)(key ^ (key >> 29)) & (FSR_MAP_N - 1u);
     for (u32 n = 0; n < FSR_MAP_N; n++, i = (i + 1u) & (FSR_MAP_N - 1u)) {
-        if (t[i].gen != gen) { if (!insert) return NULL; t[i].gen = gen; t[i].key = key; t[i].val = 0; t[i].n = 0; return &t[i]; }
+        if (t[i].gen != gen) { if (!insert) return NULL; t[i].gen = gen; t[i].key = key; t[i].val = 0; t[i].n = 0; t[i].vn = 0; return &t[i]; }
         if (t[i].key == key) return &t[i];
     }
     return NULL;
@@ -635,7 +636,8 @@ static int fsr_vm_near(int vs_idx, const char* csrc, u32 fr)
  * tighter limit (0.05 ndc). Match type 8 (purple).
  * RSX_DLSS_MV_REMATCH_N (default 256) / RSX_DLSS_MV_REMATCH_US (default 2000): at most this many draws / microseconds a frame
  * are spent re-matching (FIFO thread cost); the rest keep the old camera-only motion ("over budget") -- except draws
- * whose origin is within RSX_DLSS_VIEWMODEL_W of the eye (weapon / arms, drawn after the world): still re-matched.
+ * whose key is view-attached (fsr_key_near: origin within RSX_DLSS_VIEWMODEL_W of the eye -- weapon / arms, drawn among
+ * the world): still re-matched, at most 128 a frame.
  * RSX_DLSS_MV_DIAG=1 (diagnostic, default 0): every scene draw's origin is probed (clip x, y, w) and, while frame
  * generation is on, every 3rd frame's draws within 4 units of the eye are logged ([FG-MVN] lines, at most 300 frames). */
 static int fsr_mv_rematch_on(void)
@@ -743,7 +745,7 @@ static u64 fsr_rm_tsc_cap(void)
     return cap;
 }
 static int fsr_rematch_body(int vs_idx, const char* csrc, const float* epi, const u32* rows, u32 nr, u32 fr, u32 ring, u32 slot,
-                            const u32* cand, int nc, double lim, int* vl);
+                            const u32* cand, int nc, double lim, int* vl, int nocap);
 static int fsr_rm_fail(int mvr, int why) { s_mvr_st[mvr]++; s_rm_why = why; return -1; }
 /* the draw's object origin (one vertex-program run) lies within RSX_DLSS_VIEWMODEL_W of the eye: weapon / arms */
 static int fsr_rm_near_quick(int vs_idx, const char* csrc, const float* epi)
@@ -759,29 +761,49 @@ static int fsr_rm_near_quick(int vs_idx, const char* csrc, const float* epi)
     if (!fsr_probe(ve, pg, (const float*)csrc, epi, 0, o, q)) return 0;
     return (o[0] != 0.0f || o[1] != 0.0f || o[2] != 0.0f || o[3] != 0.0f) && rfom_viewmodel_near(o[0], o[1], o[3], vm);
 }
-static int fsr_rematch(int vs_idx, const char* csrc, const float* epi, const u32* rows, u32 nr, u32 fr, u32 ring, u32 slot,
-                       const u32* cand, int nc, double lim, int* vl)
+/* Is this draw key view-attached (weapon / arms)? Probed on the key's first draw of a frame when last frame had no
+ * answer for it (and every 64th frame per key), carried in the key's map entry: 2 near the eye, 1 not, 0 unknown
+ * (over the 256 probes a frame). Matched weapon draws are never re-matched, so the over-budget path could not learn
+ * it from them; FMD2 showed every near-eye over-budget fallback dropped before the 64-probe cap reached the weapon. */
+static u8 fsr_key_near(int vs_idx, const char* csrc, const float* epi, u32 fr)
 {
-    static u32 tf; static u64 used;   /* FIFO thread only */
+    static u32 bf, bn;   /* FIFO thread only */
+    if (bf != fr) { bf = fr; bn = 0; }
+    if (bn >= 256u) return 0;
+    bn++; s_mvr_st[MVR_KEY_PROBE]++;
+    if (!fsr_rm_near_quick(vs_idx, csrc, epi)) return 1;
+    s_mvr_st[MVR_KEY_NEAR]++;
+    return 2;
+}
+/* kn: the key's fsr_key_near state. A view-attached key (2) is re-matched past the time and draw caps (at most 128 such
+ * draws a frame); an unknown key (0) over the time cap gets the old one-probe check (64 a frame); a known far key fails. */
+static int fsr_rematch(int vs_idx, const char* csrc, const float* epi, const u32* rows, u32 nr, u32 fr, u32 ring, u32 slot,
+                       const u32* cand, int nc, double lim, int* vl, int kn)
+{
+    static u32 tf, nk; static u64 used;   /* FIFO thread only */
     *vl = 0;
-    if (tf != fr) { tf = fr; used = 0; }
+    if (tf != fr) { tf = fr; used = 0; nk = 0; }
     const u64 cap = fsr_rm_tsc_cap();
     s_rm_why = MVW_NONE;
-    if (cap && used >= cap) {   /* over budget: the weapon and arms (drawn after the world) still get re-matched */
-        static u32 nf, nn;
-        if (nf != fr) { nf = fr; nn = 0; }
-        if (nn >= 64u) return fsr_rm_fail(MVR_RM_BUDGET, MVW_BUDGET);
-        nn++;
-        if (!fsr_rm_near_quick(vs_idx, csrc, epi)) return fsr_rm_fail(MVR_RM_BUDGET, MVW_BUDGET);
+    const int nocap = kn == 2 && nk < 128u;
+    if (nocap) nk++;
+    if (cap && used >= cap) {   /* over budget: the weapon and arms (drawn among the world) still get re-matched */
+        if (!nocap) {
+            static u32 nf, nn;
+            if (nf != fr) { nf = fr; nn = 0; }
+            if (kn != 0 || nn >= 64u) return fsr_rm_fail(MVR_RM_BUDGET, MVW_BUDGET);
+            nn++;
+            if (!fsr_rm_near_quick(vs_idx, csrc, epi)) return fsr_rm_fail(MVR_RM_BUDGET, MVW_BUDGET);
+        }
         s_mvr_st[MVR_RM_NEARX]++;
     }
     const u64 t0 = __rdtsc();
-    const int r = fsr_rematch_body(vs_idx, csrc, epi, rows, nr, fr, ring, slot, cand, nc, lim, vl);
+    const int r = fsr_rematch_body(vs_idx, csrc, epi, rows, nr, fr, ring, slot, cand, nc, lim, vl, nocap);
     used += __rdtsc() - t0;
     return r;
 }
 static int fsr_rematch_body(int vs_idx, const char* csrc, const float* epi, const u32* rows, u32 nr, u32 fr, u32 ring, u32 slot,
-                            const u32* cand, int nc, double lim, int* vl)
+                            const u32* cand, int nc, double lim, int* vl, int nocap)
 {
     *vl = 0;
     if (nc <= 0 || vs_idx < 0 || vs_idx >= s_d3d.vp_vs_n || !nr) { s_rm_why = MVW_NOCAND; return -1; }
@@ -789,8 +811,10 @@ static int fsr_rematch_body(int vs_idx, const char* csrc, const float* epi, cons
     if (!ve->ucode || !ve->ucode_n) return fsr_rm_fail(MVR_RM_NOEVAL, MVW_NOEVAL);
     static u32 bf, bn;   /* FIFO thread only */
     if (bf != fr) { bf = fr; bn = 0; }
-    if (bn >= (u32)fsr_mv_rm_n()) return fsr_rm_fail(MVR_RM_BUDGET, MVW_BUDGET);
-    bn++;
+    if (!nocap) {
+        if (bn >= (u32)fsr_mv_rm_n()) return fsr_rm_fail(MVR_RM_BUDGET, MVW_BUDGET);
+        bn++;
+    }
     CamProg* pg = fsr_cam_prog(ve);
     if (pg->pk == 2) return fsr_rm_fail(MVR_RM_NOEVAL, MVW_NOEVAL);
     fsr_prog_st(ve, pg, csrc);
@@ -1003,6 +1027,16 @@ static void fsr_record_impl(D3D12DrawRecord* dr, int vs_idx, char* dst, const ch
     FsrMapE* ce = fsr_find(s_fsr_map[s_fsr_map_cur], s_fsr_map_gen[s_fsr_map_cur], h, 1);
     const u32 ord = ce ? ce->n++ : 0xFFFFFFFFu;
     const int objmv = fsr_objmv();
+    int kn = 0;   /* fsr_key_near: 2 = this key is view-attached (weapon / arms), 1 = not, 0 = unknown */
+    if (ce && objmv == 1 && fsr_mv_rematch_on() && fsr_mv_viewlock_on() && fsr_vm_w() > 0.0f) {
+        if (ord == 0) {
+            const FsrMapE* pe = s_fsr_map_frame[pm] == fr - 1u ? fsr_find(s_fsr_map[pm], s_fsr_map_gen[pm], h, 0) : NULL;
+            u8 v = pe ? pe->vn : 0;
+            if (!v || ((fr + (u32)(h >> 40)) & 63u) == 0u) v = fsr_key_near(vs_idx, csrc, epi, fr);
+            ce->vn = v;
+        }
+        kn = ce->vn;
+    }
     int nokey = 0;   /* the key had no draw last frame (new object, or its material changed) */
     if (objmv && s_fsr_map_frame[pm] == fr - 1u) {
         FsrMapE* e = fsr_find(s_fsr_map[pm], s_fsr_map_gen[pm], h, 0);
@@ -1092,7 +1126,7 @@ static void fsr_record_impl(D3D12DrawRecord* dr, int vs_idx, char* dst, const ch
                             u32 cd[4]; int vl = 0;
                             const int nc = fsr_chain_topk(e->val ? e->val - 1u : 0xFFFFFFFFu, s_fsr_next[pr],
                                                           (const float (*)[FSR_SIG_ROWS * 4])s_fsr_sig[pr], sig, cd, 4);
-                            const int r = fsr_rematch(vs_idx, csrc, epi, rows, nr, fr, ring, slot, cd, nc, 0.5, &vl);
+                            const int r = fsr_rematch(vs_idx, csrc, epi, rows, nr, fr, ring, slot, cd, nc, 0.5, &vl, kn);
                             if (r >= 0) { best = cd[r]; dr->fsr_mt = vl ? 7 : 6; s_mvr_st[vl ? MVR_RM_VL : MVR_RM_OK]++; }
                             else mvw = MVWS_AMBIG << 4 | s_rm_why;
                         } else mvw = MVWS_AMBIG << 4 | MVW_OFF;
@@ -1112,7 +1146,7 @@ static void fsr_record_impl(D3D12DrawRecord* dr, int vs_idx, char* dst, const ch
             const u32 pr = (fr - 1u) % FSR_RING;
             u32 cd[4]; int vl = 0;
             const int nc = fsr_chain_topk(le->val - 1u, s_fsr_lnext[pr], (const float (*)[FSR_SIG_ROWS * 4])s_fsr_sig[pr], sig, cd, 4);
-            const int r = fsr_rematch(vs_idx, csrc, epi, rows, nr, fr, ring, slot, cd, nc, 0.05, &vl);
+            const int r = fsr_rematch(vs_idx, csrc, epi, rows, nr, fr, ring, slot, cd, nc, 0.05, &vl, kn);
             if (r >= 0) { prev_off = ((u64)pr * s_fsr_slots + cd[r]) * FSR_HIST_STRIDE; dr->fsr_mt = 8; dr->fsr_pslot = cd[r];
                           s_fsr_st_match++; s_mvr_st[MVR_LOOSE_OK]++; }
             else { s_mvr_st[MVR_LOOSE_FAIL]++; mvw = MVWS_LOOSE << 4 | s_rm_why; }
@@ -3176,12 +3210,13 @@ static void fsr_dispatch(void)
               fprintf(stderr, "[DLSS] camera-only near the eye/600: ambiguous %u (over budget %u, unclear %u, no probe %u, not evaluable %u,"
                               " no reference %u, no candidates %u, re-match off %u) | material changed %u (loose: over budget %u, unclear %u,"
                               " no reference %u, other %u; no loose candidate %u, loose off %u) | other %u | over budget but near the eye: re-matched"
-                              " anyway %u | camera-only origin depth: behind %u, <0.5 %u, <1 %u, <2 %u, <5 %u, <20 %u, farther %u%c",
+                              " anyway %u | view-attached keys found %u (keys probed %u) | camera-only origin depth: behind %u, <0.5 %u, <1 %u, <2 %u, <5 %u, <20 %u, farther %u%c",
                       na, n[MVWS_AMBIG][MVW_BUDGET], n[MVWS_AMBIG][MVW_UNCLEAR], n[MVWS_AMBIG][MVW_NOPROBE], n[MVWS_AMBIG][MVW_NOEVAL],
                       n[MVWS_AMBIG][MVW_NOREF], n[MVWS_AMBIG][MVW_NOCAND], n[MVWS_AMBIG][MVW_OFF],
                       nl, n[MVWS_LOOSE][MVW_BUDGET], n[MVWS_LOOSE][MVW_UNCLEAR], n[MVWS_LOOSE][MVW_NOREF],
                       nl - n[MVWS_LOOSE][MVW_BUDGET] - n[MVWS_LOOSE][MVW_UNCLEAR] - n[MVWS_LOOSE][MVW_NOREF],
                       n[MVWS_NOLOOSE][MVW_NONE], n[MVWS_NOLOOSE][MVW_OFF], n[MVWS_OTHER][MVW_NONE], m[MVR_RM_NEARX],
+                      m[MVR_KEY_NEAR], m[MVR_KEY_PROBE],
                       wb[0], wb[1], wb[2], wb[3], wb[4], wb[5], wb[6], 10);
           }
           for (int i = 0; i < MVR_N; i++) s_mvr_st[i] = 0;
