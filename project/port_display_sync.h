@@ -39,6 +39,8 @@
  *    60 Hz: no FG 60 (interval 1);     FG 2x 30 -> 60.
  * No plan (no pacing, the frame limit stays the player's) when even k = 1 would render fewer than 30
  * frames/s, where the games slow down (60 Hz + FG 3x = 20, 50 Hz + FG 2x = 25).
+ * A PC that can't hold the plan steps to k + 1 (144 Hz: 72 -> 48 rather than a steady 36) and tries the
+ * faster plan again later (pds_adapt_frame, PORT_PACING_ADAPT; never faster than the setting allows).
  * Movies (30 fps): vsync interval 1 -- even on 60/120/240 Hz; on 144 / 165 Hz the pattern alternates
  * 5/5/5/5/4 resp. 5/6 refreshes, the least judder a fixed 144 / 165 Hz screen can show for 29.97 fps. */
 #ifndef PORT_DISPLAY_SYNC_H
@@ -151,6 +153,19 @@ typedef struct {
     double limiter;   /* the rendered-frame limit to set (real, a hair faster when vsync sets the pace) */
 } pds_plan;
 
+/* plan for exactly k refreshes per shown frame */
+static inline void pds_plan_fill(double hz, int mult, int k, pds_plan* p)
+{
+    p->mult = mult; p->hz = hz;
+    p->k = k;
+    p->sync = mult > 1 ? 1 : k;
+    p->shown = hz / k;
+    p->real = p->shown / mult;
+    /* vsync waits set the pace when every present is one interval: no frame generation (interval k), or
+     * frame generation showing every refresh. Otherwise (generated frames every k-th refresh at
+     * interval 1) the limiter must hold the exact rate or frames slip to k-1 refreshes. */
+    p->limiter = (mult == 1 || k == 1) ? p->real * 1.003 : p->real;
+}
 /* hz = refresh rate (measured), mult = frame-generation multiplier (1 = off), max_real = pds_max_real().
  * The smallest k whose rendered rate is <= max_real; if that falls below min_real (where the game
  * slows down), one k less when that exists. Still below min_real (k = 1: hz / mult < min_real, e.g.
@@ -165,14 +180,7 @@ static inline void pds_make_plan(double hz, int mult, double max_real, double mi
     if (k > 1 && hz / k / mult < min_real - 0.01) k--;
     p->mult = mult; p->hz = hz;
     if (hz / k / mult < min_real - 0.01) return;
-    p->k = k;
-    p->sync = mult > 1 ? 1 : k;
-    p->shown = hz / k;
-    p->real = p->shown / mult;
-    /* vsync waits set the pace when every present is one interval: no frame generation (interval k), or
-     * frame generation showing every refresh. Otherwise (generated frames every k-th refresh at
-     * interval 1) the limiter must hold the exact rate or frames slip to k-1 refreshes. */
-    p->limiter = (mult == 1 || k == 1) ? p->real * 1.003 : p->real;
+    pds_plan_fill(hz, mult, k, p);
 }
 
 static inline int pds_plan_same(const pds_plan* a, const pds_plan* b)
@@ -193,6 +201,185 @@ static inline void pds_plan_str(const pds_plan* p, char* out, size_t n)
     else
         snprintf(out, n, "%.2f Hz: %.2f fps, each frame %d refresh%s (vsync interval %d)",
                  p->hz, p->real, p->k, p->k == 1 ? "" : "es", p->sync);
+}
+
+/* ---- Adaptive step-down (PORT_PACING_ADAPT, default on; 0 = always the plan above) ---------------------
+ * The plan above comes from the frame-rate setting alone. A PC that can't hold it then shows every late
+ * frame for one more k (144 Hz, setting 60: 72 fps planned, a PC doing 40-70 gets a steady 36 -- 4
+ * refreshes a frame -- although 48, 3 refreshes, would hold). So, while fixed-refresh pacing runs:
+ *  - a frame "misses its slot" when it comes PDS_AD_LATE refreshes or more after the plan period (sync
+ *    interval k shows a late frame k refreshes later, Vulkan FIFO one refresh later);
+ *  - more than PDS_AD_SLOW_FRAC of the frames of the last PDS_AD_WIN_MS missing -> k + 1 (72 -> 48 at
+ *    144 Hz, 55 -> 41.25 at 165 Hz), again if still missing, never below min_real (30);
+ *  - after PDS_AD_HOLD_MS with no window above PDS_AD_CLEAN_FRAC misses at the slower plan, the faster
+ *    one is tried; if more than PDS_AD_PROBE_FAIL of its frames miss within PDS_AD_PROBE_MS (checked from
+ *    PDS_AD_PROBE_MIN_MS on), back at once, and the next try waits twice as long (up to
+ *    PDS_AD_HOLD_MAX_MS; also when the faster plan fails within PDS_AD_FAST_OK_MS of being taken). The
+ *    present timing can't tell how much headroom a frame had (vsync hides it), so the faster plan is
+ *    tried rather than predicted.
+ *  - never faster than the plan above (the player's limit); gaps of PDS_AD_STALL_MS or more (loading,
+ *    hangs, pause -- port_frametime.h's stall) restart the window; single frames over PDS_AD_HITCH_MS
+ *    (hitches, a loading screen's slow frames) don't count, nor do windows under PDS_AD_MIN_FPS frames/s.
+ *    Not with VRR or without fixed-refresh pacing. */
+#define PDS_AD_WIN_MS 2000.0
+#define PDS_AD_STALL_MS 1000.0
+#define PDS_AD_HITCH_MS 100.0
+#define PDS_AD_LATE 0.5
+#define PDS_AD_SLOW_FRAC 0.20
+#define PDS_AD_CLEAN_FRAC 0.02
+#define PDS_AD_HOLD_MS 10000.0
+#define PDS_AD_HOLD_MAX_MS 120000.0
+#define PDS_AD_PROBE_MS 3000.0
+#define PDS_AD_PROBE_MIN_MS 500.0
+#define PDS_AD_PROBE_FAIL 0.25
+#define PDS_AD_FAST_OK_MS 30000.0
+#define PDS_AD_MIN_FPS 20.0
+#define PDS_AD_MAX_EXTRA 4
+#define PDS_AD_RING 1024
+enum { PDS_AD_NONE = 0, PDS_AD_SLOWER = 1, PDS_AD_TRY_FASTER = 2, PDS_AD_BACK = 3 };
+
+/* PORT_PACING_ADAPT: unset / empty / anything else = on; "0", "off", "no", "false" = off */
+static inline int pds_parse_adapt(const char* e)
+{
+    if (!e || !*e) return 1;
+    char b[8]; size_t i = 0;
+    for (; e[i] && i < sizeof b - 1; i++) b[i] = (char)((e[i] >= 'A' && e[i] <= 'Z') ? e[i] + 32 : e[i]);
+    b[i] = 0;
+    return !(!strcmp(b, "0") || !strcmp(b, "off") || !strcmp(b, "no") || !strcmp(b, "false"));
+}
+
+/* The plan made slower by `extra` refreshes per frame (0 = pds_make_plan's), as far as min_real allows.
+ * Returns the extra steps applied. No plan (k = 0) stays no plan. */
+static inline int pds_make_plan_step(double hz, int mult, double max_real, double min_real, int extra, pds_plan* p)
+{
+    pds_make_plan(hz, mult, max_real, min_real, p);
+    if (p->k < 1 || extra <= 0) return 0;
+    int k = p->k + (extra > PDS_AD_MAX_EXTRA ? PDS_AD_MAX_EXTRA : extra);
+    while (k > p->k && hz / k / p->mult < min_real - 0.01) k--;
+    const int got = k - p->k;
+    if (got) pds_plan_fill(hz, p->mult, k, p);
+    return got;
+}
+static inline int pds_plan_max_extra(double hz, int mult, double max_real, double min_real)
+{
+    pds_plan p;
+    return pds_make_plan_step(hz, mult, max_real, min_real, PDS_AD_MAX_EXTRA, &p);
+}
+
+typedef struct {
+    int enabled;
+    int extra;           /* refreshes per frame added to the plan (0 = the player's) */
+    int probing;         /* trying the faster plan */
+    int why;             /* PDS_AD_* of the last change */
+    double frac;         /* misses (0..1) behind the last change */
+    double hold;         /* clean time at the slower plan before the next try (ms) */
+    double last;         /* previous frame (ms), < 0 = none */
+    double win0;         /* window (re)started, < 0 = at the next frame */
+    double clean0;       /* misses last seen / window restarted */
+    double probe0;       /* the try started */
+    double fast_t;       /* last step to a faster plan, < 0 = none */
+    int pn, pmiss;       /* frames / misses since the try started */
+    double rt[PDS_AD_RING];
+    unsigned char rm[PDS_AD_RING];
+    int head, n, nmiss;  /* ring of the frames in the window: oldest at head */
+} pds_adapt;
+
+static inline void pds_adapt_restart(pds_adapt* a)
+{
+    a->head = a->n = a->nmiss = 0;
+    a->last = -1.0; a->win0 = -1.0;
+}
+static inline void pds_adapt_init(pds_adapt* a, int enabled)
+{
+    memset(a, 0, sizeof *a);
+    a->enabled = enabled;
+    a->hold = PDS_AD_HOLD_MS;
+    a->fast_t = -1.0;
+    pds_adapt_restart(a);
+}
+/* Back to the player's plan (pacing off, frame generation switched...). */
+static inline void pds_adapt_reset(pds_adapt* a) { pds_adapt_init(a, a->enabled); }
+
+/* Once a rendered frame while a plan (k >= 1) paces: now = its present time (ms), period_ms = the plan's
+ * rendered-frame period (1000 / real), refresh_ms = 1000 / hz, max_extra = pds_plan_max_extra. Returns 1 when a->extra changed
+ * (a->why / a->frac say why): make the plan again with pds_make_plan_step(..., a->extra, ...). */
+static inline int pds_adapt_frame(pds_adapt* a, double now, double period_ms, double refresh_ms, int max_extra)
+{
+    if (!a->enabled || !(period_ms > 0.0) || !(refresh_ms > 0.0)) return 0;
+    if (max_extra < 0) max_extra = 0;
+    if (a->extra > max_extra) {   /* the refresh rate / limit changed under it */
+        a->extra = max_extra; a->probing = 0; a->why = PDS_AD_NONE; a->frac = 0.0;
+        pds_adapt_restart(a);
+        return 1;
+    }
+    if (a->win0 < 0.0) { a->win0 = a->clean0 = now; if (a->probing) { a->probe0 = now; a->pn = a->pmiss = 0; } }
+    if (a->last < 0.0) { a->last = now; return 0; }
+    const double dt = now - a->last;
+    a->last = now;
+    if (dt >= PDS_AD_STALL_MS || dt < 0.0) {   /* loading / hang / pause: nothing before it counts */
+        a->head = a->n = a->nmiss = 0;
+        a->win0 = a->clean0 = now;
+        if (a->probing) { a->probe0 = now; a->pn = a->pmiss = 0; }
+        return 0;
+    }
+    if (dt > PDS_AD_HITCH_MS) return 0;   /* a hitch (shader compile, streaming) or a loading screen's frame: no frame rate */
+    const int miss = dt > period_ms + PDS_AD_LATE * refresh_ms;
+    if (a->n == PDS_AD_RING) { a->nmiss -= a->rm[a->head]; a->head = (a->head + 1) % PDS_AD_RING; a->n--; }
+    { const int i = (a->head + a->n) % PDS_AD_RING; a->rt[i] = now; a->rm[i] = (unsigned char)miss; a->n++; a->nmiss += miss; }
+    while (a->n && a->rt[a->head] < now - PDS_AD_WIN_MS) { a->nmiss -= a->rm[a->head]; a->head = (a->head + 1) % PDS_AD_RING; a->n--; }
+
+    if (a->probing) {
+        a->pn++; a->pmiss += miss;
+        if (now - a->probe0 >= PDS_AD_PROBE_MIN_MS && a->pn >= 10 && a->pmiss > PDS_AD_PROBE_FAIL * a->pn) {
+            a->frac = (double)a->pmiss / a->pn;
+            a->extra++; a->probing = 0; a->why = PDS_AD_BACK;
+            a->hold = a->hold * 2.0 > PDS_AD_HOLD_MAX_MS ? PDS_AD_HOLD_MAX_MS : a->hold * 2.0;
+            pds_adapt_restart(a);
+            return 1;
+        }
+        if (now - a->probe0 < PDS_AD_PROBE_MS) return 0;
+        a->probing = 0;   /* held: the normal window from here */
+    }
+    if (now - a->win0 < PDS_AD_WIN_MS || a->n <= 0) return 0;
+    if (a->n * 1000.0 / PDS_AD_WIN_MS < PDS_AD_MIN_FPS) { a->clean0 = now; return 0; }   /* loading screen */
+    const double frac = (double)a->nmiss / a->n;
+    if (frac > PDS_AD_SLOW_FRAC) {
+        a->clean0 = now;
+        if (a->extra >= max_extra) return 0;
+        /* the faster plan failed soon after it was taken: wait longer before the next try */
+        if (a->fast_t >= 0.0 && now - a->fast_t < PDS_AD_FAST_OK_MS)
+            a->hold = a->hold * 2.0 > PDS_AD_HOLD_MAX_MS ? PDS_AD_HOLD_MAX_MS : a->hold * 2.0;
+        else a->hold = PDS_AD_HOLD_MS;
+        a->extra++; a->why = PDS_AD_SLOWER; a->frac = frac;
+        pds_adapt_restart(a);
+        return 1;
+    }
+    if (frac > PDS_AD_CLEAN_FRAC) { a->clean0 = now; return 0; }
+    if (a->extra > 0 && now - a->clean0 >= a->hold) {
+        a->extra--; a->probing = 1; a->why = PDS_AD_TRY_FASTER; a->frac = frac; a->fast_t = now;
+        pds_adapt_restart(a);
+        return 1;
+    }
+    return 0;
+}
+
+/* The log line for a change: p = the new plan, was = the plan before.
+ * "stepping to 48.00 fps (k=3) -- 72.00 fps missed (65% of frames over 2 s)" */
+static inline void pds_adapt_str(const pds_adapt* a, const pds_plan* p, const pds_plan* was, char* out, size_t n)
+{
+    char r[64], w[64];
+    if (p->mult > 1) snprintf(r, sizeof r, "%.2f fps rendered (%.2f shown, k=%d)", p->real, p->shown, p->k);
+    else snprintf(r, sizeof r, "%.2f fps (k=%d)", p->real, p->k);
+    snprintf(w, sizeof w, "%.2f fps", was->real);
+    if (a->why == PDS_AD_SLOWER)
+        snprintf(out, n, "stepping to %s -- %s missed (%.0f%% of frames over %.0f s); PORT_PACING_ADAPT=0 keeps it",
+                 r, w, a->frac * 100.0, PDS_AD_WIN_MS / 1000.0);
+    else if (a->why == PDS_AD_TRY_FASTER)
+        snprintf(out, n, "trying %s again (%.0f s without misses)", r, a->hold / 1000.0);
+    else if (a->why == PDS_AD_BACK)
+        snprintf(out, n, "stepping to %s -- %s still misses (%.0f%%); next try in %.0f s", r, w, a->frac * 100.0, a->hold / 1000.0);
+    else
+        snprintf(out, n, "stepping to %s", r);
 }
 
 /* Where in the refresh period a present came, as the phase lock's error: -0.5 .. 0.5 periods, 0 = mid-refresh. */
