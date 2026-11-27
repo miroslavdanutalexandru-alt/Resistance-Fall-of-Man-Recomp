@@ -23,6 +23,12 @@
  *   hang   A watchdog thread: when the game loop (and, with PORT_HANG_DUMP=1,
  *          the renderer thread) makes no progress for a while, writes
  *          <TAG>_<time>_hang.dmp / .txt once per stall; the game keeps running.
+ *   exit   guest_exit(): the game quit on its own (libc exit() / sys_process_exit,
+ *          an internal error on PS3 -- back to the XMB) without the player
+ *          asking. <game>_crash.inc writes <TAG>_<time>_exit.dmp / .txt (the
+ *          calling guest thread, every thread's stack, the last 200 lines of
+ *          run.log), says so in a message box and ends the process instead of
+ *          freezing on the last frame. PORT_GUEST_EXIT_QUIT=0: the old freeze.
  *
  * The report is written by a reporter thread that is started at init, never on
  * the faulting thread: a stack overflow leaves no stack to work with, and a
@@ -106,14 +112,14 @@ struct PortCrashConfig {
      * returns the length. Must only read (the game may still be running). */
     size_t (*guest_threads)(char* buf, size_t cap);
     /* optional (NULL = none), on the reporter thread after each report (kind:
-     * 0 crash, 1 hang): e.g. write the frame-time summary (port_frametime.h) */
+     * 0 crash, 1 hang, 2 guest exit): e.g. write the frame-time summary (port_frametime.h) */
     void (*after_report)(int kind);
 };
 
 namespace port_crash {
 
-enum { KIND_CRASH = 0, KIND_HANG = 1 };
-enum { MAX_MODS = 512, MAX_THREADS = 256, SNAP_BYTES = 96 * 1024, LOG_TAIL_LINES = 80 };
+enum { KIND_CRASH = 0, KIND_HANG = 1, KIND_EXIT = 2 };
+enum { MAX_MODS = 512, MAX_THREADS = 256, SNAP_BYTES = 96 * 1024, LOG_TAIL_LINES = 80, EXIT_TAIL_LINES = 200 };
 
 typedef BOOL (WINAPI* mdw_t)(HANDLE, DWORD, HANDLE, MINIDUMP_TYPE, PMINIDUMP_EXCEPTION_INFORMATION,
                              PMINIDUMP_USER_STREAM_INFORMATION, PMINIDUMP_CALLBACK_INFORMATION);
@@ -126,7 +132,7 @@ struct Request {
     EXCEPTION_POINTERS* ep;      /* crash: the faulting thread's exception */
     DWORD tid;                   /* crash: the faulting thread */
     const char* how;             /* "unhandled exception", "abort()", ... */
-    char detail[200];            /* hang: what stalled */
+    char detail[400];            /* hang: what stalled; exit: who quit */
     char out_txt[MAX_PATH];      /* result: the .txt written ("" = none) */
     char out_dmp[MAX_PATH];      /* result: the .dmp written ("" = none) */
     PortGuestState guest;        /* crash: the faulting thread's guest state */
@@ -470,7 +476,7 @@ static void all_threads(const Request& r)
         char name[96] = "";
         /* GetThreadDescription allocates: not after heap corruption */
         if (!(r.ep && r.ep->ExceptionRecord && r.ep->ExceptionRecord->ExceptionCode == 0xC0000374)) thread_name(h, name, sizeof name);
-        const char* role = faulting ? "  <== CRASHED HERE" : tid == s_watch_id ? "  (hang watchdog)" : "";
+        const char* role = faulting ? "  <== CRASHED HERE" : r.kind == KIND_EXIT && tid == r.tid ? "  <== CALLED EXIT" : tid == s_watch_id ? "  (hang watchdog)" : "";
         out("\n--- thread %lu%s%s%s%s\n", tid, name[0] ? " \"" : "", name, name[0] ? "\"" : "", role);
         CONTEXT c; memset(&c, 0, sizeof c);
         int have = 0;
@@ -578,7 +584,7 @@ static void env_summary()
 
 /* The game's stdout is redirected to logs\run.log by run.bat: find that file
  * from the handle (any redirect works), else <port>\logs\run.log. */
-static void log_tail()
+static void log_tail(int want)
 {
     char path[MAX_PATH] = "";
     HANDLE so = GetStdHandle(STD_OUTPUT_HANDLE);
@@ -589,16 +595,16 @@ static void log_tail()
     }
     if (!path[0]) snprintf(path, sizeof path, "%s\\logs\\run.log", s_root);
     HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL);
-    out("\n==== last %d lines of %s ====\n", LOG_TAIL_LINES, path);
+    out("\n==== last %d lines of %s ====\n", want, path);
     if (f == INVALID_HANDLE_VALUE) { out("(not found)\n"); return; }
-    static char buf[64 * 1024];
+    static char buf[128 * 1024];
     LARGE_INTEGER sz; GetFileSizeEx(f, &sz);
     LARGE_INTEGER from; from.QuadPart = sz.QuadPart > (LONGLONG)sizeof buf ? sz.QuadPart - (LONGLONG)sizeof buf : 0;
     SetFilePointerEx(f, from, NULL, FILE_BEGIN);
     DWORD got = 0; ReadFile(f, buf, sizeof buf, &got, NULL); CloseHandle(f);
     int lines = 0; DWORD s = got;
     while (s > 0) {
-        if (buf[s - 1] == '\n' && s != got && ++lines > LOG_TAIL_LINES) break;
+        if (buf[s - 1] == '\n' && s != got && ++lines > want) break;
         s--;
     }
     put(buf + s, got - s);
@@ -819,7 +825,7 @@ static void do_report(Request& r)
     invparam_site(r);
     char ts[32]; stamp(ts, sizeof ts, 1);
     char stem[MAX_PATH];
-    const char* kind = r.kind == KIND_CRASH ? "crash" : "hang";
+    const char* kind = r.kind == KIND_CRASH ? "crash" : r.kind == KIND_EXIT ? "exit" : "hang";
     if (s_cfg.exe_suffix && *s_cfg.exe_suffix)
         snprintf(stem, sizeof stem, "%s\\%s_%s_%s_%s", s_dir, s_cfg.tag, ts, s_cfg.exe_suffix, kind);
     else
@@ -851,7 +857,7 @@ static void do_report(Request& r)
     if (r.kind == KIND_CRASH && r.ep && r.ep->ExceptionRecord) {
         exception_section(r, line, sizeof line);
     } else {
-        out("\n==== hang ====\n%s\n", r.detail);
+        out("\n==== %s ====\n%s\n", r.kind == KIND_EXIT ? "guest exit" : "hang", r.detail);
         snprintf(line, sizeof line, "%s", r.detail);
     }
     if (s_cfg.guest_threads) {
@@ -863,7 +869,7 @@ static void do_report(Request& r)
         if (gn) put(gb, gn); else out("(none)\n");
     }
     all_threads(r);
-    log_tail();
+    log_tail(r.kind == KIND_EXIT ? EXIT_TAIL_LINES : LOG_TAIL_LINES);
     env_summary();
     out("\n==== modules ====\n");
     for (int i = 0; i < s_nmods; i++)
@@ -1014,6 +1020,23 @@ static void __cdecl on_invparam(const wchar_t* e, const wchar_t* f, const wchar_
     t_ip = NULL;
     if (s_prev_invparam) { s_prev_invparam(e, f, file, line, res); return; }
     __fastfail(FAST_FAIL_INVALID_ARG);   /* what the default handler does */
+}
+
+/* The game quit on its own (see the header): one report, then no more
+ * (hang reports of the dying process would only add noise). The caller's
+ * native stack is in the thread list. Returns 1 when a report was written. */
+static int guest_exit(const char* detail)
+{
+    if (!s_on) return 0;
+    AcquireSRWLockExclusive(&s_lock);
+    if (InterlockedCompareExchange(&s_crashed, 1, 0) != 0) { ReleaseSRWLockExclusive(&s_lock); return 0; }
+    static Request r;
+    memset(&r, 0, sizeof r);
+    r.kind = KIND_EXIT; r.tid = GetCurrentThreadId(); r.how = "guest exit";
+    snprintf(r.detail, sizeof r.detail, "%s", detail ? detail : "");
+    run(r);
+    ReleaseSRWLockExclusive(&s_lock);
+    return r.out_txt[0] != 0;
 }
 
 /* ---- hang watchdog ---- */

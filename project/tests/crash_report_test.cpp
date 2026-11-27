@@ -161,6 +161,12 @@ static int child(const char* mode)
         return 0;
     }
     if (!strcmp(mode, "stackoverflow")) return recurse(0);
+    if (!strcmp(mode, "guestexit")) {   /* the game quit on its own: one report, a second call writes none */
+        const int first = port_crash::guest_exit("the game called exit() -> sys_prx_exitspawn_with_level (guest exit code 1) test-detail");
+        const int second = port_crash::guest_exit("second exit");
+        printf("guest_exit returned %d then %d\n", first, second); fflush(stdout);
+        return 7;
+    }
     if (!strcmp(mode, "dbglock") || !strcmp(mode, "dbglate")) {   /* crash while another thread holds the DbgHelp lock */
         g_locked_ev = CreateEventA(NULL, TRUE, FALSE, NULL);
         CloseHandle((HANDLE)_beginthreadex(NULL, 0, dbghelp_holder, (void*)(uintptr_t)(!strcmp(mode, "dbglate") ? 3000 : INFINITE), 0, NULL));
@@ -677,6 +683,17 @@ int main(int argc, char** argv)
         Run def = run_child(work, "hang", NULL, "hang_default");
         check(def.dumps.empty() && has(def.log, "hang limit 90 s"), "unset: the old 90 s watchdog (no dump within 11 s)");
     }
+    Run ge = run_child(work, "guestexit");
+    check(ge.code == 7 && ge.dumps.size() == 1 && ge.txts.size() == 1 && has(ge.dumps[0].name, "_exit.dmp") &&
+          has(ge.txts[0].name, "_exit.txt"), "guestexit: one TEST_<time>_exit.dmp/.txt, caller goes on",
+          port_report::fmt("exit %lu, %zu dumps", ge.code, ge.dumps.size()));
+    check(has(ge.txt, "-- exit report") && has(ge.txt, "==== guest exit ====") && has(ge.txt, "test-detail") &&
+          has(ge.txt, "<== CALLED EXIT"), "guestexit: report says who quit, marks the calling thread");
+    check(has(ge.txt, "==== last 200 lines of") && has(ge.txt, "filler log line 10\r\n") && has(ge.txt, "child-log-last-line"),
+          "guestexit: the last 200 lines of run.log");
+    check(has(ge.crashes, "[exit] ") && has(ge.crashes, "test-detail") && !has(ge.crashes, "second exit") &&
+          has(ge.log, "guest_exit returned 1 then 0"), "guestexit: one crashes.txt line, second call ignored");
+    check_dump(ge, "guestexit", false);
     Run dis = run_child(work, "av", "TESTPFX_CRASH_DUMPS=0\0", "av_disabled");
     check(dis.dumps.empty() && dis.txts.empty() && dis.code == EXCEPTION_ACCESS_VIOLATION, "<prefix>_CRASH_DUMPS=0: reporter off, crash unchanged");
 

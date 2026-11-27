@@ -89,6 +89,9 @@ s32 sys_ppu_thread_yield(void);
  * -----------------------------------------------------------------------*/
 
 void sys_process_exit(s32 exitcode);
+/* the game quit on its own (exit() / sys_process_exit): non-zero = reported, exit with *code */
+extern int (*volatile g_port_guest_exit_hook)(const char* via, s32* code, int code_known);
+extern volatile int g_port_user_quit;   /* set by player-requested quits: no report */
 s32 sys_process_getpid(void);
 s32 sys_process_get_number_of_object(u32 object_type, u32* count);
 s32 sys_process_is_spu_lock_line_reservation_address(u32 addr, u64 flags);

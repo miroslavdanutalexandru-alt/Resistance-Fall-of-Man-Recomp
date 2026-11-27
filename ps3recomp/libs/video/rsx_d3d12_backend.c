@@ -48,6 +48,7 @@ char* rsx_getenv(const char* name);
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+extern volatile int g_port_user_quit;   /* sysPrxForUser.c: the player closed the window, not a guest exit */
 #include <dwmapi.h>     /* RFOM_MOVIE_VSYNC: DwmGetCompositionTimingInfo (display refresh period) */
 #pragma comment(lib, "dwmapi.lib")
 #include "../../../project/rfom_movie_pace.h"   /* movie vsync vs VRR, shared with the vblank lock */
@@ -1350,6 +1351,7 @@ static void psow_quit_stop(void);   /* the pipeline builders (shader precompile)
 static void pc_quit_clean(const char* why)
 {
     fprintf(stderr, "[quit] %s -- waiting for saves to finish%c", why, 10); fflush(stderr);
+    g_port_user_quit = 1;   /* a guest exit from here on is the player's quit: no report */
     s_quitting = 1; rsx_focus_paused = 0; g_ps3_host_paused = 0;   /* let the game finish a save it is in the middle of */
     const ULONGLONG t0 = GetTickCount64();
     ULONGLONG idle_since = 0;
@@ -11725,7 +11727,7 @@ static void render_frame_impl(void)
           GetWindowThreadProcessId(s_d3d.hwnd, NULL) == GetCurrentThreadId()) {
           last = now; MSG msg;
           while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
-              if (msg.message == WM_QUIT) { s_d3d.window_closed = 1; break; }
+              if (msg.message == WM_QUIT) { g_port_user_quit = 1; s_d3d.window_closed = 1; break; }
               TranslateMessage(&msg); DispatchMessageA(&msg);
           }
       } }

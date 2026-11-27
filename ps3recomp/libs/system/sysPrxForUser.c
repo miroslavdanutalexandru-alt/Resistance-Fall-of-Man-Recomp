@@ -185,6 +185,41 @@ static void exit_park_forever(void)
     }
 }
 
+/* The guest decided to quit (libc exit() -> sys_prx_exitspawn_with_level, or
+ * sys_process_exit) without the player asking: on PS3 that returns to the XMB;
+ * here the exitspawn used to be a no-op and the game froze on its last frame.
+ * The port sets g_port_guest_exit_hook (crash report + message box); when it
+ * returns non-zero the process exits with *code (the hook may fill in the
+ * status libc exit() got). A player-requested
+ * quit sets g_port_user_quit first and keeps the old path. Runs once: another
+ * thread exiting meanwhile parks, the same thread coming back skips it. */
+int (*volatile g_port_guest_exit_hook)(const char* via, s32* code, int code_known) = 0;
+volatile int g_port_user_quit = 0;
+
+static int guest_exit_report(const char* via, s32* code, int code_known)
+{
+    if (!g_port_guest_exit_hook || g_port_user_quit) return 0;
+    {
+        const char* ec = getenv("PS3_EXIT_CRT");   /* harness runs (smoke test, PGO) */
+        if (ec && *ec && *ec != '0') return 0;
+    }
+#ifdef _WIN32
+    static volatile LONG s_owner = 0;
+    static volatile LONG s_result = 0;
+    const LONG me = (LONG)GetCurrentThreadId();
+    const LONG prev = InterlockedCompareExchange(&s_owner, me, 0);
+    if (prev == me) return s_result;
+    if (prev) { for (;;) Sleep(1000); }
+    s_result = g_port_guest_exit_hook(via, code, code_known) != 0;
+    return s_result;
+#else
+    static int s_done = 0;
+    if (s_done) return 0;
+    s_done = 1;
+    return g_port_guest_exit_hook(via, code, code_known) != 0;
+#endif
+}
+
 void sys_process_exit(s32 exitcode)
 {
     /* Fast exit (PS3_EXIT_CRT unset): only the first caller runs the exit hooks
@@ -219,6 +254,7 @@ void sys_process_exit(s32 exitcode)
 #endif
         }
     }
+    guest_exit_report("sys_process_exit", &exitcode, 1);
     {
         /* exit() runs the CRT's atexit handlers and static destructors while the
          * RSX, D3D12 and SPU threads are still running (R3 saw heap corruption
@@ -1085,6 +1121,10 @@ s32 _sys_heap_free(sys_heap_t heap, void* ptr)
 
 s32 sys_prx_exitspawn_with_level(void)
 {
+    /* libc exit() ends here (sys_game_process_exitspawn does the level loads):
+     * the game is quitting to the XMB. */
+    s32 code = 1;
+    if (guest_exit_report("exit() -> sys_prx_exitspawn_with_level", &code, 0)) sys_process_exit(code);
     printf("[sysPrxForUser] sys_prx_exitspawn_with_level() - no-op\n");
     return CELL_OK;
 }

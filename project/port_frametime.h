@@ -507,7 +507,7 @@ extern "C" void port_ft_exit(void)
 /* port_crash.h after_report: a crash or hang report was written. */
 static void port_ft_on_report(int kind)
 {
-    port_ft::dump(kind == 0 ? "crash" : "hang");
+    port_ft::dump(kind == 0 ? "crash" : kind == 2 ? "exit" : "hang");
 }
 
 static void NTAPI port_ft_tls(PVOID, DWORD reason, PVOID)

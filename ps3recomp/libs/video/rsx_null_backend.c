@@ -17,6 +17,7 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+extern volatile int g_port_user_quit;   /* sysPrxForUser.c: the player closed the window, not a guest exit */
 
 /* ---------------------------------------------------------------------------
  * Internal state
@@ -56,7 +57,7 @@ static LRESULT CALLBACK null_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg) {
     case WM_CLOSE:
-        s_state.window_closed = 1;
+        g_port_user_quit = 1; s_state.window_closed = 1;
         DestroyWindow(hwnd);
         return 0;
 
@@ -94,7 +95,7 @@ static LRESULT CALLBACK null_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_KEYDOWN:
         if (wp == VK_ESCAPE) {
-            s_state.window_closed = 1;
+            g_port_user_quit = 1; s_state.window_closed = 1;
             DestroyWindow(hwnd);
         }
         return 0;
