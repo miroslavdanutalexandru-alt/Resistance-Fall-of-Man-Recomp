@@ -359,13 +359,18 @@ static int cacao_images(u32 lw, u32 lh)
     return 1;
 }
 
-/* FFX_CACAO_UpdateConstants for a perspective camera (standard depth), generateNormals */
+/* FFX_CACAO_UpdateConstants for a perspective camera (standard depth), generateNormals.
+ * Tuned for Fall of Man rather than FFX's defaults (radius 1.2, strength 1, clamp 0.98, horizon 0.06,
+ * fade 50-300): the AO multiplies the final lit, fogged colour (not an ambient term) and the world is
+ * in metres with shallow facade relief (pilasters, ledges 0.1-0.3 m), so the defaults shaded whole
+ * facades and walls grey. A 0.6 m radius, half strength, a higher horizon angle, at most 60 % darkening
+ * and a 20-90 m fade keep flat walls unshaded and the AO on real corners, contacts and recesses. */
 static void cacao_constants(float k[28], u32 w, u32 h, u32 dw, u32 dh)
 {
-    static float radius = -1.0f, strength = 1.0f;
+    static float radius = -1.0f, strength = 0.5f;
     if (radius < 0.0f) {
         const char* e;
-        radius = 1.2f;
+        radius = 0.6f;
         if ((e = getenv("RSX_CACAO_RADIUS")) && *e) { const float v = (float)atof(e); if (v >= 0.05f && v <= 20.0f) radius = v; }
         if ((e = getenv("RSX_CACAO_STRENGTH")) && *e) { const float v = (float)atof(e); if (v >= 0.0f && v <= 5.0f) strength = v; }
     }
@@ -374,8 +379,8 @@ static void cacao_constants(float k[28], u32 w, u32 h, u32 dw, u32 dh)
     { const float cn = g_rfom_cam_near, cf = g_rfom_cam_far, cv = g_rfom_cam_vfov;
       if (cn > 0.0f && cf > cn && cv > 0.1f && cv < 2.5f) { n = cn; f = cf; fov = cv; } }
     const float lw = (float)((w + 1) / 2), lh = (float)((h + 1) / 2);
-    const float tan_y = tanf(fov * 0.5f), tan_x = tan_y * (16.0f / 9.0f);
-    const float shadow_power = 1.5f, shadow_clamp = 0.98f, horizon = 0.06f, fade_from = 50.0f, fade_to = 300.0f, sharpness = 0.98f, detail = 0.5f;
+    const float tan_y = tanf(fov * 0.5f), tan_x = tan_y * ((float)w / (float)h);
+    const float shadow_power = 1.5f, shadow_clamp = 0.6f, horizon = 0.1f, fade_from = 20.0f, fade_to = 90.0f, sharpness = 0.98f, detail = 0.5f;
     float near_limit = radius * 1.2f;
     if (s_cc_quality <= 0) near_limit *= 1.5f;
     near_limit /= tan_y;
