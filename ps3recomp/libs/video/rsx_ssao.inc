@@ -18,6 +18,15 @@
  * With an upscaler the scene is drawn into the top-left render fraction of the
  * surface, so both passes cover that region only (before upscaling).
  *
+ * RFOM_AO_BEFORE_FX (default 1): the passes run earlier, at the end of the
+ * opaque part of the scene -- before the first blended effect draw (smoke,
+ * fog, fire, sparks, glass: blended, not replace / modulating, no depth write)
+ * after which at most a small tail of depth-writing draws remains (the
+ * view-model weapon). Those effects write no depth, so AO from the opaque depth
+ * multiplied in after them darkened the smoke / fog layer with the shape of the
+ * buildings behind it (grey facades in smoke). No such draw: the old point.
+ * 0 = always the old point (the first reader of the finished scene).
+ *
  * RFOM_AO_MODE (RSX_AO_MODE; launcher Graphics > Quality > Ambient occlusion):
  *   game / off   no AO (Fall of Man has none of its own; the default)
  *   port         the passes above (= RSX_SSAO=1, which is still honoured)
@@ -250,16 +259,79 @@ static void ssao_note_draw(int want, int cur_zi, int own_depth)
 
 #include "rsx_cacao.inc"   /* RFOM_AO_MODE=cacao */
 
+/* RFOM_AO_BEFORE_FX: the draw of this batch the passes run before (NULL = none) */
+static const D3D12DrawRecord* s_ao_early_dr;
+static int ssao_before_fx(void)
+{
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("RFOM_AO_BEFORE_FX"); v = port_native_parse_bool(e, 1); }
+    return v;
+}
+/* 0 = neither, 1 = opaque (colour + depth write), 2 = effect (blended, no depth write;
+ * not replace ONE,ZERO nor a modulating blend -- the FSR reactive-mask rule) */
+static int ssao_draw_kind(const D3D12DrawRecord* dr)
+{
+    if ((dr->cmask & 0xFu) == 0u) return 0;
+    if ((dr->cull & 0x100u) && (dr->cull & 0x400u)) return 1;
+    if (!(dr->blend_key & 1u)) return 0;
+    const u32 bs = (dr->blend_key >> 1) & 31u, bd = (dr->blend_key >> 6) & 31u, bo = (dr->blend_key >> 21) & 7u;
+    if (bs == 2u && bd == 1u) return 0;
+    if (bo == 1u && (bs == 1u || bs == 7u || bs == 9u) && (bd == 1u || bd == 2u || bd == 3u || bd == 5u)) return 0;
+    return 2;
+}
+static int ssao_draw_slot(const D3D12DrawRecord* dr)
+{
+    return !dr->rt_off ? -1 : rt_variants() ? dr->rt_slot : off_rt_find(dr->rt_off);
+}
+/* Render thread, before the replay loop of a batch: pick the end of the opaque
+ * scene (see RFOM_AO_BEFORE_FX). partial: the batch is a mid-frame flush. */
+static void ssao_plan_batch(int partial)
+{
+    s_ao_early_dr = NULL;
+    const int slot = s_ao_slot;
+    if (s_ao_done || slot < 0 || !ssao_on() || !ssao_before_fx() || !depth_per_rt()) return;
+    u32 nop = 0; int last = 0;
+    for (u32 d = 0; d < T_DRAWCNT && d < MAX_DRAWS; d++) {
+        const D3D12DrawRecord* dr = &T_DRAWS[d];
+        if (!dr->is_vp || dr->is_clear || dr->is_blit || ssao_draw_slot(dr) != slot) continue;
+        last = ssao_draw_kind(dr);
+        if (last == 1) nop++;
+    }
+    /* a mid-frame flush cut inside the opaque scene: decide in a later batch */
+    if (!nop || (partial && last == 1)) return;
+    const u32 tail = nop / 8u > 48u ? nop / 8u : 48u;
+    const u32 prior = s_ao_cnt[slot];
+    u32 ob = 0;
+    for (u32 d = 0; d < T_DRAWCNT && d < MAX_DRAWS; d++) {
+        const D3D12DrawRecord* dr = &T_DRAWS[d];
+        if (!dr->is_vp || dr->is_clear || dr->is_blit || ssao_draw_slot(dr) != slot) continue;
+        const int k = ssao_draw_kind(dr);
+        if (k == 1) ob++;
+        else if (k == 2 && prior + ob >= 32u && nop - ob <= tail) {
+            s_ao_early_dr = dr;
+            { static int n = 0; if (n < 3) { n++;
+                fprintf(stderr, "[SSAO] before effects: draw %u of %u (fp 0x%08X, blend key 0x%08X), %u opaque draws before, %u after%c",
+                        d, T_DRAWCNT, dr->fp_addr, dr->blend_key, prior + ob, nop - ob, 10); } }
+            return;
+        }
+    }
+}
+
 /* Render thread, before non-clear draw `dr` (target `want`) binds its target:
- * if it is the first draw to sample the finished scene, apply AO to the scene.
+ * if it is the first effect draw after the opaque scene (ssao_plan_batch) or
+ * the first draw to sample the finished scene, apply AO to the scene.
  * Returns 1 when the passes ran (the caller re-binds its own state). */
 static int ssao_maybe_apply(const D3D12DrawRecord* dr, int want)
 {
     const int slot = s_ao_slot;
-    if (s_ao_done || slot < 0 || dr->is_clear || want == slot || !ssao_on()) return 0;
-    int samp = 0;
-    for (int u = 0; u < RSX_UNITS; u++) if (dr->tex_rt[u] == slot) samp = 1;
-    if (!samp) return 0;
+    if (s_ao_done || slot < 0 || dr->is_clear || !ssao_on()) return 0;
+    if (dr != s_ao_early_dr) {
+        if (want == slot) return 0;
+        int samp = 0;
+        for (int u = 0; u < RSX_UNITS; u++) if (dr->tex_rt[u] == slot) samp = 1;
+        if (!samp) return 0;
+    }
+    s_ao_early_dr = NULL;
     s_ao_done = 1;
     OffRT* rt = &s_d3d.off_rt[slot];
     if (!rt->res) return 0;

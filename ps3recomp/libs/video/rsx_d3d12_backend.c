@@ -11671,6 +11671,7 @@ static int mtrp_clean(const D3D12DrawRecord* dr, int cur_rt, const int* cur_m, u
         if (rt != cur_rt && rt != cur_m[0] && rt != cur_m[1] && rt != cur_m[2] &&
             s_d3d.off_rt[rt].st != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) return 0;
     }
+    if (dr == s_ao_early_dr) return 0;   /* the AO passes run before it (RFOM_AO_BEFORE_FX) */
     return 1;
 }
 static void mtrp_dp_report(double fr)
@@ -12714,6 +12715,7 @@ static void render_frame_impl(void)
             const u64 cb2_base = s_d3d.vp_fpcb ? s_d3d.vp_fpcb->lpVtbl->GetGPUVirtualAddress(s_d3d.vp_fpcb)
                                                  + (u64)T_PARITY * MAX_DRAWS * VP_FPCB_STRIDE : 0;
             u64 _dpn = 0;
+            ssao_plan_batch(!(s_present_this_frame && !s_in_midflush));
             for (u32 d = 0; d < T_DRAWCNT && d < MAX_DRAWS; d++) {
                 const D3D12DrawRecord* dr = &T_DRAWS[d];
                 if (!dr->is_vp) continue;
