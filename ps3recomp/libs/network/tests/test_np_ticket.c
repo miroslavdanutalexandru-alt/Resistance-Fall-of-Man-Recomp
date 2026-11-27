@@ -85,6 +85,35 @@ static void set_online(int on)
 static int fails;
 #define CHECK(cond) do { if (!(cond)) { printf("FAIL line %d: %s\n", __LINE__, #cond); fails++; } } while (0)
 
+/* A stand-in for port_online.c's ticket source. */
+static const u8 k_real[] = { 0x21, 0x01, 0x00, 0x00, 'R', 'E', 'A', 'L' };
+static int  s_src_take = 1;
+static s32  s_src_state;
+static char s_src_service[32];
+static u32  s_src_cookie_size;
+static u8   s_src_cookie0;
+static s32 src_request(const char* svc, const u8* cookie, u32 n)
+{
+    strcpy(s_src_service, svc);
+    s_src_cookie_size = n;
+    s_src_cookie0 = n ? cookie[0] : 0;
+    return s_src_take;
+}
+static s32 src_get(const u8** t, u32* len)
+{
+    if (s_src_state > 0) { *t = k_real; *len = sizeof k_real; }
+    return s_src_state;
+}
+static int src_param(const u8* t, u32 len, s32 id, u8 out[256])
+{
+    (void)t; (void)len;
+    if (id != SCE_NP_TICKET_PARAM_SUBJECT_STATUS) return -1;
+    memset(out, 0, 256);
+    out[0] = 1; out[1] = 2; out[2] = 3; out[3] = 4;
+    return 0;
+}
+static const np_ticket_source k_fake_source = { src_request, src_get, src_param };
+
 int main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -206,6 +235,50 @@ int main(void)
         CHECK(call(GET_PARAM, (u64)id, PARAM, 0, 0, 0, 0) == CELL_OK);
     CHECK(call(GET_PARAM, SCE_NP_TICKET_PARAM_SERIAL_ID, PARAM, 0, 0, 0, 0) == CELL_OK);
     CHECK(memcmp(vm_base + PARAM, vm_base + TICKET, 20) == 0);
+
+    /* PORT_ONLINE: a ticket source (port_online.c's RPCN client) takes the
+     * request; GOT_TICKET comes when it delivers, carrying the ticket's size,
+     * and GetTicket / GetTicketParam read the real ticket. */
+    CHECK(sceNpManagerRegisterCallback((SceNpManagerCallback)(uintptr_t)CB,
+                                       (void*)(uintptr_t)CB_ARG) == CELL_OK);
+    g_np_ticket_source = &k_fake_source;
+    s_nqueued = 0;
+    vm_write8(0x5000, 0xC0); vm_write8(0x5001, 0x0C);
+    CHECK(call(REQUEST_TICKET, NPID, SERVICE, 0x5000, 2, 0, 0) == CELL_OK);
+    CHECK(s_nqueued == 0);   /* in flight */
+    CHECK(strcmp(s_src_service, "overwritten") == 0 && s_src_cookie_size == 2 && s_src_cookie0 == 0xC0);
+    CHECK((u32)call(REQUEST_TICKET, NPID, SERVICE, 0x5000, NP_TICKET_COOKIE_MAX + 1, 0, 0) == SCE_NP_ERROR_INVALID_ARGUMENT);
+    s_src_state = 1;
+    np_ticket_deliver((s32)sizeof k_real);
+    CHECK(s_nqueued == 1 && s_queued[0].opd == CB);
+    CHECK(s_queued[0].args[0] == SCE_NP_MANAGER_EVENT_GOT_TICKET);
+    CHECK(s_queued[0].args[1] == sizeof k_real && s_queued[0].args[2] == CB_ARG);
+    memset(vm_base + TICKET, 0xA5, 0x400);
+    vm_write32(SIZE, 0);
+    CHECK(call(GET_TICKET, TICKET, SIZE, 0, 0, 0, 0) == CELL_OK);
+    CHECK(vm_read32(SIZE) == sizeof k_real);
+    CHECK(memcmp(vm_base + TICKET, k_real, sizeof k_real) == 0 && vm_base[TICKET + sizeof k_real] == 0xA5);
+    CHECK(call(GET_PARAM, SCE_NP_TICKET_PARAM_SUBJECT_STATUS, PARAM, 0, 0, 0, 0) == CELL_OK);
+    CHECK(vm_read32(PARAM) == 0x01020304u);
+    /* A field the source lacks falls back to the made-up value. */
+    CHECK(call(GET_PARAM, SCE_NP_TICKET_PARAM_SUBJECT_ONLINE_ID, PARAM, 0, 0, 0, 0) == CELL_OK);
+    CHECK(strcmp((const char*)vm_base + PARAM, "BraveOtter") == 0);
+    /* A failed request: the error event, and GetTicket fails so Resistance:
+     * Fall of Man's poll (func_00034DF4) takes its error path. */
+    s_nqueued = 0;
+    CHECK(call(REQUEST_TICKET, NPID, SERVICE, 0, 0, 0, 0) == CELL_OK);
+    s_src_state = (s32)SCE_NP_ERROR_OFFLINE;
+    np_ticket_deliver((s32)SCE_NP_ERROR_OFFLINE);
+    CHECK(s_nqueued == 1 && (u32)s_queued[0].args[1] == SCE_NP_ERROR_OFFLINE);
+    CHECK((u32)call(GET_TICKET, TICKET, SIZE, 0, 0, 0, 0) == SCE_NP_ERROR_OFFLINE);
+    CHECK((u32)call(GET_PARAM, SCE_NP_TICKET_PARAM_ISSUED_DATE, PARAM, 0, 0, 0, 0) == SCE_NP_ERROR_INVALID_STATE);
+    /* Not taken (no RPCN account): the made-up ticket answers, as before. */
+    s_src_take = 0; s_src_state = 0; s_nqueued = 0;
+    CHECK(call(REQUEST_TICKET, NPID, SERVICE, 0, 0, 0, 0) == CELL_OK);
+    CHECK(s_nqueued == 1 && s_queued[0].args[1] == 0);
+    vm_write32(SIZE, 0);
+    CHECK(call(GET_TICKET, TICKET, SIZE, 0, 0, 0, 0) == CELL_OK && vm_read32(SIZE) == NP_TICKET_SIZE);
+    g_np_ticket_source = NULL;
 
     /* No registered callback: the request still succeeds, and nothing is
      * queued to address 0. */

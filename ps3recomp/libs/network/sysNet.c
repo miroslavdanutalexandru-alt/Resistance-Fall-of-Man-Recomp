@@ -646,6 +646,7 @@ static int dns_pending(int32_t s)
 static uint32_t dns_parse_question(const uint8_t* buf, uint32_t len, char* name, size_t namecap)
 {
     if (len < 12 + 5) return 0;
+    if ((buf[2] & 0x80) || (buf[2] & 0x78)) return 0;   /* a response, or not a standard query */
     if ((buf[4] << 8 | buf[5]) != 1) return 0;          /* QDCOUNT */
     uint32_t p = 12; size_t n = 0;
     if (namecap) name[0] = 0;
@@ -659,7 +660,7 @@ static uint32_t dns_parse_question(const uint8_t* buf, uint32_t len, char* name,
         n += l; name[n] = 0;
         p += 1 + l;
     }
-    if (p + 5 > len) return 0;
+    if (!n || p + 5 > len) return 0;
     p += 1;                                              /* root label */
     uint16_t qtype = (uint16_t)(buf[p] << 8 | buf[p + 1]);
     uint16_t qclass = (uint16_t)(buf[p + 2] << 8 | buf[p + 3]);
@@ -681,14 +682,14 @@ static int dns_maybe_answer(int32_t s, const void* guest_buf, uint32_t len,
 
     struct in_addr answer;
     if (!hosts_override(name, &answer)) {
-        if (net_trace()) printf("[sys_net] DNS query '%s' -> real server (not in PS3_NET_HOSTS)\n", name);
+        if (net_trace()) printf("[sys_net] DNS query '%s' -> real server (not redirected)\n", name);
         return 0;
     }
 
     net_socket_slot* sl = &s_sockets[s];
     memset(sl->dns, 0, sizeof sl->dns);
     memcpy(sl->dns, q, qend);                            /* id, then the question */
-    sl->dns[2] = 0x81;                                   /* QR=1, RD=1 */
+    sl->dns[2] = (uint8_t)(0x80 | (q[2] & 0x01));        /* QR=1, opcode 0, RD as asked */
     sl->dns[3] = 0x80;                                   /* RA=1, rcode=0 */
     sl->dns[4] = 0; sl->dns[5] = 1;                      /* QDCOUNT */
     sl->dns[6] = 0; sl->dns[7] = 1;                      /* ANCOUNT */
@@ -1062,9 +1063,15 @@ int32_t sys_net_bnet_select(int32_t nfds, void* readfds, void* writefds,
  * system hosts file. One "name ip" or "name=ip" per line; '#' starts a comment
  * and blank lines are skipped. The file is read on every lookup: DNS lookups
  * are rare, and an edit made while the game runs then applies to the next
- * connect. Returns 1 and fills *out when the name was found. */
+ * connect. Returns 1 and fills *out when the name was found.
+ *
+ * PORT_ONLINE (port_online.c) installs g_net_resolve_hook for online.ini's
+ * host.NAME=IP / dns= redirection; it is asked first. */
+int (*g_net_resolve_hook)(const char* name, uint32_t* ip_out) = NULL;
+
 static int hosts_override(const char* host, struct in_addr* out)
 {
+    if (g_net_resolve_hook && host && g_net_resolve_hook(host, (uint32_t*)&out->s_addr)) return 1;
     const char* path = getenv("PS3_NET_HOSTS");
     if (!path || !*path) return 0;
     FILE* f = fopen(path, "r");
@@ -1152,6 +1159,21 @@ uint32_t sys_net_bnet_inet_ntoa(uint32_t addr)
     return ea;
 }
 
+/* const char* inet_ntop(int af, const void* src, char* dst, socklen_t size):
+ * dst on success, NULL (errno set) otherwise. */
+uint32_t sys_net_bnet_inet_ntop(int32_t family, const void* src, char* dst, uint32_t size)
+{
+    if (family != SYS_NET_AF_INET) { (void)fail(SYS_NET_EAFNOSUPPORT); return 0; }
+    const uint8_t* b = GUEST_PTR(EA(src), const uint8_t*);
+    char* out = GUEST_PTR(EA(dst), char*);
+    if (!b || !out) { (void)fail(SYS_NET_EFAULT); return 0; }
+    char tmp[16];
+    int n = snprintf(tmp, sizeof tmp, "%u.%u.%u.%u", b[0], b[1], b[2], b[3]);
+    if (n < 0 || (uint32_t)n + 1 > size) { (void)fail(SYS_NET_ENOSPC); return 0; }
+    memcpy(out, tmp, (size_t)n + 1);
+    return EA(dst);
+}
+
 uint32_t sys_net_bnet_gethostbyname(const char* name)
 {
     const char* host = GUEST_PTR(EA(name), const char*);
@@ -1162,7 +1184,7 @@ uint32_t sys_net_bnet_gethostbyname(const char* name)
 
     if (hosts_override(host, &address)) {
         char ip[16];
-        printf("[sys_net] gethostbyname('%s') -> %s (PS3_NET_HOSTS)\n", host, ip_str(&address, ip));
+        printf("[sys_net] gethostbyname('%s') -> %s (redirected)\n", host, ip_str(&address, ip));
     } else {
         memset(&hints, 0, sizeof(hints));
         hints.ai_family = AF_INET;
@@ -1229,6 +1251,7 @@ static void h_inet_pton(ppu_context* ctx)   { RET_S(sys_net_bnet_inet_pton(S32(3
 static void h_inet_aton(ppu_context* ctx)   { RET_S(sys_net_bnet_inet_aton(PTR(3), PTR(4))); }
 static void h_inet_addr(ppu_context* ctx)   { RET_U(sys_net_bnet_inet_addr(PTR(3))); }
 static void h_inet_ntoa(ppu_context* ctx)   { RET_U(sys_net_bnet_inet_ntoa(R32(3))); }
+static void h_inet_ntop(ppu_context* ctx)   { RET_U(sys_net_bnet_inet_ntop(S32(3), PTR(4), PTR(5), R32(6))); }
 static void h_gethostbyname(ppu_context* ctx) { RET_U(sys_net_bnet_gethostbyname(PTR(3))); }
 static void h_errno_loc(ppu_context* ctx)   { RET_U(sys_net_errno_loc()); }
 static void h_h_errno_loc(ppu_context* ctx) { RET_U(scratch(&s_h_errno_ea, 4)); }
@@ -1249,7 +1272,7 @@ void ps3_net_host_register(unsigned int (*guest_alloc)(unsigned int size, unsign
         { "getpeername", h_getpeername }, { "socketpoll", h_poll },
         { "socketselect", h_select },     { "inet_aton", h_inet_aton },
         { "inet_addr", h_inet_addr },     { "inet_ntoa", h_inet_ntoa },
-        { "inet_pton", h_inet_pton },
+        { "inet_pton", h_inet_pton },     { "inet_ntop", h_inet_ntop },
         { "gethostbyname", h_gethostbyname },
         { "_sys_net_errno_loc", h_errno_loc },
         { "_sys_net_h_errno_loc", h_h_errno_loc },

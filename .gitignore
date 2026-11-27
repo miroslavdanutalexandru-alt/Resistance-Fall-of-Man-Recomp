@@ -86,3 +86,6 @@ fall_*.bin
 /unins*.dat
 /unins*.exe
 /RFoMSwitch.exe
+
+# Online account (PORT_ONLINE): holds the player's password
+/online.ini

@@ -142,6 +142,24 @@ s32 sceNpDrmIsAvailable2(const u8* k_licensee, const char* drm_path);
 /* Set the fake PSN username (call before sceNpInit if desired) */
 void sceNpSetFakeUsername(const char* username);
 
+/* A source of real NP tickets (port_online.c's RPCN client, PORT_ONLINE=1).
+ *   request: 1 = taken; its GOT_TICKET event comes later through
+ *            np_ticket_deliver. 0 = not taken (the made-up ticket answers).
+ *            Negative = refused with that error.
+ *   get:     1 = *t and *len hold the last ticket fetched; 0 = none requested
+ *            yet; negative = the last request failed with that error.
+ *   param:   GetTicketParam's 256-byte union for paramId, in guest byte
+ *            order; 0 = filled, -1 = not in this ticket. */
+#define NP_TICKET_COOKIE_MAX 1024
+typedef struct {
+    s32 (*request)(const char* service_id, const u8* cookie, u32 cookie_size);
+    s32 (*get)(const u8** t, u32* len);
+    int (*param)(const u8* t, u32 len, s32 param_id, u8 out[256]);
+} np_ticket_source;
+extern const np_ticket_source* g_np_ticket_source;
+void np_ticket_deliver(s32 result);
+int  np_is_initialized(void);
+
 #ifdef __cplusplus
 }
 #endif
