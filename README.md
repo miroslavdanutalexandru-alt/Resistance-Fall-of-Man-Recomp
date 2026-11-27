@@ -268,16 +268,16 @@ The options are sorted into pages (the same pages as the Resistance 2 / 3 launch
 | N | Page | What is on it |
 |---|---|---|
 | 0 | Display | Screen (mode, window size, monitor, resizable window, Alt+Enter, aspect ratio, seamless level loads), Frame rate (limit, menu frame rate, VSync, tearing), HDR |
-| 1 | Graphics | Resolution (render resolution, scaling), Quality (texture filtering, LOD bias, shadow maps), View (field of view), Accessibility (colour-blind filter) |
+| 1 | Graphics | Resolution (render resolution, scaling), Quality (texture filtering, LOD bias, shadow maps, ambient occlusion), View (field of view), Accessibility (colour-blind filter) |
 | 2 | Upscaling & Frame Gen | Anti-aliasing and upscaling (DLSS / FSR / XeSS, DLSS model, sharpening, object motion vectors), Frame generation and latency (Frame Generation, Reflex) |
 | 3 | Performance | Shader cache (compile before playing, compile threads, **Rebuild shader cache**) |
 | 4 | Controls | Key bindings, Mouse, Controller, Gyro, Controller buttons |
 | 5 | Multiplayer | Online play (off by default; the community server), pause menu keys in matches (experimental), network logging, **Edit online.txt**, **Edit net_hosts.txt** |
-| 6 | Audio | Sound (speaker layout, audio buffer), In the background |
+| 6 | Audio | Sound (speaker layout, audio output, audio buffer), In the background |
 | 7 | Interface & Notifications | Notifications (achievement pop-ups), Movies (hold to skip, skip hint), Overlays (F3 overlay and its corner), Photo mode and Discord |
 | 8 | Advanced | Start-up and quitting, Gameplay (gore, adaptive difficulty), Cheats (single player), Mods and textures, Saves (location, backups, **Open save folder**), Updates |
 | 9 | Achievements | Unofficial fan-made achievements read from your save (see *Achievements* under *Trophies*) |
-| 10 | Saves & tools | Save backups, the benchmark |
+| 10 | Saves & tools | Save backups, the benchmark, **Game files folder** (game files on another drive) |
 | 11 | About | Version, credits and licences, the key list, folder buttons, the project page, **Report a problem**, **Reset all to defaults** |
 
 Options that are empty by default write nothing to `settings.bat` until changed (the game's default is used).
@@ -393,7 +393,7 @@ Privacy: the server sees your IP address and player name, and may log the lobby 
 
 Button: **Open save folder**.
 
-**Achievements, Saves & tools and About** are as before: unofficial achievements, save backups and the benchmark, and the version / credits / folders / **Report a problem** / **Reset all to defaults** (asks first; resets every setting, the key bindings included).
+**Achievements, Saves & tools and About** are as before: unofficial achievements, save backups, the benchmark and the **Game files folder** (see the FAQ), and the version / credits / folders / **Report a problem** / **Reset all to defaults** (asks first; resets every setting, the key bindings included).
 
 The sidebar picture is drawn by `tools\art\make_r1_art.py` (original artwork, generated in code) and embedded in `Launcher.exe` from `project\launcher_side.png`.
 
