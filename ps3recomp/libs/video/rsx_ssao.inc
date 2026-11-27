@@ -16,7 +16,14 @@
  *   2. depth-aware 4x4 blur of the AO, multiplied into the scene colour
  *      (alpha kept: the game keeps a mask there).
  * With an upscaler the scene is drawn into the top-left render fraction of the
- * surface, so both passes cover that region only (before upscaling). */
+ * surface, so both passes cover that region only (before upscaling).
+ *
+ * RFOM_AO_MODE (RSX_AO_MODE; launcher Graphics > Quality > Ambient occlusion):
+ *   game / off   no AO (Fall of Man has none of its own; the default)
+ *   port         the passes above (= RSX_SSAO=1, which is still honoured)
+ *   cacao        FidelityFX CACAO (rsx_cacao.inc) at the same point: its four passes
+ *                replace pass 1, and its result is multiplied in without the blur
+ * RFOM_AO_QUALITY=low|medium|high: CACAO quality preset (default medium). */
 
 static int s_ao_on = -1;
 static float s_ao_strength = 0.6f, s_ao_radius = 1.0f;
@@ -32,15 +39,34 @@ static ID3D12PipelineState* s_ao_pso_ao;
 static ID3D12PipelineState* s_ao_pso_apply; static u32 s_ao_apply_fmt;
 static ID3D12Resource* s_ao_tex; static u32 s_ao_tw, s_ao_th; static D3D12_RESOURCE_STATES s_ao_tex_st;
 static int s_ao_fail = 0;
+enum { AO_MODE_GAME, AO_MODE_PORT, AO_MODE_CACAO, AO_MODE_OFF };
+static int s_ao_mode = AO_MODE_GAME;
+static ID3D12PipelineState* s_ao_pso_apply1; static u32 s_ao_apply1_fmt;   /* CACAO: multiply without the blur */
+static int s_cc_quality;
+static int ao_env_eq(const char* a, const char* b) { for (; *a && *b; a++, b++) if ((*a | 0x20) != (*b | 0x20)) return 0; return !*a && !*b; }
 
 static int ssao_on(void)
 {
     if (s_ao_on < 0) {
         const char* e = getenv("RSX_SSAO");
-        s_ao_on = port_native_parse_bool(e, 0);
+        s_ao_mode = port_native_parse_bool(e, 0) ? AO_MODE_PORT : AO_MODE_GAME;
+        if (!((e = getenv("RFOM_AO_MODE")) && *e)) e = getenv("RSX_AO_MODE");
+        if (e && *e) {
+            if (ao_env_eq(e, "game") || ao_env_eq(e, "0")) s_ao_mode = AO_MODE_GAME;
+            else if (ao_env_eq(e, "port") || ao_env_eq(e, "ssao") || ao_env_eq(e, "1")) s_ao_mode = AO_MODE_PORT;
+            else if (ao_env_eq(e, "cacao") || ao_env_eq(e, "2")) s_ao_mode = AO_MODE_CACAO;
+            else if (ao_env_eq(e, "off") || ao_env_eq(e, "none") || ao_env_eq(e, "3")) s_ao_mode = AO_MODE_OFF;
+        }
+        s_cc_quality = 1;
+        if (!((e = getenv("RFOM_AO_QUALITY")) && *e)) e = getenv("RSX_AO_QUALITY");
+        if (e && *e) { const int c = *e | 0x20; s_cc_quality = (c == 'l' || c == '0') ? 0 : (c == 'h' || c == '2') ? 2 : 1; }
+        s_ao_on = s_ao_mode == AO_MODE_PORT || s_ao_mode == AO_MODE_CACAO;
+        if (s_ao_mode == AO_MODE_CACAO)
+            fprintf(stderr, "[SSAO] ambient occlusion: FidelityFX CACAO, quality %s (RFOM_AO_MODE)%c",
+                    s_cc_quality <= 0 ? "Low" : s_cc_quality == 1 ? "Medium" : "High", 10);
         if ((e = getenv("RSX_SSAO_STRENGTH")) && *e) { const float v = (float)atof(e); if (v >= 0.0f && v <= 1.0f) s_ao_strength = v; }
         if ((e = getenv("RSX_SSAO_RADIUS")) && *e) { const float v = (float)atof(e); if (v >= 0.1f && v <= 8.0f) s_ao_radius = v; }
-        if (s_ao_on) fprintf(stderr, "[SSAO] ambient occlusion on (RSX_SSAO): strength %.2f, radius %.2f%c", s_ao_strength, s_ao_radius, 10);
+        if (s_ao_mode == AO_MODE_PORT) fprintf(stderr, "[SSAO] ambient occlusion on (RSX_SSAO): strength %.2f, radius %.2f%c", s_ao_strength, s_ao_radius, 10);
     }
     return s_ao_on;
 }
@@ -49,7 +75,7 @@ static const char* ssao_status(void)
 {
     static char b[96];
     if (!ssao_on()) return "off";
-    snprintf(b, sizeof b, "on, %u runs, skipped %u/%u/%u/%u", s_ao_runs, s_ao_skips[0], s_ao_skips[1], s_ao_skips[2], s_ao_skips[3]);
+    snprintf(b, sizeof b, "%s, %u runs, skipped %u/%u/%u/%u", s_ao_mode == AO_MODE_CACAO ? "CACAO" : "on", s_ao_runs, s_ao_skips[0], s_ao_skips[1], s_ao_skips[2], s_ao_skips[3]);
     return b;
 }
 
@@ -93,7 +119,8 @@ static const char s_ao_hlsl[] =
 "    }\n"
 "    float ao = ws > 0.0 ? s / ws : 1.0;\n"
 "    return float4(ao, ao, ao, 1.0);\n"
-"}\n";
+"}\n"
+"float4 ps_apply1(float4 sp : SV_Position) : SV_Target { float ao = aot.Load(int3(int2(sp.xy), 0)); return float4(ao, ao, ao, 1.0); }\n";
 
 static ID3D12PipelineState* ssao_pso(const char* entry, DXGI_FORMAT fmt, int multiply)
 {
@@ -221,6 +248,8 @@ static void ssao_note_draw(int want, int cur_zi, int own_depth)
     else if (own_depth) s_ao_rtz_cnt++;
 }
 
+#include "rsx_cacao.inc"   /* RFOM_AO_MODE=cacao */
+
 /* Render thread, before non-clear draw `dr` (target `want`) binds its target:
  * if it is the first draw to sample the finished scene, apply AO to the scene.
  * Returns 1 when the passes ran (the caller re-binds its own state). */
@@ -256,12 +285,15 @@ static int ssao_maybe_apply(const D3D12DrawRecord* dr, int want)
     if (rh > ch) rh = ch;
     const float zsx = (float)zd.Width / (float)cw, zsy = (float)zd.Height / (float)ch;
     if (rw < 8 || rh < 8 || zsx < 0.99f || zsy < 0.99f) { s_ao_skips[1]++; return 0; }
-    if (!ssao_setup() || !ssao_tex(rw, rh)) { s_ao_skips[2]++; return 0; }
-    if (!s_ao_pso_apply || s_ao_apply_fmt != rt->dxgi) {
-        ID3D12PipelineState* p = ssao_pso("ps_apply", (DXGI_FORMAT)rt->dxgi, 1);
+    const int cacao = s_ao_mode == AO_MODE_CACAO;
+    if (!ssao_setup() || !ssao_tex(rw, rh) || (cacao && !cacao_ready(rw, rh))) { s_ao_skips[2]++; return 0; }
+    ID3D12PipelineState** ap = cacao ? &s_ao_pso_apply1 : &s_ao_pso_apply;
+    u32* af = cacao ? &s_ao_apply1_fmt : &s_ao_apply_fmt;
+    if (!*ap || *af != rt->dxgi) {
+        ID3D12PipelineState* p = ssao_pso(cacao ? "ps_apply1" : "ps_apply", (DXGI_FORMAT)rt->dxgi, 1);
         if (!p) { s_ao_skips[2]++; return 0; }
-        if (s_ao_pso_apply) grave_defer((ID3D12Resource*)s_ao_pso_apply);
-        s_ao_pso_apply = p; s_ao_apply_fmt = rt->dxgi;
+        if (*ap) grave_defer((ID3D12Resource*)*ap);
+        *ap = p; *af = rt->dxgi;
     }
     ID3D12Device* dv = s_d3d.device;
     ID3D12GraphicsCommandList* cl = s_d3d.cmd_list;
@@ -283,6 +315,8 @@ static int ssao_maybe_apply(const D3D12DrawRecord* dr, int want)
 
     ssao_barrier(dres, dst, D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     ssao_barrier(s_ao_tex, &s_ao_tex_st, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    /* CACAO: depth -> AO into s_ao_tex instead of pass 1 (the depth texels covering the region: zsx / zsy per colour pixel) */
+    if (cacao) cacao_run(dres, zf, rw, rh, (u32)((float)rw * zsx + 0.5f), (u32)((float)rh * zsy + 0.5f));
     const float k[8] = { (float)rw, (float)rh, s_ao_strength, s_ao_radius, (float)rh * 0.06f, zsx, zsy, 0.0f };
     D3D12_VIEWPORT vp = { 0, 0, (float)rw, (float)rh, 0.0f, 1.0f };
     D3D12_RECT sc = { 0, 0, (LONG)rw, (LONG)rh };
@@ -294,15 +328,17 @@ static int ssao_maybe_apply(const D3D12DrawRecord* dr, int want)
     cl->lpVtbl->IASetPrimitiveTopology(cl, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     cl->lpVtbl->RSSetViewports(cl, 1, &vp); cl->lpVtbl->RSSetScissorRects(cl, 1, &sc);
     /* pass 1: depth -> AO */
-    { D3D12_CPU_DESCRIPTOR_HANDLE r; s_ao_rtv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_ao_rtv_heap, &r);
-      cl->lpVtbl->OMSetRenderTargets(cl, 1, &r, FALSE, NULL); }
-    cl->lpVtbl->SetPipelineState(cl, s_ao_pso_ao);
-    cl->lpVtbl->DrawInstanced(cl, 3, 1, 0, 0);
-    /* pass 2: blurred AO multiplied into the scene */
+    if (!cacao) {
+        D3D12_CPU_DESCRIPTOR_HANDLE r; s_ao_rtv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_ao_rtv_heap, &r);
+        cl->lpVtbl->OMSetRenderTargets(cl, 1, &r, FALSE, NULL);
+        cl->lpVtbl->SetPipelineState(cl, s_ao_pso_ao);
+        cl->lpVtbl->DrawInstanced(cl, 3, 1, 0, 0);
+    }
+    /* pass 2: blurred AO (CACAO: as it is) multiplied into the scene */
     ssao_barrier(s_ao_tex, &s_ao_tex_st, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     off_rt_transition(slot, D3D12_RESOURCE_STATE_RENDER_TARGET);
     { D3D12_CPU_DESCRIPTOR_HANDLE r = off_rt_rtv(slot); cl->lpVtbl->OMSetRenderTargets(cl, 1, &r, FALSE, NULL); }
-    cl->lpVtbl->SetPipelineState(cl, s_ao_pso_apply);
+    cl->lpVtbl->SetPipelineState(cl, *ap);
     cl->lpVtbl->DrawInstanced(cl, 3, 1, 0, 0);
     /* back to the backend's own bindings (as fsr_merge) */
     vp_set_heaps(cl);   /* + the guest sampler heap (Phase 2) */
@@ -313,7 +349,7 @@ static int ssao_maybe_apply(const D3D12DrawRecord* dr, int want)
     s_rs_epoch++;
     s_ao_runs++;
     { static int n = 0; if (n < 3) { n++;
-        fprintf(stderr, "[SSAO] applied: scene slot %d (0x%08X %ux%u, %ux%u drawn), depth %s %ux%u, format %u%c",
+        fprintf(stderr, "[SSAO] %s applied: scene slot %d (0x%08X %ux%u, %ux%u drawn), depth %s %ux%u, format %u%c", cacao ? "CACAO" : "SSAO",
                 slot, rt->off, rt->w, rt->h, rw, rh, dres == s_rtdepth[slot] ? "own" : "zeta", (u32)zd.Width, zd.Height, rt->dxgi, 10); } }
     return 1;
 }

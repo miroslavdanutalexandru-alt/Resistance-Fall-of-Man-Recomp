@@ -13,7 +13,7 @@ static const CatGroup g_cat[] = {
     { P_DISPLAY,  "HDR",                          "hdr*", nullptr },
     { P_DISPLAY,  "PICTURE",                      "gamma", nullptr },
     { P_GRAPHICS, "RESOLUTION",                   "res filter", nullptr },
-    { P_GRAPHICS, "QUALITY",                      "aniso lodbias shadowscale ssao", nullptr },
+    { P_GRAPHICS, "QUALITY",                      "aniso lodbias shadowscale ssao aoquality", nullptr },
     { P_GRAPHICS, "VIEW",                         "@fov", nullptr },
     { P_GRAPHICS, "ACCESSIBILITY",                "colorblind", nullptr },
     { P_UPSCALE,  "ANTI-ALIASING AND UPSCALING",  "fsr upscale dlsspreset sharpen fsr_sharp objmv", nullptr },

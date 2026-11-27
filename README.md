@@ -247,7 +247,8 @@ There is no *Sprint button* option (Resistance 2 / 3 have one): this game starts
 
 | Page | Option | Values | Notes |
 |---|---|---|---|
-| Graphics › Quality | Ambient occlusion | **Off**, On (experimental) | `RSX_SSAO`. A screen-space AO pass computed from the scene depth when the scene pass ends, before the game's post-processing. `RSX_SSAO_STRENGTH=<0..1>` (0.6) and `RSX_SSAO_RADIUS=<0.1..8>` (1.0) tune it |
+| Graphics › Quality | Ambient occlusion | **Game**, Port SSAO (extra), CACAO, Off | `RFOM_AO_MODE` = (game) / `1` / `cacao` / `off` (`RSX_SSAO=1` still means Port SSAO). Fall of Man has no AO of its own, so Game and Off look the same. CACAO: AMD FidelityFX CACAO (`rsx_cacao.inc`, higher quality) at the same point as the port SSAO, from the game camera's near / far / field of view; `RSX_CACAO_RADIUS` (0.6, in metres) and `RSX_CACAO_STRENGTH` (0.5) tune it (smaller than FFX's defaults so flat walls and facades stay unshaded). Also in F9 (on restart). Port SSAO: A screen-space AO pass computed from the scene depth when the scene pass ends, before the game's post-processing. `RSX_SSAO_STRENGTH=<0..1>` (0.6) and `RSX_SSAO_RADIUS=<0.1..8>` (1.0) tune it |
+| Graphics › Quality | Ambient occlusion quality | **Medium**, Low, High | `RFOM_AO_QUALITY` = (medium) / `low` / `high`: CACAO quality preset (3 / 5 / 12 samples per pixel). |
 
 
 ### Effects Resistance 2 / 3 can turn off that this game doesn't have
