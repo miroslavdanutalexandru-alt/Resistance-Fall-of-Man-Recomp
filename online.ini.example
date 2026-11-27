@@ -1,0 +1,28 @@
+# Online (experimental) - read only when PORT_ONLINE=1. Without it the game is the same as always.
+# Copy this file to online.ini (same folder as run.bat) and fill in YOUR OWN account.
+# online.ini holds your password in plain text: it is ignored by git; never share it.
+# The port never creates accounts: use an existing RPCN account (made with RPCS3,
+# Configuration -> RPCN). RPCS3 itself is not needed to play.
+
+# RPCN server (host or host:port, default port 31313). It signs you in and issues
+# the NP ticket the game server checks.
+rpcn_host = np.rpcs3.net
+rpcn_user =
+# Your plain RPCN password, or the 64-character hash RPCS3 stores (config.yml / rpcn.yml
+# Password). Either works: the port sends RPCN the same hash RPCS3 does, never the plain text.
+rpcn_password =
+# Only if the server asked for an email token when the account was made
+rpcn_token =
+
+# DNS server for the game's own server lookups (community servers), e.g. a revival's DNS
+# dns = 0.0.0.0
+
+# Fixed answers for single host names (checked before dns=)
+# host.example.server.name = 192.0.2.1
+
+# PS Rewired (psrewired.com), the community Resistance: Fall of Man server, as its
+# RPCS3 guide sets it up (psrewired.com/guides/rpcs3). Uncomment EITHER the two host lines
+# OR the dns line:
+# host.resistance.ps3.online.scea.com = 67.222.156.250
+# host.resistancegs.ps3.online.scea.com = 67.222.156.250
+# dns = 67.222.156.250

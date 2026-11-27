@@ -70,6 +70,50 @@ carries a `PS3RECOMP-NP-TICKET` header and the player's online ID, and
 nothing that identifies the machine; the account ID is a hash of the online
 ID. Only a server written to accept such a ticket will take it.
 
+## Community servers with RPCN sign-in (PORT_ONLINE)
+
+Revival servers such as PS Rewired check a real, RPCN-signed NP ticket. A
+port can get one with `PORT_ONLINE=1` (off by default; with it unset nothing
+here runs). The code is in `libs/network/port_online.c`, and the port's
+startup calls `port_online_register()` before the network modules register.
+
+What `PORT_ONLINE=1` does:
+- reads `online.ini` (`PORT_ONLINE_CONFIG=path`, else the working directory,
+  else next to the exe) and sets `PS3_NET_ONLINE=1`, so sockets are real and
+  NP reports ONLINE;
+- `host.NAME = IP` lines and `dns = IP` redirect the title's lookups, both
+  through `gethostbyname` and the title's own DNS queries (answered locally,
+  as above); `host.` lines win over `dns=`;
+- cellNetCtl reports the routed LAN address as the IP and `dns=` as the
+  primary DNS;
+- with `rpcn_user` and `rpcn_password` set, the online ID is the RPCN user,
+  and `sceNpManagerRequestTicket` logs in to `rpcn_host` (TLS, port 31313)
+  on a worker thread and requests a ticket for the title's service ID.
+  GOT_TICKET is reported when it arrives. `sceNpManagerGetTicket` returns
+  the server's ticket as is, and `sceNpManagerGetTicketParam` reads its
+  fields. A failed sign-in reports GOT_TICKET with `SCE_NP_ERROR_OFFLINE`,
+  and GetTicket returns that error. Without an account the made-up ticket
+  above stands.
+
+The password is never sent in plain text: RPCN takes
+PBKDF2-HMAC-SHA3-256(password, "No matter where you go, everybody's
+connected.", 200000 iterations, 32 bytes) as 64 uppercase hex digits, the
+value RPCS3 stores. A 64-hex-digit `rpcn_password` is taken as that value.
+`PORT_ONLINE_PROBE=1` connects to `rpcn_host` at startup, reads the
+server's protocol version (34) and logs it, without logging in. Log lines
+start with `[online]`.
+
+Licence: RPCS3 is GPL-2.0, and none of its code is used. The RPCN packet
+format, the ticket 2.1 layout and the password derivation were written from
+the protocol's observable wire format and the psdevwiki notes. SHA3, HMAC
+and PBKDF2 are written here from FIPS 202 / RFC 2104 / RFC 8018, and checked
+against Python's hashlib in `tests/test_port_online.c`.
+
+Resistance: Fall of Man runs as two processes (front end and levels) and
+switches with `exitspawn` on level loads. Each process signs in again, and
+a connection open at the switch is closed. The environment, `PORT_ONLINE`
+included, carries over.
+
 ## Two players on one machine
 
 ```

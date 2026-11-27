@@ -598,6 +598,7 @@ static void hle_cellGcmInitBody(ppu_context* ctx)
 extern "C" void ps3_net_host_register(unsigned int (*guest_alloc)(unsigned int, unsigned int));
 extern "C" void np_score_register_ctx(void);   /* libs/network/sceNpScore.c */
 extern "C" void np_register_ctx(void);         /* libs/network/sceNp.c: NP ticket */
+extern "C" void port_online_register(void);    /* libs/network/port_online.c: PORT_ONLINE=1 */
 extern "C" void cellSaveData_register_ctx_handlers(void); /* libs/system/cellSaveData.c */
 extern "C" void avconf_register_ctx(void);     /* libs/misc/cellAvconfExt.c */
 static uint32_t g_net_errno_ea = 0;
@@ -926,6 +927,9 @@ extern "C" void ppu_sysprx_register(void)
     /* PS3_NET_ONLINE: real host sockets (libs/network/sysNet.c). Registered
      * first because the first registration of a NID wins, so these shadow the
      * offline model below; without the variable nothing changes. */
+    /* PORT_ONLINE=1 (online.ini): sets PS3_NET_ONLINE and installs the
+     * resolver, DNS and NP ticket hooks, so it goes before both. */
+    port_online_register();
     if (getenv("PS3_NET_ONLINE")) ps3_net_host_register(gcm_guest_alloc);
     /* sceNpScore ranking calls take up to 15 arguments: the ones past r10
      * come off the stack, so they need the full context. */

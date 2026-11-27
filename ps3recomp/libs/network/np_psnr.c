@@ -243,8 +243,14 @@ int np_psnr_enabled(void)
     return getenv("PS3_NET_ONLINE") && getenv("PSNR_SERVER");
 }
 
+/* PORT_ONLINE (port_online.c): the RPCN account name from online.ini, which
+ * the server's ticket carries, so the title shows the same name. NULL = none. */
+const char* (*g_np_online_id_hook)(void) = NULL;
+
 const char* np_psnr_online_id(void)
 {
+    const char* hooked = g_np_online_id_hook ? g_np_online_id_hook() : NULL;
+    if (hooked && *hooked) return hooked;
     const char* id = np_psnr_identity();
     return id ? id : np_fake_username();
 }

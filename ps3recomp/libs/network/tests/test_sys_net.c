@@ -139,6 +139,15 @@ static void put_sockaddr(uint32_t ea, uint32_t ip_be, uint16_t port)
     vm_write32(ea + 4, ip_be);
 }
 
+/* Stands in for port_online_resolve (online.ini host.NAME=IP). */
+static int test_resolve_hook(const char* name, uint32_t* ip)
+{
+    if (strcmp(name, "resistance.ps3.online.scea.com")) return 0;
+    const uint8_t b[4] = { 67, 222, 156, 250 };
+    memcpy(ip, b, 4);
+    return 1;
+}
+
 int main(void)
 {
     vm_base = (uint8_t*)calloc(1, 1u << 20);
@@ -474,6 +483,35 @@ int main(void)
         test_set_env("PS3_NET_HOSTS", "");
         remove(hosts);
         assert(!hosts_override("game.example.com", &ov));     /* unset: no overrides */
+
+        /* PORT_ONLINE's resolver hook is asked first, by gethostbyname and
+         * by the local DNS answers alike. */
+        g_net_resolve_hook = test_resolve_hook;
+        strcpy((char*)vm_base + STR, "resistance.ps3.online.scea.com");
+        h = (uint32_t)call("gethostbyname", STR, 0, 0, 0, 0, 0);
+        assert(h && vm_read32(vm_read32(vm_read32(h + 16))) == 0x43DE9CFAu);   /* 67.222.156.250 */
+        d = C3("socket", SYS_NET_AF_INET, SYS_NET_SOCK_DGRAM, 0);
+        ql = put_dns_query(BUF, 0x0102, "resistance.ps3.online.scea.com", 1);
+        vm_base[BUF + 2] = 0;                                  /* RD clear: echoed clear */
+        assert(call("sendto", d, BUF, ql, 0, ADDR_A, 16) == (int64_t)ql);
+        n = (int32_t)call("recvfrom", d, BUF, 512, 0, 0, 0);
+        assert(n == (int32_t)ql + 16 && r[2] == 0x80 && r[3] == 0x80);
+        assert(r[n - 4] == 67 && r[n - 3] == 222 && r[n - 2] == 156 && r[n - 1] == 250);
+        /* A response (QR set) is not a question. */
+        ql = put_dns_query(BUF, 1, "a.example", 1);
+        vm_base[BUF + 2] |= 0x80;
+        assert(dns_parse_question(vm_base + BUF, ql, qn, sizeof qn) == 0);
+        assert(C1("socketclose", d) == 0);
+        g_net_resolve_hook = NULL;
+    }
+
+    /* inet_ntop: dotted quad into the guest buffer; too small is ENOSPC. */
+    {
+        vm_base[BUF] = 192; vm_base[BUF + 1] = 168; vm_base[BUF + 2] = 1; vm_base[BUF + 3] = 20;
+        assert((uint32_t)call("inet_ntop", SYS_NET_AF_INET, BUF, STR, 16, 0, 0) == STR);
+        assert(!strcmp((const char*)vm_base + STR, "192.168.1.20"));
+        assert(call("inet_ntop", SYS_NET_AF_INET, BUF, STR, 12, 0, 0) == 0 && errno_cell() == SYS_NET_ENOSPC);
+        assert(call("inet_ntop", 99, BUF, STR, 16, 0, 0) == 0);
     }
 
     /* A bad fd is EBADF (9), and closing works. */

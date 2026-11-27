@@ -390,6 +390,11 @@ static int  s_np_ticket_ready = 0;
 static char s_np_ticket_service[25];   /* the service ID it was requested for */
 static u64  s_np_ticket_issued_ms;
 
+/* PORT_ONLINE (port_online.c): a real ticket from an RPCN server, for
+ * community servers that verify it. Without it (or before the first
+ * RequestTicket it takes) the made-up ticket below stands. */
+const np_ticket_source* g_np_ticket_source = NULL;
+
 /* A stable 64-bit account ID (FNV-1a) from the name and its saved salt
  * (np_psnr_identity_key), so one player keeps one account across runs and two
  * players never share one, even with the same name. */
@@ -429,6 +434,18 @@ static s32 np_ticket_request(u32 np_id_ea, u32 service_ea, u32 cookie_ea, u32 co
     if (!s_np_initialized) return SCE_NP_ERROR_NOT_INITIALIZED;
     if (!service_ea) return SCE_NP_ERROR_INVALID_ARGUMENT;
     np_ticket_build(service_ea);
+    if (g_np_ticket_source && g_np_ticket_source->request) {
+        static u8 cookie[NP_TICKET_COOKIE_MAX];
+        if (cookie_size > NP_TICKET_COOKIE_MAX) return SCE_NP_ERROR_INVALID_ARGUMENT;
+        for (u32 i = 0; cookie_ea && i < cookie_size; i++) cookie[i] = vm_read8(cookie_ea + i);
+        s32 r = g_np_ticket_source->request(s_np_ticket_service, cookie, cookie_ea ? cookie_size : 0);
+        if (r != 0) {
+            printf("[sceNp] ManagerRequestTicket(service=\"%s\", cookie %u bytes) -> %s\n",
+                   s_np_ticket_service, cookie_ea ? cookie_size : 0,
+                   r > 0 ? "fetching from the RPCN server" : "refused");
+            return r > 0 ? CELL_OK : r;
+        }
+    }
     printf("[sceNp] ManagerRequestTicket(npId=0x%08X, service=\"%s\", cookie=0x%08X/%u) -> %u bytes\n",
            np_id_ea, s_np_ticket_service, cookie_ea, cookie_size, (u32)NP_TICKET_SIZE);
     if (s_npmgr_cb) {
@@ -439,6 +456,30 @@ static s32 np_ticket_request(u32 np_id_ea, u32 service_ea, u32 cookie_ea, u32 co
         printf("[sceNp] ManagerRequestTicket: no manager callback registered to report it\n");
     }
     return CELL_OK;
+}
+
+/* Completion of a request g_np_ticket_source took: GOT_TICKET with the
+ * ticket's size, or a negative error, as the console reports it. Safe from
+ * any thread (the event is queued for the title's next CheckCallback). */
+void np_ticket_deliver(s32 result)
+{
+    printf("[sceNp] GOT_TICKET: %s %d\n", result < 0 ? "error" : "ticket of", result);
+    if (!s_npmgr_cb) {
+        printf("[sceNp] GOT_TICKET: no manager callback registered to report it\n");
+        return;
+    }
+    const u64 args[8] = { (u64)(u32)SCE_NP_MANAGER_EVENT_GOT_TICKET, (u64)(u32)result,
+                          (u64)(u32)(uintptr_t)s_npmgr_cb_arg, 0, 0, 0, 0, 0 };
+    cellSysutilQueueGuestCallbackArgs((u32)(uintptr_t)s_npmgr_cb, args);
+}
+
+/* The real ticket, when g_np_ticket_source has one: 1 and *t, *len set; 0 when
+ * none was requested yet (the made-up one stands); a negative error when the
+ * last request failed. */
+static s32 np_ticket_real(const u8** t, u32* len)
+{
+    if (!g_np_ticket_source || !g_np_ticket_source->get) return 0;
+    return g_np_ticket_source->get(t, len);
 }
 
 /* Titles read the ticket before ever requesting one: Resistance: Fall of Man
@@ -461,6 +502,22 @@ static s32 np_ticket_get(u32 buf_ea, u32 size_ea)
 {
     if (!s_np_initialized) return SCE_NP_ERROR_NOT_INITIALIZED;
     if (!size_ea) return SCE_NP_ERROR_INVALID_ARGUMENT;
+    const u8* real = NULL;
+    u32 real_len = 0;
+    s32 r = np_ticket_real(&real, &real_len);
+    if (r < 0) {
+        printf("[sceNp] ManagerGetTicket: the last request failed (0x%08X)\n", (u32)r);
+        return r;
+    }
+    if (r > 0) {
+        /* Same output-only *bufferSize. Resistance: Fall of Man's buffer is
+         * 64 KiB (func_0003542C), far beyond any ticket RPCN issues. */
+        if (buf_ea)
+            for (u32 i = 0; i < real_len; i++) vm_write8(buf_ea + i, real[i]);
+        vm_write32(size_ea, real_len);
+        printf("[sceNp] ManagerGetTicket(buf=0x%08X) -> %u bytes (RPCN)\n", buf_ea, real_len);
+        return CELL_OK;
+    }
     np_ticket_ensure();
     if (buf_ea)
         for (u32 i = 0; i < NP_TICKET_SIZE; i++)
@@ -479,6 +536,21 @@ static s32 np_ticket_get_param(s32 id, u32 out_ea)
     if (!out_ea) return SCE_NP_ERROR_INVALID_ARGUMENT;
     if (id < SCE_NP_TICKET_PARAM_SERIAL_ID || id > SCE_NP_TICKET_PARAM_SUBJECT_DOB)
         return SCE_NP_ERROR_INVALID_ARGUMENT;
+    {
+        const u8* real = NULL;
+        u32 real_len = 0;
+        s32 r = np_ticket_real(&real, &real_len);
+        if (r < 0) return SCE_NP_ERROR_INVALID_STATE;
+        if (r > 0) {
+            u8 out[256];
+            if (g_np_ticket_source->param && g_np_ticket_source->param(real, real_len, id, out) == 0) {
+                for (u32 i = 0; i < 256; i++) vm_write8(out_ea + i, out[i]);
+                printf("[sceNp] ManagerGetTicketParam(id=%d) (RPCN)\n", id);
+                return CELL_OK;
+            }
+            printf("[sceNp] ManagerGetTicketParam(id=%d): not in the RPCN ticket, made-up value\n", id);
+        }
+    }
     np_ticket_ensure();
     printf("[sceNp] ManagerGetTicketParam(id=%d)\n", id);
 

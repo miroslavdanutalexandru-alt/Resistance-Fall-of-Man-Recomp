@@ -57,6 +57,46 @@ typedef struct {
 
 static NetCtlHandlerSlot s_handlers[CELL_NET_CTL_HANDLER_MAX];
 
+/* PORT_ONLINE (port_online.c): online.ini dns=, reported as the primary DNS
+ * so a title's own resolver asks it. Network order; 0 = not set. */
+uint32_t g_netctl_dns_override = 0;
+
+/* The address of the interface that routes to the internet: a UDP connect
+ * picks the route without sending anything. The hostname's first address can
+ * be a virtual adapter (Hyper-V, VPN), which a server would see as wrong. */
+static int netctl_get_route_ip(char* buf, size_t buflen)
+{
+    struct sockaddr_in to, me;
+    socklen_t len = sizeof(me);
+    int ok = 0;
+#ifdef _WIN32
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return 0;
+    SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (s == INVALID_SOCKET) return 0;
+#else
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s < 0) return 0;
+#endif
+    memset(&to, 0, sizeof(to));
+    to.sin_family = AF_INET;
+    to.sin_port = htons(53);
+    to.sin_addr.s_addr = htonl(0x01010101u);   /* 1.1.1.1; any public address */
+    memset(&me, 0, sizeof(me));
+    if (connect(s, (struct sockaddr*)&to, sizeof(to)) == 0 &&
+        getsockname(s, (struct sockaddr*)&me, &len) == 0 && me.sin_addr.s_addr != 0) {
+        const unsigned char* ip = (const unsigned char*)&me.sin_addr;
+        snprintf(buf, buflen, "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
+        ok = 1;
+    }
+#ifdef _WIN32
+    closesocket(s);
+#else
+    close(s);
+#endif
+    return ok;
+}
+
 /* Try to get the host machine's IP address */
 static int netctl_get_host_ip(char* buf, size_t buflen)
 {
@@ -222,7 +262,8 @@ s32 cellNetCtlGetInfo(s32 code, CellNetCtlInfo* info)
         break;
 
     case CELL_NET_CTL_INFO_IP_ADDRESS:
-        netctl_get_host_ip(info->ip_address, sizeof(info->ip_address));
+        if (!netctl_online() || !netctl_get_route_ip(info->ip_address, sizeof(info->ip_address)))
+            netctl_get_host_ip(info->ip_address, sizeof(info->ip_address));
         break;
 
     case CELL_NET_CTL_INFO_NETMASK:
@@ -235,7 +276,12 @@ s32 cellNetCtlGetInfo(s32 code, CellNetCtlInfo* info)
         break;
 
     case CELL_NET_CTL_INFO_PRIMARY_DNS:
-        strncpy(info->primary_dns, "8.8.8.8", sizeof(info->primary_dns) - 1);
+        if (g_netctl_dns_override) {
+            const unsigned char* d = (const unsigned char*)&g_netctl_dns_override;
+            snprintf(info->primary_dns, sizeof(info->primary_dns), "%u.%u.%u.%u", d[0], d[1], d[2], d[3]);
+        } else {
+            strncpy(info->primary_dns, "8.8.8.8", sizeof(info->primary_dns) - 1);
+        }
         break;
 
     case CELL_NET_CTL_INFO_SECONDARY_DNS:
