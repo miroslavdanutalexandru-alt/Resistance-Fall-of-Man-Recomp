@@ -62,6 +62,12 @@
  * RFOM_DLSS_CUT=0|1 (default 1): reset the upscaler history when M shows a cut.
  * RFOM_DLSS_MV_ZOFF=0|1 (default 1): replay depth-test-off opaque draws too.
  * RFOM_DLSS_SNAP=0|1 (default 1): snap the render share so w*u, h*u are whole pixels.
+ *
+ * Per-object motion for draws that would get the camera's only (fsr_rematch; "[DLSS] object motion/600:" line):
+ * RSX_DLSS_MV_REMATCH=0|1 (default 1): ambiguous nearest matches re-matched by screen position, not dropped.
+ * RSX_DLSS_MV_VIEWLOCK=0|1 (default 1): ...and near-eye draws (weapon, arms -- skinned too) may pick the draw that
+ *            stayed on screen. RSX_DLSS_MV_LOOSE=0|1 (default 1): a draw whose material changed since last frame
+ *            is matched by program + mesh. All three change only which previous-frame draw a draw is paired with.
  * =========================================================================*/
 #include <stdbool.h>
 #include "rsx_vp_cpu.h"   /* RFOM_DLSS_CAM: CPU evaluation of the vertex program's position */
@@ -196,7 +202,7 @@ static void fsr_camera(float* n, float* f, float* fov)
 static void fsr_jitter(u32 frame, float* jx, float* jy)
 {
     static int jon = -1; if (jon < 0) { const char* e = getenv("RSX_FSR_JITTER"); jon = e ? atoi(e) : 1; }
-    if (!jon || s_fsr_ab >= 2) { *jx = *jy = 0.0f; return; }   /* 4 too */   /* v184 diag: RSX_FSR_JITTER=0 / Home modes 2,3 */
+    if (!jon || s_fsr_ab >= 2 || R1L('h')) { *jx = *jy = 0.0f; return; }   /* 4 too */   /* v184 diag: RSX_FSR_JITTER=0 / Home modes 2,3 */
     /* 8 phases at 1x, 8 x (output/render)^2 when upscaling (NVIDIA's guidance) */
     const float f = g_up_frac;
     u32 ph = (u32)(8.0f / (f * f) + 0.5f); if (ph < 8u) ph = 8u; if (ph > 72u) ph = 72u;
@@ -233,7 +239,8 @@ static int fsr_hist_init(void)
     return 1;
 }
 
-typedef struct { u64 key; u32 val; u32 gen; u32 n; } FsrMapE;   /* n: v189 draws of this key so far (ordinal) */
+typedef struct { u64 key; u32 val; u32 gen; u32 n; u8 vn; } FsrMapE;   /* n: v189 draws of this key so far (ordinal);
+                                                                         vn: s_fsr_map only, the key is view-attached (fsr_key_near) */
 static FsrMapE s_fsr_map[2][FSR_MAP_N];  static u32 s_fsr_map_gen[2], s_fsr_map_frame[2];
 static FsrMapE s_fsr_occ[FSR_MAP_N];     static u32 s_fsr_occ_gen;
 /* v189: exact-match lookups by (key, hfull) and (key, hvar), same generations as
@@ -250,6 +257,29 @@ static int s_fsr_map_cur; static u32 s_fsr_tab_frame, s_fsr_hist_n;
 #define FSR_SIG_ROWS 16u   /* v184j: 32 -> 16 (v184e raised it; exact hashes now do the heavy lifting) */
 static float s_fsr_sig[FSR_RING][FSR_HIST_SLOTS][FSR_SIG_ROWS * 4];   /* v177: per slot constant signature */
 static u32   s_fsr_next[FSR_RING][FSR_HIST_SLOTS];                    /* same-key chain (0xFFFFFFFF ends) */
+/* RSX_DLSS_MV_REMATCH / _LOOSE (fsr_rematch): a slot's probe point (post-viewport clip, origin probe) and the record
+ * frame + 1 it is valid for (0 = not evaluated); the loose identity (program, mesh size, fetch -- no fragment
+ * program, no textures) -> chain head, and its chain. */
+static float s_fsr_pc[FSR_RING][FSR_HIST_SLOTS][4];
+static u32   s_fsr_pcf[FSR_RING][FSR_HIST_SLOTS];
+static FsrMapE s_fsr_lmap[2][FSR_MAP_N];
+static u32   s_fsr_lnext[FSR_RING][FSR_HIST_SLOTS];
+/* record-side object-motion counters for the "[DLSS] object motion/600" line (PORT_STATS_LOG=1) */
+enum { MVR_RM_OK, MVR_RM_VL, MVR_LOOSE_OK, MVR_RM_UNCLEAR, MVR_RM_NOPROBE, MVR_RM_NOEVAL, MVR_RM_NOREF, MVR_RM_BUDGET,
+       MVR_AMB_DROP, MVR_NOKEY, MVR_LOOSE_FAIL, MVR_CAM_SPLIT, MVR_CAM_FILL,
+       MVR_CO_RIGID, MVR_CO_SKIN, MVR_CO_NOEVAL, MVR_CO_UNK, MVR_CO_NEAR, MVR_RM_NEARX, MVR_KEY_NEAR, MVR_KEY_PROBE, MVR_VA_STILL, MVR_VA_WORLD, MVR_N };
+static volatile u32 s_mvr_st[MVR_N];
+/* why a draw kept camera-only motion (dr->fsr_why): stage << 4 | re-match failure */
+enum { MVW_NONE, MVW_BUDGET, MVW_UNCLEAR, MVW_NOPROBE, MVW_NOEVAL, MVW_NOREF, MVW_NOCAND, MVW_OFF, MVW_N };
+enum { MVWS_NONE, MVWS_AMBIG, MVWS_LOOSE, MVWS_NOLOOSE, MVWS_OTHER, MVWS_N };
+static int s_rm_why;   /* FIFO thread: the last fsr_rematch failure (MVW_*) */
+/* camera-only draws whose origin is within RSX_DLSS_VIEWMODEL_W of the eye (weapon / arms), by stage and failure */
+static volatile u32 s_mvn_st[MVWS_N][MVW_N], s_mvn_w[7];
+/* render-side: scene draws the motion pass did not replay, by reason (fsr_mv_replay) */
+enum { MVS_DRAWN, MVS_BLEND_RX, MVS_MODUL, MVS_COLOUR_OFF, MVS_DEPTH_OFF, MVS_CUTOUT, MVS_SUBVP, MVS_FPKILL, MVS_NOPSO, MVS_LATE, MVS_N };
+static u32 s_mvs_st[MVS_N];
+/* the solved camera (render thread, cam_solve + hold) for the FIFO thread's rematch: seqlock, odd = being written */
+static volatile LONG s_rm_mseq; static double s_rm_M[16]; static volatile u32 s_rm_mframe;
 
 
 static u64 fsr_mix(u64 h, u64 v) { h ^= v + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2); return h * 0xFF51AFD7ED558CCDull; }
@@ -257,7 +287,7 @@ static FsrMapE* fsr_find(FsrMapE* t, u32 gen, u64 key, int insert)
 {
     u32 i = (u32)(key ^ (key >> 29)) & (FSR_MAP_N - 1u);
     for (u32 n = 0; n < FSR_MAP_N; n++, i = (i + 1u) & (FSR_MAP_N - 1u)) {
-        if (t[i].gen != gen) { if (!insert) return NULL; t[i].gen = gen; t[i].key = key; t[i].val = 0; t[i].n = 0; return &t[i]; }
+        if (t[i].gen != gen) { if (!insert) return NULL; t[i].gen = gen; t[i].key = key; t[i].val = 0; t[i].n = 0; t[i].vn = 0; return &t[i]; }
         if (t[i].key == key) return &t[i];
     }
     return NULL;
@@ -309,6 +339,32 @@ static float fsr_match_ratio(void)
     return v;
 }
 static volatile u64 s_fsr_st_tsc;                 /* record-thread TSC ticks spent in fsr_record */
+/* R1_LIVE (rsx_r1live.inc): draws recorded with no previous-frame map (never reset), and the cumulative counters --
+ * render thread, every FSR dispatch and just before the 600-frame stats reset (reset = 1) */
+static volatile u32 s_r1l_nohist;
+static void r1l_collect(int reset)
+{
+    if (!s_r1l_on) return;
+    static u32 last[R1C_N];
+    u32 v[R1C_N]; memset(v, 0, sizeof v);
+    volatile u32* m = s_mvr_st;
+    v[R1C_KEY_NEAR] = m[MVR_KEY_NEAR]; v[R1C_KEY_PROBE] = m[MVR_KEY_PROBE]; v[R1C_NEARX] = m[MVR_RM_NEARX];
+    v[R1C_RM_BUDGET] = m[MVR_RM_BUDGET]; v[R1C_NEAR_CAM] = m[MVR_CO_NEAR];
+    v[R1C_NEAR_BUDGET] = s_mvn_st[MVWS_AMBIG][MVW_BUDGET] + s_mvn_st[MVWS_LOOSE][MVW_BUDGET];
+    v[R1C_NEAR_UNCLEAR] = s_mvn_st[MVWS_AMBIG][MVW_UNCLEAR] + s_mvn_st[MVWS_LOOSE][MVW_UNCLEAR];
+    v[R1C_NEAR_NOLOOSE] = s_mvn_st[MVWS_NOLOOSE][MVW_NONE] + s_mvn_st[MVWS_NOLOOSE][MVW_OFF];
+    v[R1C_NEAR_OTHER] = s_mvn_st[MVWS_OTHER][MVW_NONE];
+    v[R1C_RM_OK] = m[MVR_RM_OK]; v[R1C_RM_VL] = m[MVR_RM_VL]; v[R1C_LOOSE_OK] = m[MVR_LOOSE_OK]; v[R1C_LOOSE_FAIL] = m[MVR_LOOSE_FAIL];
+    v[R1C_NOKEY] = m[MVR_NOKEY]; v[R1C_NOHIST] = s_r1l_nohist; v[R1C_CAM_ONLY] = m[MVR_CAM_SPLIT] + m[MVR_CAM_FILL];
+    v[R1C_AMB_DROP] = m[MVR_AMB_DROP]; v[R1C_RM_UNCLEAR] = m[MVR_RM_UNCLEAR];
+    v[R1C_LATE] = s_mvs_st[MVS_LATE]; v[R1C_NOPSO] = s_mvs_st[MVS_NOPSO]; v[R1C_REC] = s_fsr_st_rec;
+    v[R1C_VA_STILL] = m[MVR_VA_STILL]; v[R1C_VA_WORLD] = m[MVR_VA_WORLD];
+    volatile u32* c = s_r1l_blk + 16;
+    for (int i = R1C_KEY_NEAR; i < R1C_N; i++) {
+        c[i] += v[i] - last[i];
+        last[i] = reset && i != R1C_NOHIST ? 0u : v[i];
+    }
+}
 static volatile u32 s_fsr_disp_frame; static volatile ULONGLONG s_fsr_disp_ms;   /* v184: last FSR dispatch (render thread) */
 /* RSX_DLSS_OBJMV (all three upscalers): 1 = per-object motion (previous-frame draw
  * matching) with camera motion for draws that have no match (default); 0 = camera
@@ -319,7 +375,7 @@ static int fsr_objmv(void)
     static int v = -1;
     if (v < 0) { const char* e = getenv("RSX_DLSS_OBJMV"); v = e ? atoi(e) : 1; if (v < 0 || v > 2) v = 1;
                  if (fsr_mode()) fprintf(stderr, "[FSR] object motion: %s%c", v == 0 ? "camera only" : v == 2 ? "per object, unmatched still" : "per object + camera fallback", 10); }
-    return v;
+    return R1L('f') ? 0 : v;
 }
 /* RSX_DLSS_DEBUG: what the upscaler is fed, drawn over its output (render-res
  * inputs stretched to the screen, 35% scene luminance behind):
@@ -328,7 +384,8 @@ static int fsr_objmv(void)
  * depth = depth fed to DLSS (magenta = no motion-pass draw covered the pixel)
  * match = per-draw previous-frame match: green exact, cyan exact instance,
  *         yellow nearest-by-constants, orange ambiguous nearest (RSX_DLSS_MATCH_RATIO),
- *         blue camera fallback, red none
+ *         blue camera fallback, red none, magenta re-matched by position (RSX_DLSS_MV_REMATCH),
+ *         white view-locked (RSX_DLSS_MV_VIEWLOCK), purple loose identity (RSX_DLSS_MV_LOOSE)
  *         (depth fed to DLSS is invalid in this mode). */
 static int fsr_dbg_view(void)
 {
@@ -339,7 +396,7 @@ static int fsr_dbg_view(void)
         if (v < 0 || v > 3) v = 0;
         if (v) fprintf(stderr, "[FSR] debug view %d (RSX_DLSS_DEBUG)%c", v, 10);
     }
-    return v;
+    return s_r1l_tint ? 3 : v;
 }
 static float fsr_dbg_scale(void)
 {
@@ -476,7 +533,8 @@ static int dlss_cam_rep(void)
 typedef struct { volatile u32 hash; rfom_camrep_t r; } CamRep;
 static CamRep s_cam_rep[512];
 static CamRep* cam_rep(u32 hash) { return &s_cam_rep[(hash * 2654435761u) >> 23]; }
-typedef struct { u32 hash; u8 st; signed char pa; } CamProg;   /* st: 0 unknown, 1 position attribute pa, 2 can't evaluate */
+typedef struct { u32 hash; u8 st; signed char pa; u8 pk; } CamProg;   /* st: 0 unknown, 1 position attribute pa, 2 can't evaluate;
+                                                                         pk (fsr_rematch probe): 0 unknown, 1 runs, 2 refused */
 static CamProg s_cam_prog[512];
 static CamFrame* cam_frame(u32 fr)
 {
@@ -512,7 +570,7 @@ static void cam_note(const D3D12DrawRecord* dr, int vs_idx, const char* csrc, co
         }
     }
     CamProg* pg = &s_cam_prog[(ve->hash * 2654435761u) >> 23];
-    if (pg->hash != ve->hash) { pg->hash = ve->hash; pg->st = 0; pg->pa = -1; }
+    if (pg->hash != ve->hash) { pg->hash = ve->hash; pg->st = 0; pg->pa = -1; pg->pk = 0; }
     if (pg->st == 2) return;
     cf->tried++;
     static float cur[512 * 4], prv[512 * 4];   /* FIFO thread only */
@@ -567,7 +625,7 @@ static int fsr_vm_near(int vs_idx, const char* csrc, u32 fr)
     if (bf != fr) { bf = fr; bn = 0; }
     if (bn >= 256u) return 0;
     CamProg* pg = &s_cam_prog[(ve->hash * 2654435761u) >> 23];
-    if (pg->hash != ve->hash) { pg->hash = ve->hash; pg->st = 0; pg->pa = -1; }
+    if (pg->hash != ve->hash) { pg->hash = ve->hash; pg->st = 0; pg->pa = -1; pg->pk = 0; }
     if (pg->st == 2) return 0;   /* skinned / not evaluable: no single object origin */
     bn++;
     static float c[512 * 4];   /* FIFO thread only */
@@ -581,6 +639,347 @@ static int fsr_vm_near(int vs_idx, const char* csrc, u32 fr)
     vpcpu_attr_default(v);   /* position (0,0,0,1): the object's origin */
     if (!vpcpu_run(ve->ucode, ve->ucode_n, c, (const float (*)[4])v, o)) return 0;
     return rfom_viewmodel_near(o[0], o[1], o[3], thr);
+}
+
+/* ---- per-object motion for draws that would get camera-only motion ----
+ * RSX_DLSS_MV_REMATCH (default 1, 0 = off: the old drop): a nearest-by-constants match refused as ambiguous
+ * (RSX_DLSS_MATCH_RATIO) is resolved by WHERE the object is instead of dropped for camera-only motion: a probe point
+ * of the object (its origin; skinned meshes: their root bone, every non-position input 0.25) is run through the
+ * vertex program (rsx_vp_cpu.h) with this draw's constants and with each of the 4 nearest candidates' previous-
+ * frame constants (the history slot), and the candidate whose point lies where the object would have been last frame
+ * if it had stayed put -- this draw's own per-instance rows with last frame's camera rows, or through the solved
+ * camera -- is taken when it is clearly nearer than the runner-up (RSX_DLSS_MV_REMATCH_RATIO, default 0.5) and within
+ * 0.5 ndc. A moving door, a walking character, a turning vehicle stays near that spot (its own motion); a
+ * neighbouring copy of it does not. Match type 6 (magenta in RSX_DLSS_DEBUG=match).
+ * RSX_DLSS_MV_VIEWLOCK (default 1): for a draw whose probe point lies within RSX_DLSS_VIEWMODEL_W of the eye (the
+ * first-person weapon and arms, skinned ones included -- fsr_vm_near can't evaluate those), "stayed put on SCREEN"
+ * also counts: such a draw follows the view, its camera-only motion is the background's sweep (ghosting). Never
+ * zero motion made up: the pick is always a real previous-frame draw, whose constants give the motion. Static world
+ * geometry is never within the eye distance. Match type 7 (white).
+ * RSX_DLSS_MV_LOOSE (default 1): a draw whose key (program, fragment program, mesh size, textures) had no draw last
+ * frame -- its fragment program or a texture changed (animated material, display, muzzle glow on the weapon) --
+ * looks for last frame's draws of the same program and mesh size under any material, verified the same way with a
+ * tighter limit (0.05 ndc). Match type 8 (purple).
+ * RSX_DLSS_MV_REMATCH_N (default 256) / RSX_DLSS_MV_REMATCH_US (default 2000): at most this many draws / microseconds a frame
+ * are spent re-matching (FIFO thread cost); the rest keep the old camera-only motion ("over budget") -- except draws
+ * whose key is view-attached (fsr_key_near: origin within RSX_DLSS_VIEWMODEL_W of the eye -- weapon / arms, drawn among
+ * the world): still re-matched, at most 128 a frame.
+ * RSX_DLSS_MV_DIAG=1 (diagnostic, default 0): every scene draw's origin is probed (clip x, y, w) and, while frame
+ * generation is on, every 3rd frame's draws within 4 units of the eye are logged ([FG-MVN] lines, at most 300 frames). */
+static int fsr_mv_rematch_on(void)
+{
+    static int v = -1;
+    if (v < 0) { v = dlss_env_i("RSX_DLSS_MV_REMATCH", 1, 0, 1);
+                 fprintf(stderr, "[DLSS] ambiguous object matches: %s%c", v ? "re-matched by screen position (RSX_DLSS_MV_REMATCH=0: dropped)"
+                                                                           : "dropped for camera motion (RSX_DLSS_MV_REMATCH=0)", 10); }
+    return v && !R1L('d');
+}
+static int fsr_mv_viewlock_on(void)
+{
+    static int v = -1;
+    if (v < 0) { v = dlss_env_i("RSX_DLSS_MV_VIEWLOCK", 1, 0, 1);
+                 fprintf(stderr, "[DLSS] view-locked draws (weapon / arms): %s%c", v ? "matched to the draw that stayed on screen (RSX_DLSS_MV_VIEWLOCK=0: off)"
+                                                                                    : "off (RSX_DLSS_MV_VIEWLOCK=0)", 10); }
+    return v && !R1L('c');
+}
+static int fsr_mv_loose_on(void)
+{
+    static int v = -1;
+    if (v < 0) { v = dlss_env_i("RSX_DLSS_MV_LOOSE", 1, 0, 1);
+                 fprintf(stderr, "[DLSS] draws whose material changed: %s%c", v ? "matched by program and mesh, verified by position (RSX_DLSS_MV_LOOSE=0: off)"
+                                                                               : "camera motion (RSX_DLSS_MV_LOOSE=0)", 10); }
+    return v && !R1L('d');
+}
+static int fsr_mv_diag(void) { static int v = -1; if (v < 0) { v = dlss_env_i("RSX_DLSS_MV_DIAG", 0, 0, 1); if (v) fprintf(stderr, "[DLSS] RSX_DLSS_MV_DIAG=1: every draw's origin probed, [FG-MVN] lines while frame generation is on%c", 10); } return v; }
+static int fsr_mv_rm_n(void) { static int v = -1; if (v < 0) v = dlss_env_i("RSX_DLSS_MV_REMATCH_N", 256, 0, 8192); return R1L('e') ? 8192 : v; }
+static double fsr_mv_rm_ratio(void)
+{
+    static double v = -1.0;
+    if (v < 0.0) { const char* e = getenv("RSX_DLSS_MV_REMATCH_RATIO"); v = e && *e ? atof(e) : 0.5; if (!(v > 0.0) || v > 1.0) v = 0.5; }
+    return v;
+}
+static CamProg* fsr_cam_prog(const VPVSEntry* ve)
+{
+    CamProg* pg = &s_cam_prog[(ve->hash * 2654435761u) >> 23];
+    if (pg->hash != ve->hash) { pg->hash = ve->hash; pg->st = 0; pg->pa = -1; pg->pk = 0; }
+    return pg;
+}
+/* FIFO thread: the program's position input, once (st 1 rigid / 2 skinned, morphing or not evaluable) */
+static void fsr_prog_st(const VPVSEntry* ve, CamProg* pg, const char* csrc)
+{
+    if (pg->st) return;
+    static float c[512 * 4];
+    memcpy(c, csrc, sizeof c);
+    const int pa = vpcpu_find_pos(ve->ucode, ve->ucode_n, c, ve->inmask);
+    if (pa < 0) pg->st = 2; else { pg->pa = (signed char)pa; pg->st = 1; }
+}
+static const float s_rm_pts[5][3] = { { 0, 0, 0 }, { 0, 0, 1 }, { 0, 0, -1 }, { 1, 0, 0 }, { 0, 1, 0 } };
+/* Probe point k of the object under constants c, through the viewport epilogue epi (posscale, posoffset).
+ * o = pre-epilogue clip (for rfom_viewmodel_near), q = post-epilogue clip. 0 = the program can't be run. */
+static int fsr_probe(const VPVSEntry* ve, const CamProg* pg, const float* c, const float* epi, int k, float o[4], float q[4])
+{
+    float v[16][4];
+    for (int i = 0; i < 16; i++) { v[i][0] = v[i][1] = v[i][2] = v[i][3] = 0.25f; }
+    const int pa = pg->st == 1 && pg->pa >= 0 ? pg->pa : 0;
+    v[pa][0] = s_rm_pts[k][0]; v[pa][1] = s_rm_pts[k][1]; v[pa][2] = s_rm_pts[k][2]; v[pa][3] = 1.0f;
+    if (!vpcpu_run(ve->ucode, ve->ucode_n, c, (const float (*)[4])v, o)) return 0;
+    q[0] = o[0] * epi[0] + o[3] * epi[4]; q[1] = o[1] * epi[1] + o[3] * epi[5];
+    q[2] = o[2] * epi[2] + o[3] * epi[6]; q[3] = o[3];
+    return 1;
+}
+/* 16-byte rows out of the history slot: upload heap (write-combined), so streaming loads */
+static void fsr_wc_rows(float* dst, const u8* hp, const u32* rows, u32 nr)
+{
+    for (u32 i = 0; i < nr; i++) {
+        const u32 r = rows[i];
+#ifdef __SSE4_1__
+        _mm_storeu_si128((__m128i*)(void*)(dst + r * 4), _mm_stream_load_si128((__m128i*)(void*)(hp + (size_t)r * 16)));
+#else
+        memcpy(dst + r * 4, hp + (size_t)r * 16, 16);
+#endif
+    }
+}
+/* last solved camera, if recent (render thread publishes it; the record thread runs up to FSR_LEAD frames ahead) */
+static int fsr_rm_camera(u32 fr, double M[16])
+{
+    for (int t = 0; t < 2; t++) {
+        const LONG s1 = s_rm_mseq;
+        if (s1 & 1) { YieldProcessor(); continue; }
+        MemoryBarrier();
+        memcpy(M, s_rm_M, 16 * sizeof(double));
+        const u32 mf = s_rm_mframe;
+        MemoryBarrier();
+        if (s_rm_mseq != s1) continue;
+        return mf && fr - mf <= FSR_LEAD + 2u;
+    }
+    return 0;
+}
+/* Re-match: pick one of cand[0..nc) (previous-frame slots of ring pr) as this draw's previous-frame draw, or -1.
+ * *vl = the pick won on the view-locked (stayed on screen) term. */
+/* RSX_DLSS_MV_REMATCH_US (default 2000, 0 = no limit): FIFO-thread time a frame may spend re-matching, in TSC ticks */
+static u64 fsr_rm_tsc_cap(void)
+{
+    static int us = -1; static u64 t0, cap; static LARGE_INTEGER q0, qf;
+    if (us < 0) { us = dlss_env_i("RSX_DLSS_MV_REMATCH_US", 2000, 0, 100000); QueryPerformanceFrequency(&qf); QueryPerformanceCounter(&q0); t0 = __rdtsc(); }
+    if (!us || R1L('e')) return 0;
+    if (!cap) {   /* TSC rate from the first >= 50 ms after start-up (3 GHz until then) */
+        LARGE_INTEGER q1; QueryPerformanceCounter(&q1);
+        const double s = qf.QuadPart ? (double)(q1.QuadPart - q0.QuadPart) / (double)qf.QuadPart : 0.0;
+        if (s < 0.05) return (u64)us * 3000u;
+        cap = (u64)((double)(__rdtsc() - t0) / s * 1e-6 * us); if (!cap) cap = 1;
+    }
+    return cap;
+}
+static int fsr_rematch_body(int vs_idx, const char* csrc, const float* epi, const u32* rows, u32 nr, u32 fr, u32 ring, u32 slot,
+                            const u32* cand, int nc, double lim, int* vl, int nocap);
+static int fsr_rm_fail(int mvr, int why) { s_mvr_st[mvr]++; s_rm_why = why; return -1; }
+/* the draw's object origin (one vertex-program run) lies within RSX_DLSS_VIEWMODEL_W of the eye: weapon / arms */
+static int fsr_rm_near_quick(int vs_idx, const char* csrc, const float* epi)
+{
+    const float vm = fsr_vm_w();
+    if (!fsr_mv_viewlock_on() || !(vm > 0.0f) || vs_idx < 0 || vs_idx >= s_d3d.vp_vs_n) return 0;
+    const VPVSEntry* ve = &s_d3d.vp_vs[vs_idx];
+    if (!ve->ucode || !ve->ucode_n) return 0;
+    CamProg* pg = fsr_cam_prog(ve);
+    if (pg->pk == 2) return 0;
+    fsr_prog_st(ve, pg, csrc);
+    float o[4], q[4];
+    if (!fsr_probe(ve, pg, (const float*)csrc, epi, 0, o, q)) return 0;
+    return (o[0] != 0.0f || o[1] != 0.0f || o[2] != 0.0f || o[3] != 0.0f) && rfom_viewmodel_near(o[0], o[1], o[3], vm);
+}
+/* Is this draw key view-attached (weapon / arms)? Probed on the key's first draw of a frame when last frame had no
+ * answer for it (and every 64th frame per key), carried in the key's map entry: 2 near the eye, 1 not, 0 unknown
+ * (over the 256 probes a frame). Matched weapon draws are never re-matched, so the over-budget path could not learn
+ * it from them; FMD2 showed every near-eye over-budget fallback dropped before the 64-probe cap reached the weapon. */
+static u8 fsr_key_near(int vs_idx, const char* csrc, const float* epi, u32 fr)
+{
+    static u32 bf, bn;   /* FIFO thread only */
+    if (bf != fr) { bf = fr; bn = 0; }
+    if (bn >= 256u) return 0;
+    bn++; s_mvr_st[MVR_KEY_PROBE]++;
+    if (!fsr_rm_near_quick(vs_idx, csrc, epi)) return 1;
+    s_mvr_st[MVR_KEY_NEAR]++;
+    return 2;
+}
+/* RSX_DLSS_MV_VIEWSTILL (default 1, 0 = off): a draw left with camera-only motion (ambiguous and not re-matched, or
+ * a new key without a loose match -- the weapon switching vertex programs) whose origin is near the eye and sits where
+ * last frame's view-attached pieces were (not where the camera alone would have moved it: rfom_va_still) follows the
+ * view: it gets zero screen motion (match type 7, white) instead of the camera's, which smeared the gun across fast
+ * turns (FMD2: blue gun body, why 0x11 / 0x30). Same rule as engines that output camera-relative velocity for the
+ * first-person viewmodel; independent of the re-match budget (a probe or two per weapon key a frame). */
+static int fsr_mv_viewstill_on(void)
+{
+    static int v = -1;
+    if (v < 0) { v = dlss_env_i("RSX_DLSS_MV_VIEWSTILL", 1, 0, 1);
+                 fprintf(stderr, "[DLSS] view-attached draws without a match (weapon / arms): %s%c", v ? "zero screen motion when they followed the view (RSX_DLSS_MV_VIEWSTILL=0: camera motion)"
+                                                                                                      : "camera motion (RSX_DLSS_MV_VIEWSTILL=0)", 10); }
+    return v && !R1L('b') && !R1L('i');
+}
+#define FSR_VA_N 32u
+static RfomMvPt s_fsr_va[2][FSR_VA_N]; static u32 s_fsr_va_n[2], s_fsr_va_f[2];   /* FIFO thread: view-attached points by frame parity */
+/* the draw's origin probe: o = pre-epilogue clip (rfom_viewmodel_near), q = post-epilogue clip; 0 = no usable point */
+static int fsr_va_probe(int vs_idx, const char* csrc, const float* epi, float o[4], float q[4])
+{
+    if (vs_idx < 0 || vs_idx >= s_d3d.vp_vs_n) return 0;
+    const VPVSEntry* ve = &s_d3d.vp_vs[vs_idx];
+    if (!ve->ucode || !ve->ucode_n) return 0;
+    CamProg* pg = fsr_cam_prog(ve);
+    if (pg->pk == 2) return 0;
+    fsr_prog_st(ve, pg, csrc);
+    if (!fsr_probe(ve, pg, (const float*)csrc, epi, 0, o, q)) return 0;
+    return o[0] != 0.0f || o[1] != 0.0f || o[2] != 0.0f || o[3] != 0.0f;
+}
+static void fsr_va_add(u32 fr, RfomMvPt p)
+{
+    const u32 b = fr & 1u;
+    if (s_fsr_va_f[b] != fr) { s_fsr_va_f[b] = fr; s_fsr_va_n[b] = 0; }
+    if (!p.ok || s_fsr_va_n[b] >= FSR_VA_N) return;
+    for (u32 i = 0; i < s_fsr_va_n[b]; i++) { const double d = rfom_mv_pt_dist(s_fsr_va[b][i], p); if (d >= 0.0 && d < 0.005) return; }
+    s_fsr_va[b][s_fsr_va_n[b]++] = p;
+}
+/* a view-attached key's first draw this frame: its origin is next frame's reference */
+static void fsr_va_note(int vs_idx, const char* csrc, const float* epi, u32 fr)
+{
+    float o[4], q[4];
+    if (fsr_va_probe(vs_idx, csrc, epi, o, q) && rfom_viewmodel_near(o[0], o[1], o[3], fsr_vm_w())) fsr_va_add(fr, rfom_mv_pt(q));
+}
+/* kn: 2 view-attached key, 0 unknown (1 = known far: never asked). At most 128 probes a frame (64 for unknown keys). */
+static int fsr_va_still(int vs_idx, const char* csrc, const float* epi, u32 fr, int kn)
+{
+    static u32 nf, nk, nu;   /* FIFO thread only */
+    if (nf != fr) { nf = fr; nk = nu = 0; }
+    if (kn == 2 ? nk >= 128u : nu >= 64u) return 0;
+    if (kn == 2) nk++; else nu++;
+    float o[4], q[4];
+    if (!fsr_va_probe(vs_idx, csrc, epi, o, q) || !rfom_viewmodel_near(o[0], o[1], o[3], fsr_vm_w())) return 0;
+    const RfomMvPt p = rfom_mv_pt(q);
+    if (!p.ok) return 0;
+    const u32 b = (fr - 1u) & 1u;
+    double obs = -1.0;
+    if (s_fsr_va_f[b] == fr - 1u)
+        for (u32 i = 0; i < s_fsr_va_n[b]; i++) { const double d = rfom_mv_pt_dist(s_fsr_va[b][i], p); if (d >= 0.0 && (obs < 0.0 || d < obs)) obs = d; }
+    double cam = -1.0;
+    { double M[16], out[2];
+      if (fsr_rm_camera(fr, M) && vpcpu_reproj(M, p.x, p.y, (double)q[2] / q[3], out)) {
+          RfomMvPt c; c.x = out[0]; c.y = out[1]; c.w = 0.0; c.ok = 1; cam = rfom_mv_pt_dist(p, c); } }
+    if (!rfom_va_still(obs, cam)) { if (obs >= 0.0) s_mvr_st[MVR_VA_WORLD]++; return 0; }
+    fsr_va_add(fr, p);
+    return 1;
+}
+/* kn: the key's fsr_key_near state. A view-attached key (2) is re-matched past the time and draw caps (at most 128 such
+ * draws a frame); an unknown key (0) over the time cap gets the old one-probe check (64 a frame); a known far key fails. */
+static int fsr_rematch(int vs_idx, const char* csrc, const float* epi, const u32* rows, u32 nr, u32 fr, u32 ring, u32 slot,
+                       const u32* cand, int nc, double lim, int* vl, int kn)
+{
+    static u32 tf, nk; static u64 used;   /* FIFO thread only */
+    *vl = 0;
+    if (tf != fr) { tf = fr; used = 0; nk = 0; }
+    const u64 cap = fsr_rm_tsc_cap();
+    s_rm_why = MVW_NONE;
+    const int nocap = kn == 2 && nk < 128u;
+    if (nocap) nk++;
+    if (cap && used >= cap) {   /* over budget: the weapon and arms (drawn among the world) still get re-matched */
+        if (!nocap) {
+            static u32 nf, nn;
+            if (nf != fr) { nf = fr; nn = 0; }
+            if (kn != 0 || nn >= 64u) return fsr_rm_fail(MVR_RM_BUDGET, MVW_BUDGET);
+            nn++;
+            if (!fsr_rm_near_quick(vs_idx, csrc, epi)) return fsr_rm_fail(MVR_RM_BUDGET, MVW_BUDGET);
+        }
+        s_mvr_st[MVR_RM_NEARX]++;
+    }
+    const u64 t0 = __rdtsc();
+    const int r = fsr_rematch_body(vs_idx, csrc, epi, rows, nr, fr, ring, slot, cand, nc, lim, vl, nocap);
+    used += __rdtsc() - t0;
+    return r;
+}
+static int fsr_rematch_body(int vs_idx, const char* csrc, const float* epi, const u32* rows, u32 nr, u32 fr, u32 ring, u32 slot,
+                            const u32* cand, int nc, double lim, int* vl, int nocap)
+{
+    *vl = 0;
+    if (nc <= 0 || vs_idx < 0 || vs_idx >= s_d3d.vp_vs_n || !nr) { s_rm_why = MVW_NOCAND; return -1; }
+    const VPVSEntry* ve = &s_d3d.vp_vs[vs_idx];
+    if (!ve->ucode || !ve->ucode_n) return fsr_rm_fail(MVR_RM_NOEVAL, MVW_NOEVAL);
+    static u32 bf, bn;   /* FIFO thread only */
+    if (bf != fr) { bf = fr; bn = 0; }
+    if (!nocap) {
+        if (bn >= (u32)fsr_mv_rm_n()) return fsr_rm_fail(MVR_RM_BUDGET, MVW_BUDGET);
+        bn++;
+    }
+    CamProg* pg = fsr_cam_prog(ve);
+    if (pg->pk == 2) return fsr_rm_fail(MVR_RM_NOEVAL, MVW_NOEVAL);
+    fsr_prog_st(ve, pg, csrc);
+    const float* cc = (const float*)csrc;
+    /* the probe point: the origin, else the first unit point in front of the eye */
+    float o[4], q[4], o0[4] = { 0, 0, 0, 0 }; int k = -1;
+    for (int t = 0; t < 5 && k < 0; t++) {
+        if (!fsr_probe(ve, pg, cc, epi, t, o, q)) { pg->pk = 2; return fsr_rm_fail(MVR_RM_NOEVAL, MVW_NOEVAL); }
+        pg->pk = 1;
+        if (rfom_mv_pt(q).ok) k = t;
+        if (t == 0) {   /* cache: next frame's draws of this object find it without re-running it */
+            memcpy(o0, o, sizeof o0);
+            memcpy(s_fsr_pc[ring][slot], q, sizeof q); s_fsr_pcf[ring][slot] = fr + 1u;
+        }
+    }
+    if (k < 0) return fsr_rm_fail(MVR_RM_NOPROBE, MVW_NOPROBE);
+    const RfomMvPt pc = rfom_mv_pt(q);
+    const float vm = fsr_vm_w();
+    const int near_eye = fsr_mv_viewlock_on() && vm > 0.0f && (o0[0] != 0.0f || o0[1] != 0.0f || o0[2] != 0.0f || o0[3] != 0.0f) &&
+                         rfom_viewmodel_near(o0[0], o0[1], o0[3], vm);
+    static float buf[512 * 4];   /* FIFO thread only */
+    /* where the object was last frame if it stayed put: (a) own per-instance rows + last frame's shared rows */
+    RfomMvPt rs[2]; int nrs = 0;
+    if (vs_idx < FSR_VARY_VS && s_fsr_multi[vs_idx] >= 16u && s_fsr_bankf[(fr - 1u) & 1u][vs_idx] == fr) {
+        const u8* vy = s_fsr_vary[vs_idx]; const float* pb = s_fsr_bank[(fr - 1u) & 1u][vs_idx];
+        memcpy(buf, csrc, sizeof buf);
+        for (u32 i = 0; i < nr; i++) if (!vy[rows[i]]) memcpy(buf + rows[i] * 4, pb + rows[i] * 4, 16);
+        float o1[4], q1[4];
+        if (fsr_probe(ve, pg, buf, epi, k, o1, q1)) { rs[nrs] = rfom_mv_pt(q1); if (rs[nrs].ok) nrs++; }
+    }
+    /* (b) through the last solved camera */
+    { double M[16], out[2];
+      if (fsr_rm_camera(fr, M) && vpcpu_reproj(M, pc.x, pc.y, (double)q[2] / q[3], out)) {
+          rs[nrs].x = out[0]; rs[nrs].y = out[1]; rs[nrs].w = 0.0; rs[nrs].ok = 1; nrs++; } }
+    if (!nrs && !near_eye) return fsr_rm_fail(MVR_RM_NOREF, MVW_NOREF);
+    double sc[8]; int vlw[8];
+    if (nc > 8) nc = 8;
+    const u32 pr = (fr - 1u) % FSR_RING;
+    for (int i = 0; i < nc; i++) {
+        const u32 c = cand[i];
+        float qc[4];
+        sc[i] = -1.0; vlw[i] = 0;
+        if (k == 0 && s_fsr_pcf[pr][c] == fr) memcpy(qc, s_fsr_pc[pr][c], sizeof qc);
+        else {
+            const u8* hp = s_fsr_hist_mapped + ((u64)pr * s_fsr_slots + c) * FSR_HIST_STRIDE;
+            float ep[12], oc[4];
+            memcpy(buf, csrc, sizeof buf);
+            fsr_wc_rows(buf, hp, rows, nr);
+            { static const u32 er[3] = { 0, 1, 2 }; fsr_wc_rows(ep, hp + 8192, er, 3); }
+            if (!fsr_probe(ve, pg, buf, ep, k, oc, qc)) continue;
+            if (k == 0) { memcpy(s_fsr_pc[pr][c], qc, sizeof qc); s_fsr_pcf[pr][c] = fr; }
+        }
+        const RfomMvPt p = rfom_mv_pt(qc);
+        for (int r = 0; r < nrs; r++) { const double d = rfom_mv_pt_dist(p, rs[r]); if (d >= 0.0 && (sc[i] < 0.0 || d < sc[i])) sc[i] = d; }
+        if (near_eye) { const double d = rfom_mv_pt_dist(p, pc); if (d >= 0.0 && (sc[i] < 0.0 || d < sc[i])) { sc[i] = d; vlw[i] = 1; } }
+    }
+    const int b = rfom_mv_rematch_pick(sc, nc, fsr_mv_rm_ratio(), lim);
+    if (b < 0) return fsr_rm_fail(MVR_RM_UNCLEAR, MVW_UNCLEAR);
+    *vl = vlw[b];
+    return b;
+}
+/* up to K slots of a previous-frame chain nearest this draw's signature (nearest first) */
+static int fsr_chain_topk(u32 head, const u32* next, const float (*sigs)[FSR_SIG_ROWS * 4], const float* sig, u32* out, int K)
+{
+    float d[8]; int n = 0, walked = 0;
+    for (u32 c = head; c != 0xFFFFFFFFu && walked < 64; c = next[c], walked++) {
+        const float* ps = sigs[c]; float s = 0.0f;
+        for (u32 j = 0; j < FSR_SIG_ROWS * 4; j++) { const float df = ps[j] - sig[j]; s += df < 0.0f ? -df : df; }
+        if (!(s == s)) continue;
+        int p = n < K ? n : K;
+        while (p > 0 && d[p - 1] > s) { if (p < K) { d[p] = d[p - 1]; out[p] = out[p - 1]; } p--; }
+        if (p < K) { d[p] = s; out[p] = c; if (n < K) n++; }
+    }
+    return n;
 }
 
 static void fsr_record_impl(D3D12DrawRecord* dr, int vs_idx, char* dst, const char* csrc, const float* epi);
@@ -633,9 +1032,18 @@ static void fsr_record_impl(D3D12DrawRecord* dr, int vs_idx, char* dst, const ch
     h = fsr_mix(h, dr->tex[0].raw);
     h = fsr_mix(h, ((u64)dr->gf << 32) | dr->tex[1].raw);
     fsr_pf(s_fsr_map[s_fsr_map_cur], h); fsr_pf(s_fsr_map[s_fsr_map_cur ^ 1], h);
+    /* RSX_DLSS_MV_LOOSE: the same program and mesh size under any fragment program / textures */
+    const int loose = fsr_objmv() == 1 && fsr_mv_loose_on();
+    u64 hl = 0;
+    if (loose) {
+        hl = fsr_mix(fsr_mix(fsr_mix(0x51ED270B27C4F3A9ull, (vs_idx >= 0 && vs_idx < s_d3d.vp_vs_n) ? s_d3d.vp_vs[vs_idx].hash : 0xFFFFFFFFu),
+                             dr->ib_count ? dr->ib_count : dr->vertex_count), dr->gf) ^ 3u;
+        fsr_pf(s_fsr_lmap[s_fsr_map_cur], hl); fsr_pf(s_fsr_lmap[s_fsr_map_cur ^ 1], hl);
+    }
 
     const u32 slot = s_fsr_hist_n++;
     const u32 ring = fr % FSR_RING;
+    s_fsr_pcf[ring][slot] = 0;
     const u64 cur_off = ((u64)ring * s_fsr_slots + slot) * FSR_HIST_STRIDE;
     u8* hp = s_fsr_hist_mapped + cur_off;
     if (vs_idx >= 0 && vs_idx < s_d3d.vp_vs_n && !s_d3d.vp_vs[vs_idx].c_all) {
@@ -704,12 +1112,28 @@ static void fsr_record_impl(D3D12DrawRecord* dr, int vs_idx, char* dst, const ch
     }
     u64 prev_off = cur_off;                     /* no match: "did not move" */
     dr->fsr_mt = 0; dr->fsr_chain = 0; dr->fsr_bd = -1.0f; dr->fsr_slot = slot; dr->fsr_pslot = 0xFFFFFFFFu;
+    dr->fsr_why = 0; dr->fsr_o[0] = dr->fsr_o[1] = dr->fsr_o[2] = 0.0f;
+    int mvw = 0;   /* why camera-only (MVWS_* << 4 | MVW_*) */
     const int pm = s_fsr_map_cur ^ 1;
     FsrMapE* ce = fsr_find(s_fsr_map[s_fsr_map_cur], s_fsr_map_gen[s_fsr_map_cur], h, 1);
     const u32 ord = ce ? ce->n++ : 0xFFFFFFFFu;
     const int objmv = fsr_objmv();
+    int kn = 0;   /* fsr_key_near: 2 = this key is view-attached (weapon / arms), 1 = not, 0 = unknown */
+    if (ce && objmv == 1 && fsr_mv_rematch_on() && fsr_mv_viewlock_on() && fsr_vm_w() > 0.0f && !R1L('b')) {   /* R1_LIVE b: 6b84476 */
+        if (ord == 0) {
+            const FsrMapE* pe = s_fsr_map_frame[pm] == fr - 1u ? fsr_find(s_fsr_map[pm], s_fsr_map_gen[pm], h, 0) : NULL;
+            u8 v = pe ? pe->vn : 0;
+            if (!v || ((fr + (u32)(h >> 40)) & 63u) == 0u) v = fsr_key_near(vs_idx, csrc, epi, fr);
+            ce->vn = v;
+        }
+        kn = ce->vn;
+        if (kn == 2 && ord == 0 && fsr_mv_viewstill_on()) fsr_va_note(vs_idx, csrc, epi, fr);
+    }
+    int nokey = 0;   /* the key had no draw last frame (new object, or its material changed) */
+    if (objmv && s_fsr_map_frame[pm] != fr - 1u) s_r1l_nohist++;
     if (objmv && s_fsr_map_frame[pm] == fr - 1u) {
         FsrMapE* e = fsr_find(s_fsr_map[pm], s_fsr_map_gen[pm], h, 0);
+        nokey = !e || !e->val;
         if (e) {
             const u32 pr = (fr - 1u) % FSR_RING;
             u32 best = 0xFFFFFFFFu; float bd = 3.0e38f; int n = 0;
@@ -788,7 +1212,19 @@ static void fsr_record_impl(D3D12DrawRecord* dr, int vs_idx, char* dst, const ch
                     const int vmn = fsr_vm_near(vs_idx, csrc, fr);
                     if (vmn) s_fsr_st_vm++;
                     const int act = rfom_nn_ambig_action(1, keep, vmn);
-                    if (act == 5) dr->fsr_mt = 5; else if (act < 0) best = 0xFFFFFFFFu;
+                    if (act == 5) dr->fsr_mt = 5;
+                    else if (act < 0) {
+                        best = 0xFFFFFFFFu;
+                        if (fsr_mv_rematch_on()) {   /* RSX_DLSS_MV_REMATCH: which candidate is it, by screen position */
+                            u32 cd[4]; int vl = 0;
+                            const int nc = fsr_chain_topk(e->val ? e->val - 1u : 0xFFFFFFFFu, s_fsr_next[pr],
+                                                          (const float (*)[FSR_SIG_ROWS * 4])s_fsr_sig[pr], sig, cd, 4);
+                            const int r = fsr_rematch(vs_idx, csrc, epi, rows, nr, fr, ring, slot, cd, nc, 0.5, &vl, kn);
+                            if (r >= 0) { best = cd[r]; dr->fsr_mt = vl ? 7 : 6; s_mvr_st[vl ? MVR_RM_VL : MVR_RM_OK]++; }
+                            else mvw = MVWS_AMBIG << 4 | s_rm_why;
+                        } else mvw = MVWS_AMBIG << 4 | MVW_OFF;
+                        if (best == 0xFFFFFFFFu) s_mvr_st[MVR_AMB_DROP]++;
+                    }
                   }
                 }
             }
@@ -796,9 +1232,63 @@ static void fsr_record_impl(D3D12DrawRecord* dr, int vs_idx, char* dst, const ch
                                        if (!dr->fsr_mt) dr->fsr_mt = 3; dr->fsr_bd = bd; dr->fsr_pslot = best; }
         }
     }
-    if (prev_off == cur_off && objmv != 2) {   /* no previous-frame match: camera motion, not "did not move" */
+    if (prev_off == cur_off && nokey && loose) {   /* RSX_DLSS_MV_LOOSE: same program and mesh, another material */
+        const int lpm = s_fsr_map_cur ^ 1;
+        const FsrMapE* le = fsr_find(s_fsr_lmap[lpm], s_fsr_map_gen[lpm], hl, 0);
+        if (le && le->val) {
+            const u32 pr = (fr - 1u) % FSR_RING;
+            u32 cd[4]; int vl = 0;
+            const int nc = fsr_chain_topk(le->val - 1u, s_fsr_lnext[pr], (const float (*)[FSR_SIG_ROWS * 4])s_fsr_sig[pr], sig, cd, 4);
+            const int r = fsr_rematch(vs_idx, csrc, epi, rows, nr, fr, ring, slot, cd, nc, 0.05, &vl, kn);
+            if (r >= 0) { prev_off = ((u64)pr * s_fsr_slots + cd[r]) * FSR_HIST_STRIDE; dr->fsr_mt = 8; dr->fsr_pslot = cd[r];
+                          s_fsr_st_match++; s_mvr_st[MVR_LOOSE_OK]++; }
+            else { s_mvr_st[MVR_LOOSE_FAIL]++; mvw = MVWS_LOOSE << 4 | s_rm_why; }
+        } else mvw = MVWS_NOLOOSE << 4;
+    } else if (prev_off == cur_off && nokey) mvw = MVWS_NOLOOSE << 4 | MVW_OFF;
+    if (prev_off == cur_off && objmv == 1 && kn != 1 && fsr_vm_w() > 0.0f && fsr_mv_viewstill_on() &&
+        fsr_va_still(vs_idx, csrc, epi, fr, kn)) {   /* RSX_DLSS_MV_VIEWSTILL: followed the view, zero screen motion */
+        dr->fsr_mt = 7; s_mvr_st[MVR_VA_STILL]++;
+    } else if (prev_off == cur_off && objmv != 2) {   /* no previous-frame match: camera motion, not "did not move" */
         const u64 co = fsr_cam_prev(vs_idx, csrc, epi, rows, nr, fr, ring);
         if (co != ~0ull) { prev_off = co; dr->fsr_mt = 4; s_fsr_st_cam++; }
+    }
+    if ((dr->fsr_mt == 0 || dr->fsr_mt == 4) && objmv == 1 && (port_stats_log() || s_r1l_on)) {   /* what is still camera-only */
+        s_mvr_st[dr->fsr_mt == 4 ? MVR_CAM_SPLIT : MVR_CAM_FILL]++;
+        if (!mvw) mvw = MVWS_OTHER << 4;
+        if (nokey) s_mvr_st[MVR_NOKEY]++;
+        if (vs_idx >= 0 && vs_idx < s_d3d.vp_vs_n && s_d3d.vp_vs[vs_idx].ucode && s_d3d.vp_vs[vs_idx].ucode_n) {
+            const VPVSEntry* ve = &s_d3d.vp_vs[vs_idx];
+            CamProg* pg = fsr_cam_prog(ve);
+            fsr_prog_st(ve, pg, csrc);
+            s_mvr_st[pg->pk == 2 ? MVR_CO_NOEVAL : pg->st == 1 ? MVR_CO_RIGID : MVR_CO_SKIN]++;
+            static u32 nf, nn;   /* near-the-eye probes: at most 512 a frame */
+            if (nf != fr) { nf = fr; nn = 0; }
+            if (pg->pk != 2 && nn < 512u) {
+                nn++;
+                float o[4], q[4];
+                if (fsr_probe(ve, pg, (const float*)csrc, epi, 0, o, q) && (o[0] != 0.0f || o[1] != 0.0f || o[2] != 0.0f || o[3] != 0.0f)) {
+                    const float w = o[3];
+                    s_mvn_w[!(w >= 0.0f) ? 0 : w < 0.5f ? 1 : w < 1.0f ? 2 : w < 2.0f ? 3 : w < 5.0f ? 4 : w < 20.0f ? 5 : 6]++;
+                    if (rfom_viewmodel_near(o[0], o[1], o[3], fsr_vm_w() > 0.0f ? fsr_vm_w() : 1.0f)) {
+                        s_mvr_st[MVR_CO_NEAR]++;
+                        s_mvn_st[(mvw >> 4) % MVWS_N][(mvw & 15) % MVW_N]++;
+                    }
+                }
+            }
+        } else s_mvr_st[MVR_CO_UNK]++;
+    }
+    if (dr->fsr_mt == 0 || dr->fsr_mt == 4) dr->fsr_why = (u8)(mvw ? mvw : MVWS_OTHER << 4);
+    if (fsr_mv_diag() && vs_idx >= 0 && vs_idx < s_d3d.vp_vs_n && s_d3d.vp_vs[vs_idx].ucode && s_d3d.vp_vs[vs_idx].ucode_n) {
+        static u32 df, dn;   /* RSX_DLSS_MV_DIAG: every draw's origin, at most 4096 a frame */
+        if (df != fr) { df = fr; dn = 0; }
+        const VPVSEntry* ve = &s_d3d.vp_vs[vs_idx];
+        CamProg* pg = fsr_cam_prog(ve);
+        if (pg->pk != 2 && dn < 4096u) {
+            dn++;
+            fsr_prog_st(ve, pg, csrc);
+            float o[4], q[4];
+            if (fsr_probe(ve, pg, (const float*)csrc, epi, 0, o, q)) { dr->fsr_o[0] = o[0]; dr->fsr_o[1] = o[1]; dr->fsr_o[2] = o[3]; }
+        }
     }
     { const u64 hf = s_fsr_hfull[ring][slot], hv = s_fsr_hvar[ring][slot];   /* v189 exact tables */
       FsrMapE* xf = fsr_find(s_fsr_exf[s_fsr_map_cur], s_fsr_map_gen[s_fsr_map_cur], fsr_mix(h, hf), 1);
@@ -810,6 +1300,11 @@ static void fsr_record_impl(D3D12DrawRecord* dr, int vs_idx, char* dst, const ch
     if (ce) {   /* push this slot onto the key's chain (val = head + 1, 0 = empty) */
         s_fsr_next[ring][slot] = ce->val ? ce->val - 1u : 0xFFFFFFFFu;
         ce->val = slot + 1u;
+    }
+    if (loose) {   /* and onto the loose identity's chain */
+        FsrMapE* le = fsr_find(s_fsr_lmap[s_fsr_map_cur], s_fsr_map_gen[s_fsr_map_cur], hl, 1);
+        if (le) { s_fsr_lnext[ring][slot] = le->val ? le->val - 1u : 0xFFFFFFFFu; le->val = slot + 1u; }
+        else s_fsr_lnext[ring][slot] = 0xFFFFFFFFu;
     }
 
     float jx, jy; fsr_jitter(fr, &jx, &jy);
@@ -2041,7 +2536,8 @@ static void fsr_mv_replay(u32 d0, u32 d1, D3D12_CPU_DESCRIPTOR_HANDLE dsv, int r
          * opaque: v188, outdoor terrain is drawn that way and had no motion/depth
          * (ground smeared under FSR). Blend key: bit0 on, src bits 1-5, dst 6-10. */
         const int rx = (dr->blend_key & 1u) && !(((dr->blend_key >> 1) & 31u) == 2u && ((dr->blend_key >> 6) & 31u) == 1u);
-        if (rx && fsr_rx_val() <= 0.0f) continue;   /* v189: blended -> reactive mask only */
+        if (s_fsr_done) s_mvs_st[MVS_LATE]++;   /* after the upscaler ran: too late for this frame's motion (counted only) */
+        if (rx && fsr_rx_val() <= 0.0f) { s_mvs_st[MVS_BLEND_RX]++; continue; }   /* v189: blended -> reactive mask only */
         /* Modulating blends (src DEST_COLOR/DEST_ALPHA/ZERO, dst ZERO/ONE/SRC_COLOR/SRC_ALPHA,
          * op ADD) only scale the colour already there: the shadow-map receive pass re-draws
          * the world with DEST_COLOR,ZERO (~95 draws, 75% of the screen in Grimsby). Marked
@@ -2051,8 +2547,8 @@ static void fsr_mv_replay(u32 d0, u32 d1, D3D12_CPU_DESCRIPTOR_HANDLE dsv, int r
         if (rx) {
             static int rm = -1; if (rm < 0) { const char* e = getenv("RSX_FSR_RX_MUL"); rm = e ? atoi(e) : 0; }
             const u32 bs = (dr->blend_key >> 1) & 31u, bd = (dr->blend_key >> 6) & 31u, bo = (dr->blend_key >> 21) & 7u;
-            if (!rm && bo == 1u && (bs == 1u || bs == 7u || bs == 9u) && (bd == 1u || bd == 2u || bd == 3u || bd == 5u)) { nmul++; continue; }
-            nrx++;
+            if (!rm && bo == 1u && (bs == 1u || bs == 7u || bs == 9u) && (bd == 1u || bd == 2u || bd == 3u || bd == 5u)) { nmul++; s_mvs_st[MVS_MODUL]++; continue; }
+            nrx++; s_mvs_st[MVS_BLEND_RX]++;
         }
         /* v184i: colour writes off = occlusion-query boxes / depth-only passes
          * (185 per frame in the Grimsby factory). Not part of the picture; each
@@ -2065,7 +2561,7 @@ static void fsr_mv_replay(u32 d0, u32 d1, D3D12_CPU_DESCRIPTOR_HANDLE dsv, int r
          * whole heap kept "still, far" and smeared. Occlusion boxes don't write
          * depth. RSX_FSR_MV_ZPRE=0 = skip every colour-off draw (v188). */
         { static int zp = -1; if (zp < 0) { const char* e = getenv("RSX_FSR_MV_ZPRE"); zp = e ? atoi(e) : 1; }
-          if ((dr->cmask & 0xFu) == 0u && !(zp && (dr->cull & 0x400u) && (dr->cull & 0x200u))) continue; }
+          if ((dr->cmask & 0xFu) == 0u && !(zp && (dr->cull & 0x400u) && (dr->cull & 0x200u))) { s_mvs_st[MVS_COLOUR_OFF]++; continue; } }
           /* depth test off: skipped (v165), except -- RFOM_DLSS_MV_ZOFF=1 with the camera
            * fill on -- an opaque, colour-writing, non-cutout one: what it draws is what
            * the screen shows there (a camera-attached weapon / sky drawn depth-off), so it
@@ -2074,7 +2570,7 @@ static void fsr_mv_replay(u32 d0, u32 d1, D3D12_CPU_DESCRIPTOR_HANDLE dsv, int r
           int zoff = 0;
           if ((dr->cull & 0x100u) && !(dr->cull & 0x200u)) {
               if (!(s_cf_armed && dlss_mv_zoff() && !rx && (dr->cmask & 7u) &&
-                    !((dr->alpha_ctl >> 16) & 1u) && !fp_kil_has(dr->fp_addr))) continue;
+                    !((dr->alpha_ctl >> 16) & 1u) && !fp_kil_has(dr->fp_addr))) { s_mvs_st[MVS_DEPTH_OFF]++; continue; }
               zoff = 1;
           }
         /* v184: alpha-cutout draws (alpha test or KIL in the program). The
@@ -2083,12 +2579,13 @@ static void fsr_mv_replay(u32 d0, u32 d1, D3D12_CPU_DESCRIPTOR_HANDLE dsv, int r
          * ghost trails around grass and crawling far edges. Skipped, the holes
          * keep the motion of what is behind them. RSX_FSR_MV_CUTOUT=1 = old. */
         { static int co = -1; if (co < 0) { const char* e = getenv("RSX_FSR_MV_CUTOUT"); co = e ? atoi(e) : 1; }   /* v188: on (cut-outs had no motion -> foliage smeared) */
-          if (!co && (((dr->alpha_ctl >> 16) & 1u) || fp_kil_has(dr->fp_addr))) { ncut++; continue; } }
-        if (dr->vp_w && dr->vp_w < rt->w) continue;                        /* sub-viewport pass */
-        if (fpkill_match(dr->fp_addr)) continue;
+          if (!co && (((dr->alpha_ctl >> 16) & 1u) || fp_kil_has(dr->fp_addr))) { ncut++; s_mvs_st[MVS_CUTOUT]++; continue; } }
+        if (dr->vp_w && dr->vp_w < rt->w) { s_mvs_st[MVS_SUBVP]++; continue; }   /* sub-viewport pass */
+        if (fpkill_match(dr->fp_addr)) { s_mvs_st[MVS_FPKILL]++; continue; }
         if (!dr->ib_count && !dr->vertex_count) continue;
         ID3D12PipelineState* pso = mv_get_pso(dr, rx, zoff);
-        if (!pso) continue;
+        if (!pso) { s_mvs_st[MVS_NOPSO]++; continue; }   /* still compiling, or a vertex-texture program (no motion VS) */
+        if (!rx) s_mvs_st[MVS_DRAWN]++;
         if (pso != last) { cl->lpVtbl->SetPipelineState(cl, pso); last = pso; }
         D3D12_VIEWPORT vp = {0, 0, tw, th, 0.0f, 1.0f};
         /* CLIP_MIN/MAX: the draw's VS remaps z into the range (vp_record_cb_impl) and the scene replay's viewport
@@ -2171,7 +2668,8 @@ static const char s_mg_hlsl[] =
 "    if (k.x < 2.5) { if (z >= 1.0) return float4(0.8, 0, 0.8, c.a); float g = 1.0 - pow(saturate(z), 64.0); return float4(g, g, g, c.a); }\n"
 "    if (z < 9.5) return float4(l, c.a);\n"
 "    int t = (int)(z - 9.5);\n"
-"    float3 mc = t == 1 ? float3(0, 1, 0) : t == 2 ? float3(0, 1, 1) : t == 3 ? float3(1, 1, 0) : t == 4 ? float3(0.2, 0.4, 1) : t == 5 ? float3(1, 0.5, 0) : float3(1, 0, 0);\n"
+"    float3 mc = t == 1 ? float3(0, 1, 0) : t == 2 ? float3(0, 1, 1) : t == 3 ? float3(1, 1, 0) : t == 4 ? float3(0.2, 0.4, 1) : t == 5 ? float3(1, 0.5, 0) :\n"
+"               t == 6 ? float3(1, 0, 1) : t == 7 ? float3(1, 1, 1) : t == 8 ? float3(0.6, 0.3, 1) : float3(1, 0, 0);\n"
 "    return float4(l + mc * 0.6, c.a);\n"
 "}\n";
 static int fsr_merge(int slot)
@@ -2276,7 +2774,7 @@ void fsr_cap_dump(const char* dir, u32 fi, u32 nd)
     snprintf(path, sizeof path, "%s/fsr_draws.txt", dir);
     FILE* f = fopen(path, "w");
     if (f) {
-        fprintf(f, "# d mt(0 none,1 exact,2 exact-instance,3 nearest,4 camera-split,5 ambiguous nearest) chain bd slot pslot fp vs tex0 tex1 count\n");
+        fprintf(f, "# d mt(0 none,1 exact,2 exact-instance,3 nearest,4 camera-split,5 ambiguous nearest,6 re-matched,7 view-locked,8 loose) chain bd slot pslot fp vs tex0 tex1 count\n");
         for (u32 d = 0; d < nd && d < MAX_DRAWS; d++) {
             const D3D12DrawRecord* dr = &T_DRAWS[d];
             if (dr->fsr != 1) continue;
@@ -2287,6 +2785,99 @@ void fsr_cap_dump(const char* dir, u32 fi, u32 nd)
     }
     fprintf(stderr, "[FSR] capture: motion/depth dumped (Home mode %d)%c", s_fsr_ab, 10);
 }
+/* RSX_MV_DUMP=<K> (2..64; unset / 0 = off): offline motion-vector quality dumps (tools/fgq_r1.py), the R2/R3 keys:
+ * Pause (RSX_MV_DUMP_KEY=<Windows VK code>), RSX_MV_DUMP_AFTER=<s> (once, s seconds after the first scene),
+ * RSX_MV_DUMP_AUTO=<s> (every s seconds of play, up to 6 bursts) or a file logs\mvdump.now (checked once a second,
+ * renamed mvdump.done) arm a burst of K consecutive scene frames. Each stores what the upscaler / frame generation were
+ * handed -- colour, depth r32f, motion vectors rg16f (UV, previous - current) -- plus the motion pass's depth before
+ * the camera fill, whose value is the pixel's source (4 no draw, -1-z no match, -3-z ambiguous, 0..1 matched):
+ * <RSX_MV_DUMP_DIR, default logs\mvdump>\burstNN\fNN_{col,z,zpre,mv}.raw (16-byte header: w h pitch dxgi, rows padded
+ * to 256 bytes) and a JSON line per frame in frames.jsonl (camera matrix the fill used, jitter, sizes). Copies ride
+ * the frame's command list; the readback at present waits for the GPU (a short stall per dumped frame only). */
+typedef struct { ID3D12Resource* r; D3D12_RESOURCE_STATES st; u32 w, h, f; } MvdTex;
+static MvdTex s_mvd_t[4];   /* render thread: colour, depth, depth before the fill, motion */
+static const char* const s_mvd_nm[4] = { "col", "z", "zpre", "mv" };
+static int s_mvd_k = -1, s_mvd_key = 0x13, s_mvd_left, s_mvd_idx, s_mvd_auto_n, s_mvd_have, s_mvd_keywas;
+static double s_mvd_after = -1.0, s_mvd_auto = 0.0;
+static u32 s_mvd_burst;
+static ULONGLONG s_mvd_t0, s_mvd_tauto, s_mvd_tchk;
+static char s_mvd_meta[2048];
+static char s_mvd_dir[260] = "logs\\mvdump";
+static int fsr_mvd_on(void)
+{
+    if (s_mvd_k < 0) {
+        const char* e = getenv("RSX_MV_DUMP");
+        s_mvd_k = (e && *e && atoi(e) > 0) ? (atoi(e) < 2 ? 2 : atoi(e) > 64 ? 64 : atoi(e)) : 0;
+        if ((e = getenv("RSX_MV_DUMP_KEY")) && *e) s_mvd_key = (int)strtol(e, NULL, 0);
+        if ((e = getenv("RSX_MV_DUMP_AFTER")) && *e) s_mvd_after = atof(e);
+        if ((e = getenv("RSX_MV_DUMP_AUTO")) && *e) s_mvd_auto = atof(e);
+        if ((e = getenv("RSX_MV_DUMP_DIR")) && *e) snprintf(s_mvd_dir, sizeof s_mvd_dir, "%s", e);
+        if (s_mvd_k) fprintf(stderr, "[mvdump] RSX_MV_DUMP=%d: key 0x%X / logs\\mvdump.now%s%s arm a burst of %d scene frames -> %s%c", s_mvd_k, s_mvd_key,
+                             s_mvd_after >= 0.0 ? ", once after RSX_MV_DUMP_AFTER s" : "", s_mvd_auto > 0.0 ? ", every RSX_MV_DUMP_AUTO s" : "", s_mvd_k, s_mvd_dir, 10);
+    }
+    return s_mvd_k > 0;
+}
+static void fsr_mvd_arm(const char* why)
+{
+    if (s_mvd_left) return;
+    s_mvd_left = s_mvd_k; s_mvd_idx = 0; s_mvd_burst++;
+    char d[300]; CreateDirectoryA(s_mvd_dir, NULL);
+    snprintf(d, sizeof d, "%s\\burst%02u", s_mvd_dir, s_mvd_burst); CreateDirectoryA(d, NULL);
+    fprintf(stderr, "[mvdump] burst %u armed (%s): next %d scene frames%c", s_mvd_burst, why, s_mvd_k, 10);
+}
+/* fsr_dispatch: 1 = dump this scene frame */
+static int fsr_mvd_frame(void)
+{
+    if (!fsr_mvd_on()) return 0;
+    if (!s_mvd_t0) { s_mvd_t0 = s_mvd_tauto = GetTickCount64(); }
+    const ULONGLONG now = GetTickCount64();
+    if (s_mvd_after >= 0.0 && now - s_mvd_t0 >= (ULONGLONG)(s_mvd_after * 1000.0)) { s_mvd_after = -1.0; fsr_mvd_arm("RSX_MV_DUMP_AFTER"); }
+    if (s_mvd_auto > 0.0 && s_mvd_auto_n < 6 && now - s_mvd_tauto >= (ULONGLONG)(s_mvd_auto * 1000.0)) {
+        s_mvd_tauto = now; s_mvd_auto_n++; fsr_mvd_arm("RSX_MV_DUMP_AUTO"); }
+    return s_mvd_left > 0 && !s_mvd_have;
+}
+/* copy src (its state tracked in *st) into dump texture i; both end in COPY_SOURCE */
+static void fsr_mvd_copy(int i, ID3D12Resource* src, D3D12_RESOURCE_STATES* st)
+{
+    if (!src) return;
+    MvdTex* t = &s_mvd_t[i];
+    D3D12_RESOURCE_DESC d; src->lpVtbl->GetDesc(src, &d);
+    if (t->r && (t->w != (u32)d.Width || t->h != d.Height || t->f != (u32)d.Format)) { grave_defer(t->r); t->r = NULL; }
+    if (!t->r) {
+        t->r = fsr_tex((u32)d.Width, d.Height, d.Format, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST, NULL);
+        if (!t->r) return;
+        t->st = D3D12_RESOURCE_STATE_COPY_DEST; t->w = (u32)d.Width; t->h = d.Height; t->f = (u32)d.Format;
+    }
+    fsr_barrier(src, st, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    fsr_barrier(t->r, &t->st, D3D12_RESOURCE_STATE_COPY_DEST);
+    s_d3d.cmd_list->lpVtbl->CopyResource(s_d3d.cmd_list, t->r, src);
+    fsr_barrier(t->r, &t->st, D3D12_RESOURCE_STATE_COPY_SOURCE);
+}
+/* render_frame_impl, every presented frame: triggers, and the readback of a dumped frame */
+static void fsr_mvd_present(u32 fi)
+{
+    if (!fsr_mvd_on()) return;
+    { const int dn = (GetAsyncKeyState(s_mvd_key) & 0x8000) != 0;
+      if (dn && !s_mvd_keywas) fsr_mvd_arm("key");
+      s_mvd_keywas = dn; }
+    { const ULONGLONG now = GetTickCount64();
+      if (now - s_mvd_tchk > 1000) { s_mvd_tchk = now;
+          if (GetFileAttributesA("logs\\mvdump.now") != INVALID_FILE_ATTRIBUTES) {
+              MoveFileExA("logs\\mvdump.now", "logs\\mvdump.done", MOVEFILE_REPLACE_EXISTING); fsr_mvd_arm("logs\\mvdump.now"); } } }
+    if (!s_mvd_have) return;
+    s_mvd_have = 0;
+    char path[400];
+    for (int i = 0; i < 4; i++) {
+        if (!s_mvd_t[i].r) continue;
+        snprintf(path, sizeof path, "%s\\burst%02u\\f%02d_%s.raw", s_mvd_dir, s_mvd_burst, s_mvd_idx, s_mvd_nm[i]);
+        cap_readback_write(s_mvd_t[i].r, s_mvd_t[i].w, s_mvd_t[i].h, s_mvd_t[i].f, D3D12_RESOURCE_STATE_COPY_SOURCE, fi, path);
+    }
+    snprintf(path, sizeof path, "%s\\burst%02u\\frames.jsonl", s_mvd_dir, s_mvd_burst);
+    FILE* f = fopen(path, "a");
+    if (f) { fprintf(f, "{\"f\": %d, %s}\n", s_mvd_idx, s_mvd_meta); fclose(f); }
+    s_mvd_idx++;
+    if (--s_mvd_left <= 0) { s_mvd_left = 0; fprintf(stderr, "[mvdump] burst %u written: %d frames in %s\\burst%02u%c", s_mvd_burst, s_mvd_idx, s_mvd_dir, s_mvd_burst, 10); }
+}
 /* ---- RFOM_DLSS_CAM: camera solve (render thread) and the camera fill ---- */
 static ID3D12RootSignature* s_cf_rs; static ID3D12PipelineState* s_cf_pso; static ID3D12DescriptorHeap* s_cf_heap;
 static UINT s_cf_inc; static u32 s_cf_ring; static int s_cf_fail;
@@ -2296,7 +2887,7 @@ static const char s_cf_hlsl[] =
 "Texture2D<float> dep : register(t0);\n"
 "RWTexture2D<float2> mvo : register(u0);\n"
 "RWTexture2D<float> zo : register(u1);\n"
-"cbuffer K : register(b0) { float4 m0, m1, m2, m3; float4 j; uint4 f; };\n"   /* j = jitter ndc xy, render w h; f = has depth, has M, rw, rh */
+"cbuffer K : register(b0) { float4 m0, m1, m2, m3; float4 j; uint4 f; float4 g; };\n"   /* j = jitter ndc xy, render w h; f = has depth, has M, rw, rh; g.x = zero-motion depth floor */
 "[numthreads(8, 8, 1)] void main(uint3 id : SV_DispatchThreadID) {\n"
 "    if (id.x >= f.z || id.y >= f.w) return;\n"
 "    float z = zo[id.xy];\n"
@@ -2304,7 +2895,9 @@ static const char s_cf_hlsl[] =
 "    if (z == 4.0) d = f.x ? dep[id.xy] : 1.0;\n"      /* no draw wrote here: the scene's depth */
 "    else if (z <= -0.5 && z > -2.5) d = saturate(-1.0 - z);\n"     /* a draw with no previous-frame match: its depth */
 "    else if (z <= -2.5 && z > -4.5) { d = saturate(-3.0 - z); if (!f.y) { zo[id.xy] = d; return; } }\n"   /* ambiguous match: its own motion unless there is a camera */
-"    else { if (!(z >= 0.0 && z <= 1.0)) zo[id.xy] = saturate(z); return; }\n"   /* never hand the upscaler / FG a depth outside 0..1 */
+"    else if (!(z >= 0.0 && z <= 1.0)) { zo[id.xy] = saturate(z); return; }\n"   /* never hand the upscaler / FG a depth outside 0..1 */
+"    else if (f.y && z >= g.x && all(mvo[id.xy] == float2(0, 0))) d = z;\n"   /* matched, exactly zero motion, far: camera motion (see RSX_DLSS_MV_ZEROFIX) */
+"    else return;\n"
 "    zo[id.xy] = d;\n"
 "    float2 mv = float2(0, 0);\n"
 "    if (f.y) {\n"
@@ -2324,7 +2917,7 @@ static int cf_init(void)
     rg[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; rg[0].NumDescriptors = 1; rg[0].BaseShaderRegister = 0; rg[0].OffsetInDescriptorsFromTableStart = 0;
     rg[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV; rg[1].NumDescriptors = 2; rg[1].BaseShaderRegister = 0; rg[1].OffsetInDescriptorsFromTableStart = 1;
     D3D12_ROOT_PARAMETER rp[2]; memset(rp, 0, sizeof rp);
-    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS; rp[0].Constants.ShaderRegister = 0; rp[0].Constants.Num32BitValues = 24;
+    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS; rp[0].Constants.ShaderRegister = 0; rp[0].Constants.Num32BitValues = 28;
     rp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE; rp[1].DescriptorTable.NumDescriptorRanges = 2; rp[1].DescriptorTable.pDescriptorRanges = rg;
     rp[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
@@ -2514,13 +3107,27 @@ static void cam_fill(u32 rw, u32 rh, float vw, float vh, const double* M, float 
       uv.Format = DXGI_FORMAT_R16G16_FLOAT; s_d3d.device->lpVtbl->CreateUnorderedAccessView(s_d3d.device, s_fsr_mv, NULL, &uv, c1);
       c1.ptr += s_cf_inc;
       uv.Format = DXGI_FORMAT_R32_FLOAT;    s_d3d.device->lpVtbl->CreateUnorderedAccessView(s_d3d.device, s_fsr_z, NULL, &uv, c1); }
-    u32 k[24]; memset(k, 0, sizeof k);
+    /* RSX_DLSS_MV_ZEROFIX (default 1): a matched draw whose previous constants equal its current ones
+     * gets exactly zero motion. R1 world draws (floors, facades) do that while the camera turns -- the
+     * view transform is not in their constants -- so they ghosted under FG (mvdump: 22-48% of the
+     * bad pixels, all at depth >= 0.95). Such pixels at depth >= RSX_DLSS_MV_ZEROFIX_Z (default 0.5;
+     * the weapon sits at ~0.18) take the camera motion instead. */
+    static float zfz = -1.0f;
+    if (zfz < 0.0f) {
+        const int on = dlss_env_i("RSX_DLSS_MV_ZEROFIX", 1, 0, 1);
+        const char* e = getenv("RSX_DLSS_MV_ZEROFIX_Z"); float t = e ? (float)atof(e) : 0.5f;
+        if (!(t >= 0.0f && t <= 1.0f)) t = 0.5f;
+        zfz = on ? t : 2.0f;
+        fprintf(stderr, "[DLSS] zero-motion far draws: %s (z >= %.2f)%c", on ? "camera motion" : "kept (RSX_DLSS_MV_ZEROFIX=0)", t, 10);
+    }
+    u32 k[28]; memset(k, 0, sizeof k);
     if (M) for (int i = 0; i < 16; i++) { const float f = (float)M[i]; memcpy(&k[i], &f, 4); }
     { const float jj[4] = { jnx, jny, vw, vh }; memcpy(&k[16], jj, 16); }
     k[20] = dres ? 1u : 0u; k[21] = M ? 1u : 0u; k[22] = rw; k[23] = rh;
+    memcpy(&k[24], &zfz, 4);
     cl->lpVtbl->SetDescriptorHeaps(cl, 1, &s_cf_heap);
     cl->lpVtbl->SetComputeRootSignature(cl, s_cf_rs);
-    cl->lpVtbl->SetComputeRoot32BitConstants(cl, 0, 24, k, 0);
+    cl->lpVtbl->SetComputeRoot32BitConstants(cl, 0, 28, k, 0);
     cl->lpVtbl->SetComputeRootDescriptorTable(cl, 1, gh);
     cl->lpVtbl->SetPipelineState(cl, s_cf_pso);
     cl->lpVtbl->Dispatch(cl, (rw + 7u) / 8u, (rh + 7u) / 8u, 1u);
@@ -2529,6 +3136,7 @@ static void cam_fill(u32 rw, u32 rh, float vw, float vh, const double* M, float 
 static void fsr_dispatch(void)
 {
     s_rs_epoch++;
+    r1l_collect(0);
     { static int hw = 0; const int hd = rsx_debug_keys() && (GetAsyncKeyState(VK_HOME) & 0x8000) != 0;   /* PORT_DEBUG_KEYS=1 */
       if (hd && !hw) {
           s_fsr_ab = (s_fsr_ab + 1) % 6;
@@ -2548,6 +3156,8 @@ static void fsr_dispatch(void)
     const float uf = (s_fsr_up_r > 0.0f && s_fsr_up_r < 1.0f) ? s_fsr_up_r : 1.0f;
     const u32 rw = uf < 1.0f ? (u32)((float)w * uf + 0.5f) : w, rh = uf < 1.0f ? (u32)((float)h * uf + 0.5f) : h;
     ID3D12GraphicsCommandList* cl = s_d3d.cmd_list;
+    const int mvd = fsr_mvd_frame();   /* RSX_MV_DUMP: the motion pass's depth before the fill (each pixel's source) */
+    if (mvd) fsr_mvd_copy(2, s_fsr_z, &s_fsr_z_st);
     /* RFOM_DLSS_CAM: exact camera motion into the pixels no matched draw covered */
     int cam_cut = 0;
     double fg_M[16]; int fg_has_M = 0;   /* DLSS-G: the camera the fill used (none = no camera motion) */
@@ -2566,7 +3176,10 @@ static void fsr_dispatch(void)
                                                                                      : "no camera motion (RFOM_DLSS_FG_CAM_HOLD=0)", 10); }
         const int hgap = s_fsr_last_frame == 0 || s_fsr_frame_r != s_fsr_last_frame + 1u;
         const double* hM = rfom_fgcam_hold(&hold, cs == 1 ? M : NULL, hgap || (cs != 1 && cs != 2), cam_cut, hold_max);
-        if (hM) { memcpy(fg_M, hM, sizeof fg_M); fg_has_M = 1; }
+        if (hM) { memcpy(fg_M, hM, sizeof fg_M); fg_has_M = 1;
+                  /* RSX_DLSS_MV_REMATCH: the record thread's "where it was if it stayed put" (seqlock) */
+                  InterlockedIncrement(&s_rm_mseq); memcpy(s_rm_M, hM, sizeof s_rm_M); s_rm_mframe = s_fsr_frame_r;
+                  InterlockedIncrement(&s_rm_mseq); }
         if (cs == 2 && hM) s_cf_held++;
         { static u32 run;   /* fallback streak lengths: why the hold (max hold_max frames) leaves frames uncovered */
           if (cs == 2) run++;
@@ -2590,6 +3203,19 @@ static void fsr_dispatch(void)
     fsr_barrier(s_fsr_z, &s_fsr_z_st, rd);
     fsr_barrier(s_fsr_rx, &s_fsr_rx_st, rd);
     fsr_barrier(s_fsr_out, &s_fsr_out_st, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    if (mvd) {   /* RSX_MV_DUMP: what the upscaler / frame generation are handed */
+        fsr_mvd_copy(0, rt->res, &rt->st); fsr_mvd_copy(1, s_fsr_z, &s_fsr_z_st); fsr_mvd_copy(3, s_fsr_mv, &s_fsr_mv_st);
+        off_rt_transition(slot, rd); fsr_barrier(s_fsr_mv, &s_fsr_mv_st, rd); fsr_barrier(s_fsr_z, &s_fsr_z_st, rd);
+        float jx = 0.0f, jy = 0.0f; fsr_jitter(s_fsr_frame_r, &jx, &jy);
+        int n = snprintf(s_mvd_meta, sizeof s_mvd_meta, "\"frame\": %u, \"w\": %u, \"h\": %u, \"rw\": %u, \"rh\": %u, \"col_dxgi\": %u, \"jit_px\": [%.6f, %.6f], "
+                         "\"fill\": %d, \"fill_jit_ndc\": [%.8f, %.8f], \"cut\": %d, \"fg\": %d, \"t_ms\": %llu, \"M\": ",
+                         s_fsr_frame_r, w, h, rw, rh, (u32)rt->dxgi, jx, jy, s_cf_armed, fg_j[0], fg_j[1], cam_cut, s_fg_on, (unsigned long long)GetTickCount64());
+        if (fg_has_M) { n += snprintf(s_mvd_meta + n, sizeof s_mvd_meta - n, "[");
+                        for (int i = 0; i < 16 && n < (int)sizeof s_mvd_meta - 32; i++) n += snprintf(s_mvd_meta + n, sizeof s_mvd_meta - n, "%s%.10g", i ? ", " : "", fg_M[i]);
+                        snprintf(s_mvd_meta + n, sizeof s_mvd_meta - n, "]"); }
+        else snprintf(s_mvd_meta + n, sizeof s_mvd_meta - n, "null");
+        s_mvd_have = 1;
+    }
 
     struct ffxDispatchDescUpscale dd; memset(&dd, 0, sizeof dd);
     dd.header.type = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
@@ -2785,6 +3411,39 @@ static void fsr_dispatch(void)
                     md ? 100.0 * s_cf_mt[4] / md : 0.0, md ? 100.0 * s_cf_mt[0] / md : 0.0, rw, rh, w, h, uf, ssao_status(), 10);
             memset(s_cf_st, 0, sizeof s_cf_st); memset(s_cf_mt, 0, sizeof s_cf_mt); memset(s_cf_dep, 0, sizeof s_cf_dep); memset(s_cf_run, 0, sizeof s_cf_run);
             s_cf_cut = s_cf_cand = s_cf_elig = s_cf_tried = s_cf_bad = s_cf_plur = s_cf_med = s_cf_held = s_cf_loose = s_cf_rskip = s_cf_rout = 0; }
+          if (port_stats_log()) {   /* per-object motion: what was rescued, what still has only the camera's */
+              volatile u32* m = s_mvr_st; const u32* s = s_mvs_st;
+              fprintf(stderr, "[DLSS] object motion/600: re-matched %u (view-locked %u), loose identity %u (RSX_DLSS_MV_REMATCH/_VIEWLOCK/_LOOSE)"
+                              " | not re-matched: unclear %u, no probe point %u, not evaluable %u, no reference %u, over budget %u, loose failed %u"
+                              " | camera-only draws %u (split %u, fill %u): no key last frame %u, ambiguous dropped %u;"
+                              " by program: rigid %u, skinned/morph %u, not evaluable %u, unknown %u; near the eye %u"
+                              " | motion pass: replayed %u, blended->reactive %u, modulating %u, colour-off %u, depth-off %u, cut-out %u,"
+                              " sub-viewport %u, fpkill %u, no PSO (compiling / vertex texture) %u, after the upscaler %u%c",
+                      m[MVR_RM_OK] + m[MVR_RM_VL], m[MVR_RM_VL], m[MVR_LOOSE_OK],
+                      m[MVR_RM_UNCLEAR], m[MVR_RM_NOPROBE], m[MVR_RM_NOEVAL], m[MVR_RM_NOREF], m[MVR_RM_BUDGET], m[MVR_LOOSE_FAIL],
+                      m[MVR_CAM_SPLIT] + m[MVR_CAM_FILL], m[MVR_CAM_SPLIT], m[MVR_CAM_FILL], m[MVR_NOKEY], m[MVR_AMB_DROP],
+                      m[MVR_CO_RIGID], m[MVR_CO_SKIN], m[MVR_CO_NOEVAL], m[MVR_CO_UNK], m[MVR_CO_NEAR],
+                      s[MVS_DRAWN], s[MVS_BLEND_RX], s[MVS_MODUL], s[MVS_COLOUR_OFF], s[MVS_DEPTH_OFF], s[MVS_CUTOUT],
+                      s[MVS_SUBVP], s[MVS_FPKILL], s[MVS_NOPSO], s[MVS_LATE], 10);
+              volatile u32 (*n)[MVW_N] = s_mvn_st; volatile u32* wb = s_mvn_w;
+              u32 na = 0, nl = 0;
+              for (int i = 0; i < MVW_N; i++) { na += n[MVWS_AMBIG][i]; nl += n[MVWS_LOOSE][i]; }
+              fprintf(stderr, "[DLSS] camera-only near the eye/600: ambiguous %u (over budget %u, unclear %u, no probe %u, not evaluable %u,"
+                              " no reference %u, no candidates %u, re-match off %u) | material changed %u (loose: over budget %u, unclear %u,"
+                              " no reference %u, other %u; no loose candidate %u, loose off %u) | other %u | over budget but near the eye: re-matched"
+                              " anyway %u | view-attached keys found %u (keys probed %u) | no match but followed the view: still %u (moved with the world %u) | camera-only origin depth: behind %u, <0.5 %u, <1 %u, <2 %u, <5 %u, <20 %u, farther %u%c",
+                      na, n[MVWS_AMBIG][MVW_BUDGET], n[MVWS_AMBIG][MVW_UNCLEAR], n[MVWS_AMBIG][MVW_NOPROBE], n[MVWS_AMBIG][MVW_NOEVAL],
+                      n[MVWS_AMBIG][MVW_NOREF], n[MVWS_AMBIG][MVW_NOCAND], n[MVWS_AMBIG][MVW_OFF],
+                      nl, n[MVWS_LOOSE][MVW_BUDGET], n[MVWS_LOOSE][MVW_UNCLEAR], n[MVWS_LOOSE][MVW_NOREF],
+                      nl - n[MVWS_LOOSE][MVW_BUDGET] - n[MVWS_LOOSE][MVW_UNCLEAR] - n[MVWS_LOOSE][MVW_NOREF],
+                      n[MVWS_NOLOOSE][MVW_NONE], n[MVWS_NOLOOSE][MVW_OFF], n[MVWS_OTHER][MVW_NONE], m[MVR_RM_NEARX],
+                      m[MVR_KEY_NEAR], m[MVR_KEY_PROBE], m[MVR_VA_STILL], m[MVR_VA_WORLD],
+                      wb[0], wb[1], wb[2], wb[3], wb[4], wb[5], wb[6], 10);
+          }
+          r1l_collect(1);
+          for (int i = 0; i < MVR_N; i++) s_mvr_st[i] = 0;
+          memset((void*)s_mvn_st, 0, sizeof s_mvn_st); memset((void*)s_mvn_w, 0, sizeof s_mvn_w);
+          memset(s_mvs_st, 0, sizeof s_mvs_st);
           s_fsr_st_rec = s_fsr_st_match = s_fsr_st_over = s_fsr_st_wait = s_fsr_st_exact = s_fsr_st_cam = s_fsr_st_amb = s_fsr_st_vm = s_fsr_st_common = s_fsr_st_zr = 0; s_fsr_st_tsc = 0; nr = gap = 0;
       } }
     s_fsr_last_frame = s_fsr_frame_r;

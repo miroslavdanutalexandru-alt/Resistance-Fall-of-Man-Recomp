@@ -468,7 +468,8 @@ typedef struct {
     u32   fsr_frame, fsr_prev;
     float fsr_jnx, fsr_jny;
     float fsr_up;   /* DLSS upscaling: share of the scene surface this jittered draw renders to (0 = not jittered) */
-    u8 fsr_mt; u16 fsr_chain; float fsr_bd; u32 fsr_slot, fsr_pslot;   /* v184 diag: how the previous frame was matched */
+    u8 fsr_mt; u8 fsr_why; u16 fsr_chain; float fsr_bd; u32 fsr_slot, fsr_pslot;   /* v184 diag: how the previous frame was matched */
+    float fsr_o[3];   /* RSX_DLSS_MV_DIAG: the object's origin in clip space (x, y, w), w = 0: not probed */
     /* v189: NV3089 copy out of a GPU surface (is_clear record, clear_mask 0):
      * source surface offset and image size, start and step in source pixels. */
     int   is_blit;
@@ -2078,6 +2079,7 @@ static int sc_get_buffers(void)
 }
 
 #include "rsx_osd.inc"   /* in-swapchain toasts / F3 overlay (rfom_pcfeat.cpp) */
+#include "rsx_r1live.inc" /* R1_LIVE=1: live A/B of the frame-generation motion fixes (tools/r1live.py) */
 #include "rsx_dlssg.inc" /* DLSS Frame Generation through Streamline (RFOM_DLSS_FG) */
 
 static int blit_init(void)
@@ -13650,6 +13652,7 @@ skip_dump_consider: ;
         }
       } }
 
+    if (s_present_this_frame && !s_in_midflush) fsr_mvd_present(fi);   /* RSX_MV_DUMP (off by default) */
     if (s_present_this_frame && !s_in_midflush) { fx_scale_frame_end(); fsr_frame_end(); ssao_frame_end(); }   /* v165 */
     /* v173 diag (PORT_DEBUG_KEYS=1 only): Ctrl+F12 logs a one-line summary of each of the next 900
      * presented frames to logs\framelog.txt (draw counts per target, distinct

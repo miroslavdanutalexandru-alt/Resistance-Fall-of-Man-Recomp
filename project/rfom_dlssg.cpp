@@ -320,16 +320,42 @@ __declspec(dllexport) void rfom_dlssg_sleep(unsigned long long id)
 
 // Game thread (rfom_reflex.cpp, before the sleep): Reflex's frame limit in microseconds per rendered frame
 // (before frame generation), 0 = no limit. Returns 1 when Streamline accepted it.
-__declspec(dllexport) int rfom_dlssg_set_limit(unsigned us)
+// RFOM_REFLEX_FG_DIV=1 (default 0 = old behaviour): while generation is on, Reflex gets the limit for
+// *presented* frames, us / (generated + 1). Measured (r1_fmd_run, r1_fmd2_run, 0.3.1 MVQ2 run): with
+// frameLimitUs = 16667 and 2x generation the rendered rate locks at exactly 30.0 fps (33.33 ms, worst 33.7)
+// against ~58 fps with generation off -- the limit paces the output, so the real frames halve and every
+// generated frame spans twice the motion. The port's own limiter still caps rendered frames (stubs.cpp).
+static std::mutex g_lim_mu;
+static unsigned g_lim_base = 0, g_lim_sent = ~0u;
+static int g_lim_gen = 0, g_lim_div = -1;
+static bool g_lim_have = false;   // rfom_reflex.cpp has asked for a limit
+static int LimitApplyLocked()
 {
-    if (!g_init || !p_slReflexSetOptions) return 0;
+    if (g_lim_div < 0) { const char* e = getenv("RFOM_REFLEX_FG_DIV"); g_lim_div = e && *e == '1'; }
+    const unsigned us = g_lim_div && g_lim_gen > 0 && g_lim_base ? g_lim_base / (unsigned)(g_lim_gen + 1) : g_lim_base;
+    if (us == g_lim_sent) return 1;
     sl::ReflexOptions ro{};
     ro.mode = g_reflex_mode;
     ro.frameLimitUs = us;
     ro.useMarkersToOptimize = true;
     const sl::Result r = p_slReflexSetOptions(ro);
-    if (r != sl::Result::eOk) { Log("slReflexSetOptions (frame limit %u us) failed: %s", us, ResStr(r)); return 0; }
+    if (r != sl::Result::eOk) { Log("slReflexSetOptions (frame limit %u us) failed: %s", us, ResStr(r)); g_lim_sent = ~0u; return 0; }
+    if (g_lim_div && us != g_lim_base)
+        Log("Reflex frame limit %u us per presented frame (%u us per rendered frame, %dx generation; RFOM_REFLEX_FG_DIV=1)",
+            us, g_lim_base, g_lim_gen + 1);
+    else if (g_lim_div && g_lim_sent != ~0u)
+        Log("Reflex frame limit %u us (generation off)", us);
+    g_lim_sent = us;
     return 1;
+}
+
+__declspec(dllexport) int rfom_dlssg_set_limit(unsigned us)
+{
+    if (!g_init || !p_slReflexSetOptions) return 0;
+    std::lock_guard<std::mutex> lk(g_lim_mu);
+    g_lim_base = us;
+    g_lim_have = true;
+    return LimitApplyLocked();
 }
 
 // F3 overlay: average latency over the driver's last frames (same arithmetic as rfom_reflex.cpp).
@@ -505,6 +531,11 @@ __declspec(dllexport) int rfom_dlssg_set_options(int gen, int ui_recomp, unsigne
     o.enableUserInterfaceRecomposition = ui_recomp ? sl::Boolean::eTrue : sl::Boolean::eFalse;
     const sl::Result r = p_slDLSSGSetOptions(g_vp, o);
     if (r != sl::Result::eOk) { Log("slDLSSGSetOptions failed: %s", ResStr(r)); return 0; }
+    if (p_slReflexSetOptions) {
+        std::lock_guard<std::mutex> lk(g_lim_mu);
+        g_lim_gen = gen > 0 ? gen : 0;
+        if (g_lim_have) LimitApplyLocked();
+    }
     return 1;
 }
 
@@ -529,6 +560,7 @@ __declspec(dllexport) void rfom_dlssg_shutdown(void)
 {
     if (!g_init) return;
     if (p_slDLSSGSetOptions) { sl::DLSSGOptions o{}; o.mode = sl::DLSSGMode::eOff; p_slDLSSGSetOptions(g_vp, o); }
+    { std::lock_guard<std::mutex> lk(g_lim_mu); g_lim_gen = 0; g_lim_sent = ~0u; }
     p_slShutdown();
     g_init = false;
 }

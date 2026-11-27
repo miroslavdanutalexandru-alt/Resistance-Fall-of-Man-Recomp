@@ -584,6 +584,7 @@ static void fg_late_check(void);   /* rsx_dlssg_hud.inc */
 static void fg_present(ID3D12GraphicsCommandList* cl, UINT bi, u32 fi, D3D12_CPU_DESCRIPTOR_HANDLE sc_rtv,
                        const D3D12_VIEWPORT* vp, const float* k, int shot, int* vs)
 {
+    r1l_poll(s_fg_on);   /* R1_LIVE */
     if (!s_fg_ready && !s_f3_ready && !s_fg_dbg && !g_pc_photo_nohud) {
         if (s_fgh.gate) fg_hud_reset();   /* photo mode ended: the split stops */
         return;
@@ -685,7 +686,7 @@ static void fg_present(ID3D12GraphicsCommandList* cl, UINT bi, u32 fi, D3D12_CPU
             static unsigned n = 0;
             if (n < 10) { n++; fprintf(stderr, "[DLSS-G] frame generation paused: HUD not separated for 3 frames (present %u, RFOM_FG_UNSURE_PAUSE=0 keeps it on)%c", s_fg_presents, 10); }
         }
-        const int want = s_fgh.tagged && !s_fg_movie && s_app_active && !IsIconic(s_d3d.hwnd) && ui_ok;
+        const int want = s_fgh.tagged && !s_fg_movie && s_app_active && !IsIconic(s_d3d.hwnd) && ui_ok && !R1L('g');
         if (s_fg_movie && s_fgh.tagged) { static int n = 0; if (!n++) fg_log("frame generation held off: a movie is playing (its frames are never interpolated)"); }
         s_fg_streak = want ? s_fg_streak + 1 : 0;
         if (s_fg_streak >= 2 && (!s_fg_on || s_fg_opt_w != s_sc_w || s_fg_opt_h != s_sc_h)) {

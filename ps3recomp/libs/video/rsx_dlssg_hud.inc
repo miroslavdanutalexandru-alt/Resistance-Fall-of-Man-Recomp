@@ -23,7 +23,8 @@ static int s_fg_hlog_left;         /* RFOM_FG_HUDLOG frames still to log */
 static int s_fg_hlog_cfg = -1;     /* RFOM_FG_HUDLOG (-1: not read yet) */
 static u32 s_fg_hlog_at;           /* RFOM_FG_HUDLOG_AT: start at this upscaler frame (0 = when frame generation is on) */
 static int s_fg_hlog_wait;         /* RFOM_FG_HUDLOG set, not started yet */
-static int s_fg_hmv_pend;          /* print the next scene batch's per-draw motion matching (fg_hud_mv_dump) */
+static int s_fg_hmv_pend;
+static int s_fg_mvn_pend;          /* RSX_DLSS_MV_DIAG: print the next scene batch's near-the-eye draws ([FG-MVN]) */          /* print the next scene batch's per-draw motion matching (fg_hud_mv_dump) */
 static u32 s_fg_hlog_frame, s_fg_hlog_n;
 
 /* RFOM_FG_HUDLOG=N starts once frame generation is on (DLSS-G or FSR 3 FG; the level-start frames before it were
@@ -71,6 +72,8 @@ static void fg_hud_frame_start(void)
     const int g = s_fgh.gate;
     if (s_fg_hlog_n) { s_fg_hlog_n = 0; s_fg_hlog_frame++; if (s_fg_hlog_left > 0) s_fg_hlog_left--; }
     fg_hud_log_poll();
+    { static u32 k, dumps;   /* RSX_DLSS_MV_DIAG: every 3rd frame's near-the-eye draws, at most 300 frames */
+      if (fsr_mv_diag() && (s_fg_on || s_f3_on) && dumps < 300u && ++k % 3u == 0u) { s_fg_mvn_pend = 1; dumps++; } }
     memset(&s_fgh, 0, sizeof s_fgh);
     s_fgh.gate = g;
 }
@@ -80,19 +83,34 @@ static void fg_hud_frame_start(void)
  * F12 capture, as stderr lines). */
 static void fg_hud_mv_dump(const D3D12DrawRecord* draws, u32 nd)
 {
+    if (s_fg_mvn_pend) {   /* RSX_DLSS_MV_DIAG: draws whose origin lies within 4 units of the eye */
+        u32 ns = 0;
+        for (u32 d = 0; d < nd && d < MAX_DRAWS; d++) if (draws[d].fsr == 1) ns++;
+        if (ns) {
+            s_fg_mvn_pend = 0;
+            for (u32 d = 0; d < nd && d < MAX_DRAWS; d++) {
+                const D3D12DrawRecord* dr = &draws[d];
+                const float w = dr->fsr_o[2];
+                if (dr->fsr != 1 || !(w > -4.0f && w < 4.0f) || w == 0.0f) continue;
+                fprintf(stderr, "[FG-MVN] %u d %u mt %u why %02X o %.3f %.3f %.3f vs %d fp %08X n %u tex %08X bd %g%c", (unsigned)s_fsr_frame_r, d,
+                        dr->fsr_mt, dr->fsr_why, dr->fsr_o[0], dr->fsr_o[1], w, dr->vs_idx, dr->fp_addr,
+                        dr->ib_count ? dr->ib_count : dr->vertex_count, (u32)dr->tex[0].raw, dr->fsr_bd, 10);
+            }
+        }
+    }
     if (s_fgd_on && (s_fg_ready || s_f3_ready))   /* RFOM_FG_DIAG: this present's matching counts */
         for (u32 d = 0; d < nd && d < MAX_DRAWS; d++)
-            if (draws[d].fsr == 1) s_fgdf.m[draws[d].fsr_mt < 6 ? draws[d].fsr_mt : 0]++;
+            if (draws[d].fsr == 1) s_fgdf.m[draws[d].fsr_mt < 6 ? draws[d].fsr_mt : draws[d].fsr_mt <= 8 ? 3 : 0]++;   /* 6-8: re-matched nearest */
     if (!s_fg_hmv_pend) return;
-    u32 c[6] = {0}, ns = 0;
+    u32 c[9] = {0}, ns = 0;
     for (u32 d = 0; d < nd && d < MAX_DRAWS; d++)
-        if (draws[d].fsr == 1) { ns++; c[draws[d].fsr_mt < 6 ? draws[d].fsr_mt : 0]++; }
+        if (draws[d].fsr == 1) { ns++; c[draws[d].fsr_mt < 9 ? draws[d].fsr_mt : 0]++; }
     if (!ns) return;
     s_fg_hmv_pend = 0;
-    fprintf(stderr, "[FG-MV] upscaler frame %u: %u scene draws: exact %u instance %u nearest %u camera-split %u ambiguous %u"
-                    " unmatched %u (frame generation %s)%c", (unsigned)s_fsr_frame_r, ns, c[1], c[2], c[3], c[4], c[5], c[0],
+    fprintf(stderr, "[FG-MV] upscaler frame %u: %u scene draws: exact %u instance %u nearest %u camera-split %u ambiguous %u re-matched %u view-locked %u loose %u"
+                    " unmatched %u (frame generation %s)%c", (unsigned)s_fsr_frame_r, ns, c[1], c[2], c[3], c[4], c[5], c[6], c[7], c[8], c[0],
             s_fg_on || s_f3_on ? "on" : "off", 10);
-    fprintf(stderr, "[FG-MV] d mt(0 none,1 exact,2 exact-instance,3 nearest,4 camera-split,5 ambiguous nearest) chain bd slot pslot fp vs tex0 tex1 count%c", 10);
+    fprintf(stderr, "[FG-MV] d mt(0 none,1 exact,2 exact-instance,3 nearest,4 camera-split,5 ambiguous nearest,6 re-matched,7 view-locked,8 loose) chain bd slot pslot fp vs tex0 tex1 count%c", 10);
     for (u32 d = 0; d < nd && d < MAX_DRAWS; d++) {
         const D3D12DrawRecord* dr = &draws[d];
         if (dr->fsr != 1) continue;
