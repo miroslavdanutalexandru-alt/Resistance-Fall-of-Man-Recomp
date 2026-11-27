@@ -627,7 +627,11 @@ static int rfom_frame_wait_impl(uint64_t target, uint32_t last_ea)
  * nothing ever signals: black screen, joined forever. A bounded wait returns
  * to the component's step loop, which sees the stop request and exits; while
  * nothing stops it, it simply waits again. RFOM_MOVIE_EVWAIT_MS=<ms> (default
- * 100), 0 = the original unbounded wait. */
+ * 100), 0 = the original unbounded wait.
+ * The front end has the same helper (EBOOT func_005E70A4, same four callers):
+ * at the end of an attract movie the player joins AudioDisplay while it is
+ * parked there, and the menu stalled until a later movie happened to signal
+ * the event (~20 s, RecompLauncher report 128478). Same bound, same switch. */
 /* Resistance port (v134): field of view. The camera setter func_000B674C
  * takes the horizontal FOV in degrees (82 = the game's gameplay view, ~65 =
  * carbine zoom, ~27 = sniper scope) and derives the projection, the vertical

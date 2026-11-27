@@ -341,6 +341,18 @@
 "        rfom_mp_scert_note(3, (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[29], 0, 0);   /* v170 diag: pump step status */"
 ]
 }
+],
+"func_005E70A4": [
+{
+"at": 3,
+"ctx": "        ctx->gpr[0] = ctx->lr;",
+"rm": [
+"        ctx->gpr[4] = (int64_t)(int32_t)(0);"
+],
+"add": [
+"        ctx->gpr[4] = rfom_movie_evwait_us();   /* RL 128478: was 0 (wait forever); see project/stubs.cpp */"
+]
+}
 ]
 },
 "preamble": [
@@ -356,7 +368,8 @@
 "extern \"C\" void rfom_mp_scert_note(int kind, uint32_t a, uint32_t b, uint32_t c, uint32_t d);",
 "extern \"C\" void rfom_mp_scert_win(int tag, uint32_t sess);",
 "extern \"C\" void rfom_mp_disp_note(uint32_t type, uint32_t slot, uint32_t code);",
-"extern \"C\" void rfom_mp_glog(int err, ppu_context* ctx);"
+"extern \"C\" void rfom_mp_glog(int err, ppu_context* ctx);",
+"extern \"C\" uint64_t rfom_movie_evwait_us(void);   /* RL 128478 (project/stubs.cpp) */"
 ],
 "header": [
 {
