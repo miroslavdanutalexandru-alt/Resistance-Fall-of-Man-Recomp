@@ -269,6 +269,32 @@ int main()
         printf("adaptive target: 150 -> 175 -> 200 ... 300 cap, steps back after 5 clean minutes; set_target clamps to the ring\n");
     }
 
+    {   /* 8-channel stage (surround output): channels stay in their slots through the ring and SoundTouch */
+        AudioOutConfig cfg; audio_out_default_config(&cfg, RATE, 100);
+        cfg.channels = 8;
+        AudioOut* ao = audio_out_create(&cfg);
+        std::vector<float> in((size_t)BLOCK * 8), out((size_t)4096 * 8);
+        unsigned checked = 0, bad = 0, ph = 0;
+        for (int b = 0; b < 200; b++) {
+            for (unsigned i = 0; i < BLOCK; i++, ph++) {
+                const float v = 0.1f + 0.02f * (float)sin(2 * PI * FREQ * ph / RATE);
+                for (unsigned c = 0; c < 8; c++) in[(size_t)i * 8 + c] = v * (float)(c + 1);
+            }
+            audio_out_push(ao, in.data(), BLOCK);
+            audio_out_tick(ao, 0);
+            const unsigned n = audio_out_render(ao, out.data(), BLOCK, 1024);
+            for (unsigned i = 0; i < n; i++) {
+                const float* f = &out[(size_t)i * 8];
+                if (fabs(f[0]) < 0.01) continue;
+                checked++;
+                for (unsigned c = 1; c < 8; c++) if (fabs(f[c] / f[0] - (double)(c + 1)) > 0.01) { bad++; break; }
+            }
+        }
+        audio_out_destroy(ao);
+        CHECK(checked > 10000 && bad == 0, "8ch: %u of %u frames had channels out of place", bad, checked);
+        printf("8-channel stage: %u frames, channel order kept\n", checked);
+    }
+
     printf(g_fail ? "FAILED (%d)\n" : "ALL PASSED\n", g_fail);
     return g_fail ? 1 : 0;
 }

@@ -1,7 +1,8 @@
 /*
  * ps3recomp - cellAvconfExt HLE implementation
  *
- * Reports standard LPCM stereo 48kHz as available audio output.
+ * Reports LPCM 48kHz output: 2 / 5.1 / 7.1 as on a PS3 over HDMI, configured
+ * to the channel count of the host output (cellAudio_host_channels).
  * Games query this to decide audio format before opening cellAudio ports.
  */
 
@@ -28,6 +29,15 @@ extern u8* vm_base;
 
 static float s_gamma = 1.0f;
 
+/* cellAudio.c: channels of the host output (2, 6 or 8) -- the Windows default
+ * device's layout or PORT_AUDIO_CHANNELS (GitHub R1 #39). */
+extern int cellAudio_host_channels(void);
+static u8 avconf_host_chnum(void)
+{
+    const int ch = cellAudio_host_channels();
+    return ch >= 8 ? CELL_AUDIO_OUT_CHNUM_8 : ch >= 6 ? CELL_AUDIO_OUT_CHNUM_6 : CELL_AUDIO_OUT_CHNUM_2;
+}
+
 /* ---------------------------------------------------------------------------
  * API implementations
  * -----------------------------------------------------------------------*/
@@ -46,7 +56,9 @@ s32 cellAudioOutGetSoundAvailability(u32 audioOut, u32 type, u32 fs, u32 option)
      * then fall through to DTS/AC3 probes that also returned 0 -- YDKJ ends up with no
      * FMOD threads at all. Returning the real 7.1 for LPCM matches the console. */
     if (type == CELL_AUDIO_OUT_CODING_TYPE_LPCM) {
-        if (fs & CELL_AUDIO_OUT_FS_48KHZ) return CELL_AUDIO_OUT_CHNUM_6;  /* 5.1 (A/B: was 8) */
+        /* 5.1 (A/B: was 8, on the stereo output); 7.1 when the host output is 7.1 */
+        if (fs & CELL_AUDIO_OUT_FS_48KHZ)
+            return avconf_host_chnum() == CELL_AUDIO_OUT_CHNUM_8 ? CELL_AUDIO_OUT_CHNUM_8 : CELL_AUDIO_OUT_CHNUM_6;
         return CELL_AUDIO_OUT_CHNUM_2;
     }
 
@@ -121,7 +133,7 @@ s32 cellAudioOutGetConfiguration(u32 audioOut,
     config = GUEST_PTR(config, CellAudioOutConfiguration*);
 
     memset(config, 0, sizeof(CellAudioOutConfiguration));
-    config->channel = CELL_AUDIO_OUT_CHNUM_2;
+    config->channel = avconf_host_chnum();
     config->encoder = CELL_AUDIO_OUT_CODING_TYPE_LPCM;
 
     return CELL_OK;
@@ -150,7 +162,7 @@ s32 cellAudioOutGetState(u32 audioOut, u32 deviceIndex, void* state)
     vm_write8(ea + 3, 0);
     vm_write32(ea + 4, 0);                                  /* no down-mixer  */
     vm_write8(ea + 8, CELL_AUDIO_OUT_CODING_TYPE_LPCM);     /* soundMode      */
-    vm_write8(ea + 9, CELL_AUDIO_OUT_CHNUM_2);
+    vm_write8(ea + 9, avconf_host_chnum());
     vm_write8(ea + 10, CELL_AUDIO_OUT_FS_48KHZ);
     vm_write8(ea + 11, 0);
     vm_write32(ea + 12, 0);

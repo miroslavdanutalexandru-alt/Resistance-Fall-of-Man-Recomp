@@ -143,10 +143,17 @@ static void lx_register()
            "RFOM_SEAMLESS", { {"On", ""}, {"Off", "0"} });
     // "AUDIO" options (stubs.cpp rfom_speakers, cellAudio.c audio_buffer_ms)
     lx_add(5, "speakers", "Speaker layout",
-           "The channel layout the game mixes for. Windows down-mixes to your real speakers or headphones. "
-           "Pros of 5.1 / 7.1: proper surround on a surround system. Cons: on plain stereo Stereo can sound a little "
-           "fuller, since nothing is down-mixed.", "RFOM_SPEAKERS",
-           { {"5.1 surround", ""}, {"7.1 surround", "8"}, {"Stereo", "2"} });
+           "The channel layout the game mixes for. Auto is 7.1 when Audio output is 7.1, else 5.1. "
+           "Pros of 5.1 / 7.1: proper surround on a surround system (it is folded down on stereo). Cons: on plain "
+           "stereo, Stereo can sound a little fuller, since nothing is folded down.", "RFOM_SPEAKERS",
+           { {"Auto", ""}, {"7.1 surround", "8"}, {"Stereo", "2"}, {"5.1 surround", "6"} });
+    lx_add(5, "audio_channels", "Audio output",
+           "The channels the port sends to Windows. Auto follows the default playback device's speaker setup "
+           "(Windows Sound settings > your device > Speaker setup / Configure): 5.1 or 7.1 there gives every "
+           "surround speaker its own channel; stereo devices get the surround mix folded down as before. "
+           "Force 5.1 / 7.1 if Windows reports fewer channels than your receiver has; Windows down-mixes "
+           "a forced layout on a device that has fewer.", "PORT_AUDIO_CHANNELS",
+           { {"Auto", ""}, {"Stereo", "2"}, {"5.1", "6"}, {"7.1", "8"} });
     lx_add(5, "audio_buffer", "Audio buffer",
            "How much sound is buffered ahead. Auto is 100 ms (150 ms on CPUs with fewer than 12 threads). "
            "Pros of a larger buffer: no crackles or stretching when the CPU is busy. Cons: sound lags the picture a "
