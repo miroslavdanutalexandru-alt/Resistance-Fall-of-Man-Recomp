@@ -2226,6 +2226,16 @@ static void prompts_init_xbox(void)
  * label with PAD_NINTENDO_SWAP (cellpad_nintendo_swap); rebuilt when that changes. */
 extern "C" int cellpad_nintendo_swap(void);   /* cellPad.c */
 static char s_nrep3[0x30][4], s_nrepf[0x30][24]; static int s_nhave[0x30]; static int s_nswap_built = -1;
+/* v191: the front end's own font codes for the online lobby's prompts (lobby
+ * text: U+0A0C Triangle, 0A0D Start, 0A0E Select, 0A0F L1, 0A10 L2, 0A11 L3,
+ * 0A13 R1, 0A14 R2, 0A15 R3; 0A0A is Square, see v185 below). Front end, online only. */
+static const struct { uint16_t cp; const char* pad; int nx; const char* x3; const char* xf; } s_fe_lobby[] = {
+    {0x0A0C,"TRIANGLE",3,"(Y)","[Y]"}, {0x0A0D,"START",5,"Mnu","[Menu]"}, {0x0A0E,"SELECT",4,"Vw ","[View]"},
+    {0x0A0F,"L1",6,"LB ","[LB]"}, {0x0A10,"L2",7,"LT ","[LT]"}, {0x0A11,"L3",8,"LS ","[LS]"},
+    {0x0A13,"R1",10,"RB ","[RB]"}, {0x0A14,"R2",11,"RT ","[RT]"}, {0x0A15,"R3",12,"RS ","[RS]"},
+};
+static int s_fe_online = 0;
+static char s_sel_kb[40];   /* "[Tab] key": the Select key, for the lobby's "SELECT button" plate */
 static void prompts_init_nintendo(void)
 {
     const int sw = cellpad_nintendo_swap();
@@ -2251,6 +2261,15 @@ static void prompts_init_nintendo(void)
         else if (g.cp == 0x0A16) snprintf(s_nrepf[i], 24, "Right Stick");
         else snprintf(s_nrepf[i], 24, "[%s]", lab);
         s_nhave[i] = 1;
+    }
+    if (s_fe_online) {   /* v191: the online lobby's glyphs (s_fe_lobby; 0A0A = Square there) */
+        auto put = [sw](int i, int idx) {
+            const char* lab = pcx_nx_label(idx, sw); if (!lab) return;
+            const int face = strlen(lab) == 1 && isalpha((unsigned char)lab[0]);
+            if (face) snprintf(s_nrep3[i], 4, "(%s)", lab); else snprintf(s_nrep3[i], 4, "%-3.3s", lab);
+            snprintf(s_nrepf[i], 24, "[%s]", lab); s_nhave[i] = 1; };
+        put(0x0A0A - 0x0A09, 1);
+        for (auto& g : s_fe_lobby) put(g.cp - 0x0A09, g.nx);
     }
 }
 static void prompts_init(void)
@@ -2285,7 +2304,14 @@ static void prompts_init(void)
               char k3[4], kf[24];
               if (getenv("PS3_NET_ONLINE")) {   /* the lobby is only reached online */
               if (pad_key_for("SQUARE", k3, kf)) { memcpy(s_rep3[sq], k3, 4); memcpy(s_repf[sq], kf, 24); s_have[sq] = 1; }
-              memcpy(s_xrep3[sq], "(X)", 4); snprintf(s_xrepf[sq], 24, "[X]"); s_xhave[sq] = 1; }
+              memcpy(s_xrep3[sq], "(X)", 4); snprintf(s_xrepf[sq], 24, "[X]"); s_xhave[sq] = 1;
+              /* v191: the lobby's other button glyphs ("[R2] TEXT CHAT", "[L1] / [L2]
+               * SCROLL", "[Tri] OPTIONS", sort / filter / tab prompts) */
+              for (auto& g : s_fe_lobby) { const int i = g.cp - 0x0A09;
+                  if (pad_key_for(g.pad, k3, kf)) { memcpy(s_rep3[i], k3, 4); memcpy(s_repf[i], kf, 24); s_have[i] = 1; }
+                  memcpy(s_xrep3[i], g.x3, 4); snprintf(s_xrepf[i], 24, "%s", g.xf); s_xhave[i] = 1; }
+              s_fe_online = 1; s_nswap_built = -1; prompts_init_nintendo();
+              if (pad_key_for("SELECT", k3, kf)) snprintf(s_sel_kb, sizeof s_sel_kb, kf[0] == '[' ? "%s key" : "%s", kf); }
           } } }
 }
 /* One text file as loaded (its original bytes) and as last patched, so the
@@ -2350,6 +2376,8 @@ static void prompts_apply(uint32_t base, uint32_t end, int mode, uint32_t* blkp,
         if (m == 22 && !memcmp(p + i, "Press the START button", 22)) r = mode == 3 ? "Press the + button" : mode ? "Press the MENU button" : "Press the SPACE bar";
         else if (m == 34 && !memcmp(p + i, "Press the START button to continue", 34)) r = mode == 3 ? "Press the + button to continue" : mode ? "Press the MENU button to continue" : "Press the SPACE bar to continue";
         else if (m == 35 && !memcmp(p + i, " Press the START button to continue", 35)) r = mode == 3 ? " Press the + button to continue" : mode ? " Press the MENU button to continue" : " Press the SPACE bar to continue";
+        else if (m == 13 && s_fe_online && !memcmp(p + i, "SELECT button", 13))   /* v191: the lobby's BUDDY LIST plate */
+            r = mode == 3 ? "- button" : mode ? "VIEW button" : s_sel_kb[0] ? s_sel_kb : nullptr;
         if (r) { size_t si = 0; while (si < starts.size() && starts[si] != i) si++;
                  if (si == starts.size()) { starts.push_back(i); isgrab.push_back(r); } else isgrab[si] = r; }
         i += m;

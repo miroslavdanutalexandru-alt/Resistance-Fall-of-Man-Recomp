@@ -975,6 +975,53 @@ static void pad_poll_keyboard(void)
         lx = ly = 0;   /* the stick would fight the d-pad on some screens */
         menu_raw = 1;  /* v162b: menus read raw buttons -- the controller-screen swap (e.g. crouch <-> d-pad up) must not apply */
       } }
+    /* v191 (experimental, RFOM_MP_PAUSE_KEYS=1; off by default): the pause menu of
+     * an online match (front end, s_fe_level). The match keeps running, so the
+     * v162 menu test (the look code stopped) never fires and the menu, which only
+     * reads the d-pad and Cross/Circle, got WASD as the left stick and arrows as
+     * whatever they are bound to. No pause flag of the game is known, so the
+     * pause is followed from Start: a Start press (Esc) opens it, the next one
+     * closes it. While open: WASD / arrows = d-pad, Enter = Cross (Space keeps
+     * its binding, Cross by default), Backspace = Circle; Enter bound to Start
+     * selects instead. Mouse motion (looking around: the menu was left another
+     * way, e.g. Resume) ends it. */
+    { static int en = -1, fe5 = -1;
+      if (en < 0) { const char* e = getenv("RFOM_MP_PAUSE_KEYS"); en = (e && atoi(e)) ? 1 : 0; }
+      if (fe5 < 0) { char mp[MAX_PATH] = ""; GetModuleFileNameA(NULL, mp, MAX_PATH);
+                     const char* b = strrchr(mp, '\\'); b = b ? b + 1 : mp;
+                     fe5 = _stricmp(b, "ResistanceFoM.exe") ? 0 : 1; }
+      static int paused = 0, was_start = 0, said = 0; static long mv = 0; static ULONGLONG mv_t = 0;
+      if (!en || !fe5 || !s_fe_level) { paused = 0; was_start = (btns & CELL_PAD_CTRL_START) != 0; }
+      else {
+        #define KD(vk) ((GetAsyncKeyState(vk) & 0x8000) != 0)
+        u16 b = btns;
+        if (paused && KD(VK_RETURN) && !KD(VK_ESCAPE)) b &= (u16)~CELL_PAD_CTRL_START;
+        const int st = (b & CELL_PAD_CTRL_START) != 0;
+        if (st && !was_start) { paused = !paused; mv = 0; mv_t = now; }
+        was_start = st;
+        if (paused) {   /* ~60 degrees of looking within 250 ms = playing again */
+            if (now - mv_t > 250) { mv = 0; mv_t = now; }
+            mv += labs(mdx) + labs(mdy);
+            if (mv > 600) paused = 0;
+        }
+        { static int was = 0;
+          if (paused != was && said < 40) { said++; printf("[controls] online match: pause menu keys %s\n", paused ? "on" : "off"); }
+          was = paused; }
+        if (paused) {
+            btns = b;
+            if (KD(VK_UP) || KD('W')) btns |= CELL_PAD_CTRL_UP;
+            if (KD(VK_DOWN) || KD('S')) btns |= CELL_PAD_CTRL_DOWN;
+            if (KD(VK_LEFT) || KD('A')) btns |= CELL_PAD_CTRL_LEFT;
+            if (KD(VK_RIGHT) || KD('D')) btns |= CELL_PAD_CTRL_RIGHT;
+            u16 kc = 0;
+            if (KD(VK_RETURN)) kc |= CELL_PAD_CTRL_CROSS;
+            if (KD(VK_BACK)) kc |= CELL_PAD_CTRL_CIRCLE;
+            btns |= pad_kb_confirm(kc);
+            krx = kry = 0;   /* arrows bound to looking: the d-pad only */
+            menu_raw = 1;
+        }
+        #undef KD
+      } }
     if (g_rfom_space_start && (GetAsyncKeyState(VK_SPACE) & 0x8000)) btns |= CELL_PAD_CTRL_START;   /* v160v */
     /* v186: the front end's first-run screens (initial setup, notices) say
      * "Press the SPACE bar" -- the relabelled Start prompt -- but only Enter
