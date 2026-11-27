@@ -13,7 +13,7 @@
 struct AudioOut {
     AudioOutConfig cfg;
     soundtouch::SoundTouch st;
-    std::vector<float> ring;      /* stereo interleaved, cfg.ring_frames */
+    std::vector<float> ring;      /* cfg.channels interleaved, cfg.ring_frames */
     unsigned head = 0, count = 0; /* read position, frames held */
     double tempo = 1.0, applied = 1.0;
     bool dry = true;              /* not playing: priming or after an underrun */
@@ -40,6 +40,7 @@ extern "C" void audio_out_default_config(AudioOutConfig* c, unsigned rate, unsig
 {
     memset(c, 0, sizeof(*c));
     c->rate = rate ? rate : 48000;
+    c->channels = 2;
     const unsigned ms = rate / 1000;
     c->target_frames = buffer_ms * ms;
     c->threshold = 0.75;              /* RPCS3's default time_stretching_threshold */
@@ -81,13 +82,14 @@ extern "C" AudioOut* audio_out_create(const AudioOutConfig* cfg)
     if (!(ao->cfg.min_tempo >= 0.1)) ao->cfg.min_tempo = 0.1;
     if (ao->cfg.min_tempo > 1.0) ao->cfg.min_tempo = 1.0;
     if (ao->cfg.fade_frames < 16) ao->cfg.fade_frames = 16;
-    ao->ring.assign((size_t)ao->cfg.ring_frames * 2, 0.0f);
+    if (ao->cfg.channels < 1 || ao->cfg.channels > 8) ao->cfg.channels = 2;
+    ao->ring.assign((size_t)ao->cfg.ring_frames * ao->cfg.channels, 0.0f);
     /* RPCS3's audio_resampler settings, except: a 25 ms sequence instead of
      * 40 (less audio held inside SoundTouch and finer output steps, which
      * the offline test shows matters during 20-40 ms producer stalls), and
      * no anti-alias filter (it only matters for rate changes; the rate
      * stays 1.0 here) */
-    ao->st.setChannels(2);
+    ao->st.setChannels((int)ao->cfg.channels);
     ao->st.setSampleRate(ao->cfg.rate);
     ao->st.setSetting(SETTING_SEQUENCE_MS, 25);
     ao->st.setSetting(SETTING_SEEKWINDOW_MS, 15);
@@ -119,7 +121,7 @@ extern "C" int audio_out_is_dry(const AudioOut* ao) { return ao->dry ? 1 : 0; }
 extern "C" unsigned audio_out_push(AudioOut* ao, const float* in, unsigned frames)
 {
     const unsigned cap = ao->cfg.ring_frames;
-    if (frames > cap) { ao->s_overflow += frames - cap; in += (size_t)(frames - cap) * 2; frames = cap; }
+    if (frames > cap) { ao->s_overflow += frames - cap; in += (size_t)(frames - cap) * ao->cfg.channels; frames = cap; }
     if (ao->count + frames > cap) {             /* full: drop the oldest */
         const unsigned drop = ao->count + frames - cap;
         ao->head = (ao->head + drop) % cap; ao->count -= drop; ao->s_overflow += drop;
@@ -128,8 +130,8 @@ extern "C" unsigned audio_out_push(AudioOut* ao, const float* in, unsigned frame
     unsigned left = frames;
     while (left) {
         const unsigned n = left < cap - tail ? left : cap - tail;
-        memcpy(&ao->ring[(size_t)tail * 2], in, (size_t)n * 2 * sizeof(float));
-        in += (size_t)n * 2; left -= n; tail = (tail + n) % cap;
+        memcpy(&ao->ring[(size_t)tail * ao->cfg.channels], in, (size_t)n * ao->cfg.channels * sizeof(float));
+        in += (size_t)n * ao->cfg.channels; left -= n; tail = (tail + n) % cap;
     }
     ao->count += frames;
     return frames;
@@ -149,7 +151,7 @@ static void feed(AudioOut* ao, unsigned need)
     while (ao->st.numSamples() < need && ao->count) {
         unsigned n = ao->count < 512 ? ao->count : 512;
         if (n > cap - ao->head) n = cap - ao->head;
-        ao->st.putSamples(&ao->ring[(size_t)ao->head * 2], n);
+        ao->st.putSamples(&ao->ring[(size_t)ao->head * ao->cfg.channels], n);
         ao->head = (ao->head + n) % cap; ao->count -= n;
     }
 }
@@ -209,7 +211,7 @@ extern "C" unsigned audio_out_render(AudioOut* ao, float* out, unsigned max, uns
 static unsigned render_inner(AudioOut* ao, float* out, unsigned max, unsigned dq)
 {
     if (!max) return 0;
-    const unsigned fade = ao->cfg.fade_frames, guard = ao->cfg.guard_frames;
+    const unsigned fade = ao->cfg.fade_frames, guard = ao->cfg.guard_frames, nc = ao->cfg.channels;
     if (ao->dry) {
         feed(ao, fade + 1024);
         const unsigned need = (ao->primed ? ao->cfg.resume_frames : ao->cfg.target_frames) + fade;
@@ -220,7 +222,7 @@ static unsigned render_inner(AudioOut* ao, float* out, unsigned max, unsigned dq
              * start-up the device has not started playing anything yet) */
             unsigned n = ao->primed && dq < guard ? guard - dq : 0;
             if (n > max) n = max;
-            memset(out, 0, (size_t)n * 2 * sizeof(float));
+            memset(out, 0, (size_t)n * nc * sizeof(float));
             ao->s_silence += n;
             return n;
         }
@@ -233,7 +235,7 @@ static unsigned render_inner(AudioOut* ao, float* out, unsigned max, unsigned dq
         n = ao->st.receiveSamples(out, n);
         for (unsigned i = 0; i < n && ao->fadein < fade; i++, ao->fadein++) {
             const float g = (float)(ao->fadein + 1) / (float)(fade + 1);
-            out[i * 2] *= g; out[i * 2 + 1] *= g;
+            for (unsigned c = 0; c < nc; c++) out[i * nc + c] *= g;
         }
         return n;
     }
@@ -244,12 +246,12 @@ static unsigned render_inner(AudioOut* ao, float* out, unsigned max, unsigned dq
     for (unsigned i = 0; i < k; i++) {
         float g = (float)(k - i) / (float)(k + 1);
         if (ao->fadein < fade) { g *= (float)(ao->fadein + 1) / (float)(fade + 1); ao->fadein++; }
-        out[i * 2] *= g; out[i * 2 + 1] *= g;
+        for (unsigned c = 0; c < nc; c++) out[i * nc + c] *= g;
     }
     ao->dry = true; ao->s_underruns++;
     unsigned s = guard > dq + k ? guard - dq - k : 0;
     if (s > max - k) s = max - k;
-    memset(out + (size_t)k * 2, 0, (size_t)s * 2 * sizeof(float));
+    memset(out + (size_t)k * nc, 0, (size_t)s * nc * sizeof(float));
     ao->s_silence += s;
     return k + s;
 }

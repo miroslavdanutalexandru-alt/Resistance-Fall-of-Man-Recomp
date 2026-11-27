@@ -28,7 +28,7 @@ static const CatGroup g_cat[] = {
     { P_CONTROLS, "CONTROLLER BUTTONS",           "padmap_*",
       "Also in game: F10 \xE2\x80\xBA More PC Options \xE2\x80\xBA Controller layout. Key bindings for keyboard and "
       "mouse are above." },
-    { P_AUDIO,    "SOUND",                        "speakers audio_buffer volume audio_mono", nullptr },
+    { P_AUDIO,    "SOUND",                        "speakers audio_channels audio_buffer volume audio_mono", nullptr },
     { P_AUDIO,    "IN THE BACKGROUND",            "background", nullptr },
     { P_UI,       "NOTIFICATIONS",                "trophytoast trophystyle", nullptr },
     { P_UI,       "MOVIES",                       "cutscene_skip cutscene_skip_all skiphint", nullptr },

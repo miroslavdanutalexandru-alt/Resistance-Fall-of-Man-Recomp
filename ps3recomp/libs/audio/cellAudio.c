@@ -26,6 +26,7 @@
 #include "audio_adapt.h"
 #include "audio_elastic.h"
 #include "audio_decomb.h"
+#include "audio_chmap.h"
 
 /* PORT_AUDIO_LOG (or R2_RSX_PROF) set and not 0: the periodic audio statistics
  * lines. Off by default. */
@@ -203,8 +204,51 @@ void cellaudio_set_pc_mix(int volume_pct, int mono)
     if (mono >= 0) g_port_audio_mono = mono != 0;
 }
 
-/* Output mix buffer (stereo, one block worth) */
-static float s_mix_buffer[CELL_AUDIO_BLOCK_SAMPLES * 2];
+/* Host output layout (GitHub R1 #39): 2 = the stereo fold below; more (5.1 /
+ * 7.1 device, or PORT_AUDIO_CHANNELS) = every PS3 channel on its own host
+ * speaker through s_chmap (audio_chmap.h). Set when the device is opened;
+ * only the mixer thread changes it afterwards (device re-open). */
+static unsigned   s_out_ch = 2;
+static AudioChMap s_chmap;
+static int        s_out_known = 0;   /* the backend has opened a device */
+
+/* PORT_AUDIO_CHANNELS = 2 / 6 / 8 (or stereo / 5.1 / 7.1): open that many
+ * channels whatever the Windows speaker setup is (the audio engine converts);
+ * unset / auto = follow the default device. */
+static int audio_force_channels(void)
+{
+    static int f = -1;
+    if (f < 0) {
+        const char* e = getenv("PORT_AUDIO_CHANNELS");
+        f = 0;
+        if (e && *e) {
+            if (e[0] == 's' || e[0] == 'S' || !strcmp(e, "2")) f = 2;
+            else if (!strcmp(e, "5.1") || !strcmp(e, "6")) f = 6;
+            else if (!strcmp(e, "7.1") || !strcmp(e, "8")) f = 8;
+        }
+    }
+    return f;
+}
+
+/* PORT_AUDIO_SWAP_SURROUND=1: the PS3 Ls/Rs pair on the host back speakers and
+ * Lb/Rb on the sides (default: Ls/Rs -> sides, as a receiver plays 5.1 on 7.1). */
+static int audio_swap_surround(void)
+{
+    static int s = -1;
+    if (s < 0) { const char* e = getenv("PORT_AUDIO_SWAP_SURROUND"); s = (e && *e && *e != '0') ? 1 : 0; }
+    return s;
+}
+
+static void audio_set_layout(unsigned ch, unsigned mask)
+{
+    if (ch < 3) { ch = 2; mask = AUDIO_MASK_STEREO; }
+    audio_chmap_build(&s_chmap, mask, audio_swap_surround());
+    s_out_ch = ch;
+    s_out_known = 1;
+}
+
+/* Output mix buffer (s_out_ch interleaved channels, one block worth) */
+static float s_mix_buffer[CELL_AUDIO_BLOCK_SAMPLES * AUDIO_CHMAP_MAX];
 
 /* Per port: did the last block consumed hold guest data (not all the -0.0
  * sentinel)? The SoundTouch stage's late-block wait only waits for a port
@@ -323,6 +367,7 @@ static int audio_backend_init(void)
     }
 
     SDL_PauseAudioDevice(s_sdl_audio_dev, 0); /* Start playback */
+    audio_set_layout(2, AUDIO_MASK_STEREO);
     return 0;
 }
 
@@ -412,14 +457,26 @@ static int audio_backend_init(void)
         return -1;
     }
 
-    WAVEFORMATEX wfx;
-    wfx.wFormatTag      = WAVE_FORMAT_IEEE_FLOAT;
-    wfx.nChannels       = 2;
-    wfx.nSamplesPerSec  = CELL_AUDIO_SAMPLE_RATE;
-    wfx.wBitsPerSample  = 32;
-    wfx.nBlockAlign     = wfx.nChannels * (wfx.wBitsPerSample / 8);
-    wfx.nAvgBytesPerSec = wfx.nSamplesPerSec * wfx.nBlockAlign;
-    wfx.cbSize          = 0;
+    /* GitHub R1 #39: the stream used to be stereo whatever the device was, so a
+     * 5.1 / 7.1 system only ever got the game's surround mix folded into two
+     * channels. Open the device's own channel layout (PORT_AUDIO_CHANNELS
+     * forces one) and place the PS3 channels on it (audio_chmap.h). */
+    unsigned dev_ch = 2, dev_mask = 0, dev_rate = 0;
+    { WAVEFORMATEX* mf = NULL;
+      if (SUCCEEDED(s_wasapi_client->lpVtbl->GetMixFormat(s_wasapi_client, &mf)) && mf) {
+          dev_ch = mf->nChannels; dev_rate = mf->nSamplesPerSec;
+          if (mf->wFormatTag == 0xFFFE /* WAVE_FORMAT_EXTENSIBLE */ && mf->cbSize >= 22)
+              memcpy(&dev_mask, (const unsigned char*)mf + sizeof(WAVEFORMATEX) + 2, 4);   /* dwChannelMask */
+          CoTaskMemFree(mf);
+      } }
+    unsigned out_mask = AUDIO_MASK_STEREO;
+    unsigned out_ch = audio_chmap_pick(dev_ch, dev_mask, audio_force_channels(), &out_mask);
+
+    /* WAVEFORMATEXTENSIBLE, IEEE float (KSDATAFORMAT_SUBTYPE_IEEE_FLOAT) */
+    struct { WAVEFORMATEX f; WORD valid_bits; DWORD mask; GUID sub; } wfx;
+    typedef char wfx_is_waveformatextensible[sizeof(wfx) == 40 ? 1 : -1];
+    (void)sizeof(wfx_is_waveformatextensible);
+    static const GUID subtype_float = { 0x00000003, 0x0000, 0x0010, { 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71 } };
 
     /* Request event-driven mode with a ~20ms buffer. The SoundTouch stage
      * keeps its own queue in the device (capped well below this) and needs
@@ -439,31 +496,67 @@ static int audio_backend_init(void)
 #define AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY 0x08000000
 #endif
     const DWORD convert = AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
-    hr = s_wasapi_client->lpVtbl->Initialize(
-        s_wasapi_client,
-        AUDCLNT_SHAREMODE_SHARED,
-        AUDCLNT_STREAMFLAGS_EVENTCALLBACK | convert,
-        buf_duration, 0, &wfx, NULL);
-
-    if (FAILED(hr)) {
-        /* Fallback: try without event callback */
-        hr = s_wasapi_client->lpVtbl->Initialize(
+    int evented = 1;
+    for (;;) {
+        memset(&wfx, 0, sizeof wfx);
+        wfx.f.nChannels       = (WORD)out_ch;
+        wfx.f.nSamplesPerSec  = CELL_AUDIO_SAMPLE_RATE;
+        wfx.f.wBitsPerSample  = 32;
+        wfx.f.nBlockAlign     = wfx.f.nChannels * (wfx.f.wBitsPerSample / 8);
+        wfx.f.nAvgBytesPerSec = wfx.f.nSamplesPerSec * wfx.f.nBlockAlign;
+        if (out_ch == 2) {
+            wfx.f.wFormatTag = WAVE_FORMAT_IEEE_FLOAT;   /* the stereo stream exactly as before */
+            wfx.f.cbSize     = 0;
+        } else {
+            wfx.f.wFormatTag = 0xFFFE;                   /* WAVE_FORMAT_EXTENSIBLE */
+            wfx.f.cbSize     = 22;
+            wfx.valid_bits   = 32;
+            wfx.mask         = out_mask;
+            wfx.sub          = subtype_float;
+        }
+        evented = 1;
+        HRESULT hr2 = s_wasapi_client->lpVtbl->Initialize(
             s_wasapi_client,
             AUDCLNT_SHAREMODE_SHARED,
-            convert, buf_duration, 0, &wfx, NULL);
-        if (FAILED(hr)) {
-            if (!s_wasapi_quiet) printf("[cellAudio] WASAPI Initialize failed: 0x%08lX\n", hr);
-            s_wasapi_client->lpVtbl->Release(s_wasapi_client);
-            s_wasapi_client = NULL;
-            CloseHandle(s_wasapi_event);
-            s_wasapi_event = NULL;
-            return -1;
+            AUDCLNT_STREAMFLAGS_EVENTCALLBACK | convert,
+            buf_duration, 0, &wfx.f, NULL);
+        if (FAILED(hr2)) {
+            /* Fallback: try without event callback */
+            evented = 0;
+            hr2 = s_wasapi_client->lpVtbl->Initialize(
+                s_wasapi_client,
+                AUDCLNT_SHAREMODE_SHARED,
+                convert, buf_duration, 0, &wfx.f, NULL);
         }
+        hr = hr2;
+        if (SUCCEEDED(hr) || out_ch == 2) break;
+        if (!s_wasapi_quiet) printf("[cellAudio] WASAPI %u-channel stream failed (0x%08lX) -- falling back to stereo\n",
+                                    out_ch, (unsigned long)hr);
+        out_ch = 2; out_mask = AUDIO_MASK_STEREO;
+    }
+    if (FAILED(hr)) {
+        if (!s_wasapi_quiet) printf("[cellAudio] WASAPI Initialize failed: 0x%08lX\n", hr);
+        s_wasapi_client->lpVtbl->Release(s_wasapi_client);
+        s_wasapi_client = NULL;
+        CloseHandle(s_wasapi_event);
+        s_wasapi_event = NULL;
+        return -1;
+    }
+    if (!evented) {
         CloseHandle(s_wasapi_event);
         s_wasapi_event = NULL;
     } else {
         s_wasapi_client->lpVtbl->SetEventHandle(s_wasapi_client, s_wasapi_event);
     }
+    { const int changed = !s_out_known || s_out_ch != out_ch || s_chmap.mask != out_mask;
+      audio_set_layout(out_ch, out_mask);
+      if (changed)
+          fprintf(stderr, "[audio] host output: %u ch %s (mask 0x%X) -- Windows device mix format %u ch, mask 0x%X, %u Hz%s%s%c",
+                  out_ch, audio_chmap_name(out_mask), out_mask, dev_ch, dev_mask, dev_rate,
+                  audio_force_channels() ? " (PORT_AUDIO_CHANNELS)" : "",
+                  out_ch > 2 ? (audio_swap_surround() ? "; PS3 Ls/Rs -> back, Lb/Rb -> side (PORT_AUDIO_SWAP_SURROUND)"
+                                                      : "; PS3 surround discrete, Ls/Rs -> side speakers")
+                             : "; PS3 surround folded to stereo", 10); }
 
     s_wasapi_client->lpVtbl->GetBufferSize(s_wasapi_client, &s_wasapi_buf_frames);
     { REFERENCE_TIME def = 0, mn = 0;
@@ -525,7 +618,7 @@ static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
         static int mute = -1;
         if (mute < 0) mute = getenv("PS3_MUTE") ? 1 : 0;
         extern volatile long g_ps3_audio_mute_rt;   /* runtime mute (window focus lost, quit prompt) */
-        memcpy(buf, stereo_samples, num_samples * 2 * sizeof(float));
+        memcpy(buf, stereo_samples, (size_t)num_samples * s_out_ch * sizeof(float));
         s_wasapi_render->lpVtbl->ReleaseBuffer(s_wasapi_render, num_samples,
                                                (mute || g_ps3_audio_mute_rt) ? AUDCLNT_BUFFERFLAGS_SILENT : 0);
     }
@@ -586,6 +679,45 @@ static int audio_backend_reopen(void)
 
 
 #endif /* AUDIO_BACKEND_WASAPI */
+
+/* Host output channels for cellAudioOut (GitHub R1 #39): the open device's
+ * layout, else (cellAudioOut is queried before cellAudioInit) what the default
+ * device's mix format / PORT_AUDIO_CHANNELS will give. 2 with the SDL backend. */
+int cellAudio_host_channels(void)
+{
+    if (s_out_known) return (int)s_out_ch;
+    static int probed = 0;
+    if (probed) return probed;
+    unsigned ch = 2, mask = 0, m = 0;
+#if AUDIO_BACKEND_WASAPI
+    const HRESULT ci = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    IMMDeviceEnumerator* en = NULL;
+    if (SUCCEEDED(CoCreateInstance(&CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL, &IID_IMMDeviceEnumerator, (void**)&en)) && en) {
+        IMMDevice* dev = NULL;
+        if (SUCCEEDED(en->lpVtbl->GetDefaultAudioEndpoint(en, eRender, eConsole, &dev)) && dev) {
+            IAudioClient* ac = NULL;
+            if (SUCCEEDED(dev->lpVtbl->Activate(dev, &IID_IAudioClient, CLSCTX_ALL, NULL, (void**)&ac)) && ac) {
+                WAVEFORMATEX* mf = NULL;
+                if (SUCCEEDED(ac->lpVtbl->GetMixFormat(ac, &mf)) && mf) {
+                    ch = mf->nChannels;
+                    if (mf->wFormatTag == 0xFFFE && mf->cbSize >= 22)
+                        memcpy(&mask, (const unsigned char*)mf + sizeof(WAVEFORMATEX) + 2, 4);
+                    CoTaskMemFree(mf);
+                }
+                ac->lpVtbl->Release(ac);
+            }
+            dev->lpVtbl->Release(dev);
+        }
+        en->lpVtbl->Release(en);
+    }
+    if (SUCCEEDED(ci)) CoUninitialize();
+    probed = (int)audio_chmap_pick(ch, mask, audio_force_channels(), &m);
+#else
+    (void)ch; (void)mask; (void)m;
+    probed = 2;
+#endif
+    return probed;
+}
 
 /* ---------------------------------------------------------------------------
  * Mixing
@@ -704,6 +836,7 @@ finish:
 static void audio_mix_one_block(void)
 {
     memset(s_mix_buffer, 0, sizeof(s_mix_buffer));
+    const unsigned oc = s_out_ch;   /* host channels; > 2 = discrete surround via s_chmap */
 
     mutex_lock(&s_audio_mutex);
 
@@ -823,6 +956,15 @@ static void audio_mix_one_block(void)
           if (hold) {
               holds++; run[p]++;
               const float* lp = last[p];
+              if (oc > 2) {
+                  float rows[AUDIO_CHMAP_MAX][AUDIO_CHMAP_MAX];
+                  audio_chmap_rows(&s_chmap, nch, rows);
+                  for (u32 s = 0; s < CELL_AUDIO_BLOCK_SAMPLES; s++)
+                      for (u32 c = 0; c < nch; c++) {
+                          const float v = ld_be_f32(&lp[s * nch + c]) * level * 0.6f;
+                          for (u32 o = 0; o < oc; o++) s_mix_buffer[s * oc + o] += v * rows[c][o];
+                      }
+              } else
               for (u32 s = 0; s < CELL_AUDIO_BLOCK_SAMPLES; s++) {
                   float l = 0.0f, r = 0.0f;
                   if (nch >= 2) { l = ld_be_f32(&lp[s * nch]); r = ld_be_f32(&lp[s * nch + 1]); }
@@ -910,7 +1052,7 @@ static void audio_mix_one_block(void)
          * fold (loudness compensated). See audio_decomb.h.
          * AUDIO_P1_DECOMB=0 = old fold; AUDIO_P1_DECOMB_LAG=<frames>. */
         float dc_w0 = 1.0f, dc_w1 = 1.0f, dc_g0 = 1.0f, dc_g1 = 1.0f;
-        if (p == 1 && nch == 8) {
+        if (p == 1 && nch == 8 && oc == 2) {
             static int dc_on = -1;
             static AudioDecomb dc;
             if (dc_on < 0) {
@@ -931,6 +1073,23 @@ static void audio_mix_one_block(void)
                 dc_w0 = dc.w0; dc_w1 = dc.w1; dc_g0 = dc.g0; dc_g1 = dc.g1;
             }
         }
+        /* Surround host output (GitHub R1 #39): every channel on its own speaker
+         * (audio_chmap.h), no fold -- so no fold gains and no de-comb (the
+         * delayed side copy is on its own speakers, not summed onto the fronts).
+         * Port 1 keeps its movie-LFE gain (AUDIO_P1_LFE, default 0): the 12x
+         * LFE burst would rasp on a subwoofer too. */
+        if (oc > 2) {
+            float rows[AUDIO_CHMAP_MAX][AUDIO_CHMAP_MAX];
+            audio_chmap_rows(&s_chmap, nch, rows);
+            if (p == 1 && nch >= 4)
+                for (u32 o = 0; o < AUDIO_CHMAP_MAX; o++) rows[3][o] *= lfe_gain;
+            for (u32 s = 0; s < CELL_AUDIO_BLOCK_SAMPLES; s++)
+                for (u32 c = 0; c < nch && c < AUDIO_CHMAP_MAX; c++) {
+                    const float v = ld_be_f32(&src[s * nch + c]) * level;
+                    if (v == 0.0f) continue;
+                    for (u32 o = 0; o < oc; o++) s_mix_buffer[s * oc + o] += v * rows[c][o];
+                }
+        } else
         for (u32 s = 0; s < CELL_AUDIO_BLOCK_SAMPLES; s++) {
             const float dt = (float)s / (float)CELL_AUDIO_BLOCK_SAMPLES;
             const float dc_w = dc_w0 + (dc_w1 - dc_w0) * dt;
@@ -1018,7 +1177,7 @@ static void audio_mix_one_block(void)
       if (lim < 0) { const char* e = getenv("AUDIO_LIMIT"); lim = e ? atoi(e) : 1; }
       if (lim) {
           float pk = 0.0f;
-          for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++) {
+          for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * oc; i++) {
               const float a2 = s_mix_buffer[i] < 0 ? -s_mix_buffer[i] : s_mix_buffer[i];
               if (a2 > pk) pk = a2;
           }
@@ -1029,8 +1188,7 @@ static void audio_mix_one_block(void)
           for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES; i++) {
               const float t = i < 64 ? (float)i / 64.0f : 1.0f;
               const float gg = target < g ? target : g + (target - g) * t;   /* down: at once */
-              s_mix_buffer[i * 2]     *= gg;
-              s_mix_buffer[i * 2 + 1] *= gg;
+              for (u32 o = 0; o < oc; o++) s_mix_buffer[i * oc + o] *= gg;
           }
           g = target;
       } }
@@ -1042,9 +1200,10 @@ static void audio_mix_one_block(void)
         if (g_port_volume_pct != 100 || g_port_audio_mono)
             fprintf(stderr, "[audio] master volume %d%%%s%c", g_port_volume_pct, g_port_audio_mono ? ", mono" : "", 10);
     }
-    pcx_audio_apply(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES, g_port_volume_pct / 100.0f, g_port_audio_mono);
+    if (oc > 2) audio_chmap_apply_volume(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES, &s_chmap, g_port_volume_pct / 100.0f, g_port_audio_mono);
+    else pcx_audio_apply(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES, g_port_volume_pct / 100.0f, g_port_audio_mono);
     /* Clip to [-1.0, 1.0] */
-    for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++) {
+    for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * oc; i++) {
         if (s_mix_buffer[i] > 1.0f) s_mix_buffer[i] = 1.0f;
         if (s_mix_buffer[i] < -1.0f) s_mix_buffer[i] = -1.0f;
     }
@@ -1276,7 +1435,7 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
     static int steady = -1;
     if (steady < 0) { const char* e = getenv("AUDIO_STEADY"); steady = e ? atoi(e) : 1; }
     enum { FIFO_N = 24 };
-    static float fifo[FIFO_N][CELL_AUDIO_BLOCK_SAMPLES * 2];
+    static float fifo[FIFO_N][CELL_AUDIO_BLOCK_SAMPLES * AUDIO_CHMAP_MAX];
     unsigned fhead = 0, fcount = 0;
     HANDLE tmr = CreateWaitableTimerExW(NULL, NULL, 0x00000002 /* HIGH_RESOLUTION */, TIMER_ALL_ACCESS);
     if (!tmr) tmr = CreateWaitableTimerW(NULL, FALSE, NULL);
@@ -1309,6 +1468,7 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
     if (ao_want && audio_backend_room() >= 0) {
         AudioOutConfig cfg;
         audio_out_default_config(&cfg, CELL_AUDIO_SAMPLE_RATE, audio_buffer_ms());
+        cfg.channels = s_out_ch;
         unsigned period = 0;
 #if AUDIO_BACKEND_WASAPI
         period = (unsigned)(s_wasapi_period_100ns * CELL_AUDIO_SAMPLE_RATE / 10000000);
@@ -1324,7 +1484,7 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
     memset(&acc_log, 0, sizeof acc_log); memset(&acc_win, 0, sizeof acc_win);
     ULONGLONG aw_t0 = GetTickCount64();
     unsigned sess_underruns = 0, dev_dry_total = 0, win_dry0 = 0;
-    static float ao_buf[4096 * 2];
+    static float ao_buf[4096 * AUDIO_CHMAP_MAX];
     const long long period_q = (long long)CELL_AUDIO_BLOCK_SAMPLES * qf.QuadPart / CELL_AUDIO_SAMPLE_RATE;
     unsigned target_frames = audio_buffer_ms() * CELL_AUDIO_SAMPLE_RATE / 1000;
     int ao_log_ms = 0, late_ms = 20, catchup = 3, pause_freeze = 1;
@@ -1354,7 +1514,7 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
     int primed = 0, dev_dry_flag = 0;
     unsigned dev_dry = 0, waits = 0, caught = 0, gave_up = 0, resyncs = 0;
     long long slip_q = 0, wait_q0 = 0, late_max_q = 0;
-    float el_last_l = 0.0f, el_last_r = 0.0f;   /* PORT_AUDIO_ELASTIC: last output frame */
+    float el_last[AUDIO_CHMAP_MAX] = { 0 };   /* PORT_AUDIO_ELASTIC: last output frame */
     { char dev[160], mm[48], outs[256];
 #if AUDIO_BACKEND_WASAPI
       if (s_wasapi_client)
@@ -1386,6 +1546,7 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
             want_restart = 0;
             if (ao) {
                 AudioOutConfig c = *audio_out_config(ao);
+                c.channels = s_out_ch;
                 const int room = audio_backend_room() + (int)audio_backend_queued_samples();
                 if (room > 0 && c.device_frames > (unsigned)room) c.device_frames = (unsigned)room;
                 AudioOut* n = audio_out_create(&c);
@@ -1417,6 +1578,7 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
 #endif
                         if (ao) {   /* drop the audio queued while the device was gone */
                             AudioOutConfig c = *audio_out_config(ao);
+                            c.channels = s_out_ch;   /* the new default device may have another layout */
                             const int room = audio_backend_room() + (int)audio_backend_queued_samples();
                             if (room > 0 && c.device_frames > (unsigned)room) c.device_frames = (unsigned)room;
                             AudioOut* n = audio_out_create(&c);
@@ -1552,9 +1714,9 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
                  * output frame fades to 0 over 128 frames, then silence; no guest notify */
                 for (u32 s = 0; s < CELL_AUDIO_BLOCK_SAMPLES; s++) {
                     const float g = s < 128 ? (float)(127 - s) / 128.0f : 0.0f;
-                    s_mix_buffer[s * 2] = el_last_l * g; s_mix_buffer[s * 2 + 1] = el_last_r * g;
+                    for (u32 o = 0; o < s_out_ch; o++) s_mix_buffer[s * s_out_ch + o] = el_last[o] * g;
                 }
-                el_last_l = el_last_r = 0.0f;
+                memset(el_last, 0, sizeof el_last);
                 audio_el_on_conceal(&s_el);
                 g_audio_held_tick = 1;
             } else {
@@ -1563,18 +1725,17 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
                     if (s_el.run) {   /* back from concealment: fade in */
                         for (u32 s = 0; s < 128; s++) {
                             const float g = (float)(s + 1) / 129.0f;
-                            s_mix_buffer[s * 2] *= g; s_mix_buffer[s * 2 + 1] *= g;
+                            for (u32 o = 0; o < s_out_ch; o++) s_mix_buffer[s * s_out_ch + o] *= g;
                         }
                         s_el.run = 0;
                     }
                     audio_el_on_mixed(&s_el);
-                    el_last_l = s_mix_buffer[(CELL_AUDIO_BLOCK_SAMPLES - 1) * 2];
-                    el_last_r = s_mix_buffer[(CELL_AUDIO_BLOCK_SAMPLES - 1) * 2 + 1];
+                    for (u32 o = 0; o < s_out_ch; o++) el_last[o] = s_mix_buffer[(CELL_AUDIO_BLOCK_SAMPLES - 1) * s_out_ch + o];
                 }
             }
-            { static FILE* _wf = (FILE*)-1;   /* AUDIO_WAV=<file>: raw f32le stereo 48 kHz of the final mix */
+            { static FILE* _wf = (FILE*)-1;   /* AUDIO_WAV=<file>: raw f32le 48 kHz of the final mix, host channels ([audio] host output) */
               if (_wf == (FILE*)-1) { const char* e = getenv("AUDIO_WAV"); _wf = e ? fopen(e, "wb") : NULL; }
-              if (_wf) fwrite(s_mix_buffer, sizeof(float), CELL_AUDIO_BLOCK_SAMPLES * 2, _wf); }
+              if (_wf) fwrite(s_mix_buffer, sizeof(float), CELL_AUDIO_BLOCK_SAMPLES * s_out_ch, _wf); }
             if (ao) {
                 const unsigned qdev = audio_backend_queued_samples();
                 audio_out_push(ao, s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
@@ -1674,21 +1835,21 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
          * "is any port producing sound" is answerable (LBP Bink movie audio). */
         { static int _ap = -1; if (_ap < 0) _ap = getenv("AUDIO_PEAK") ? 1 : 0;
           if (_ap) { static unsigned _n = 0; float pk = 0.0f;
-            for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++) {
+            for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * s_out_ch; i++) {
                 float a = s_mix_buffer[i]; if (a < 0) a = -a; if (a > pk) pk = a; }
             if ((++_n % 200) == 0 || (pk > 0.001f && _n < 40))
                 fprintf(stderr, "[audio-peak] block#%u peak=%.4f\n", _n, pk); } }
-        /* AUDIO_WAV=<file>: append the final mix as raw f32le stereo 48 kHz
-         * (ffmpeg -f f32le -ar 48000 -ac 2 -i <file>). */
+        /* AUDIO_WAV=<file>: append the final mix as raw f32le 48 kHz, host channels
+         * (ffmpeg -f f32le -ar 48000 -ac <2|6|8> -i <file>). */
         { static FILE* _wf = (FILE*)-1;
           if (_wf == (FILE*)-1) { const char* e = getenv("AUDIO_WAV"); _wf = e ? fopen(e, "wb") : NULL; }
-          if (_wf) fwrite(s_mix_buffer, sizeof(float), CELL_AUDIO_BLOCK_SAMPLES * 2, _wf); }
+          if (_wf) fwrite(s_mix_buffer, sizeof(float), CELL_AUDIO_BLOCK_SAMPLES * s_out_ch, _wf); }
         audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
         /* AUDIO_RATE=1: blocks mixed vs real time, and frames dropped. */
         { static int on = -1; if (on < 0) on = getenv("AUDIO_RATE") ? 1 : 0;
           if (on) { static ULONGLONG t0; static unsigned n, z; static unsigned long long d0;
             ULONGLONG now = GetTickCount64(); if (!t0) t0 = now; n++;
-            { int nz = 0; for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++) if (s_mix_buffer[i] != 0.0f) { nz = 1; break; }
+            { int nz = 0; for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * s_out_ch; i++) if (s_mix_buffer[i] != 0.0f) { nz = 1; break; }
               if (!nz) z++; }
             if (now - t0 >= 5000) {
                 fprintf(stderr, "[audio-rate] %.1f blocks/s (real time 187.5), silent %.1f%%, dropped %.0f frames/s, device buf %u%c",

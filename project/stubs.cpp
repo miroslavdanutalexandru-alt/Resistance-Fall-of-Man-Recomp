@@ -848,13 +848,20 @@ extern "C" void rfom_fov_lod_fix(uint32_t cam, double f, double aspect)
  * "2ch_90". The two run on different threads; when the sound setup won the
  * race it read the initial 2 and the whole session mixed in the 2ch layout
  * (only L/R, quieter, positions wrong). Return the configured layout either
- * way. RFOM_SPEAKERS=6 (default) / 8 / 2 (= the game's stereo layout always). */
+ * way. RFOM_SPEAKERS=6 / 8 / 2 (= the game's stereo layout always); unset =
+ * 8 on a 7.1 host output, else 6 (GitHub R1 #39: cellAudio now plays every
+ * channel discretely on a 5.1 / 7.1 device). An explicit value also wins over
+ * the audio-out setup's own value. */
+extern "C" int cellAudio_host_channels(void);
 extern "C" uint32_t rfom_speakers(uint32_t v)
 {
-    static int sp = -1;
-    if (sp < 0) { const char* e = getenv("RFOM_SPEAKERS"); sp = e ? atoi(e) : 6;
-                  if (sp != 2 && sp != 6 && sp != 8) sp = 6; }
+    static int sp = -1, forced = 0;
+    if (sp < 0) { const char* e = getenv("RFOM_SPEAKERS"); sp = (e && *e) ? atoi(e) : 0;
+                  forced = sp == 2 || sp == 6 || sp == 8;
+                  if (!forced) sp = cellAudio_host_channels() >= 8 ? 8 : 6;
+                  fprintf(stderr, "[audio] game speaker layout %d ch%s%c", sp, forced ? " (RFOM_SPEAKERS)" : "", 10); }
     if (sp == 2) return 2;
+    if (forced && v != (uint32_t)sp) return (uint32_t)sp;
     if (v == 2) {
         static int n = 0;
         if (n < 2) { n++; fprintf(stderr, "[audio] speaker layout read before the audio-out setup -- using %d channels%c", sp, 10); }

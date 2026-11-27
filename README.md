@@ -335,7 +335,8 @@ Button: **Rebuild shader cache** (asks first).
 
 | Setting | Choices (default) | Environment variable | Notes |
 |---|---|---|---|
-| Speaker layout | **5.1 surround**, 7.1 surround, Stereo | `RFOM_SPEAKERS=6\|8\|2` | |
+| Speaker layout | **Auto**, 7.1 surround, Stereo, 5.1 surround | `RFOM_SPEAKERS=8\|2\|6` | Auto = 7.1 on a 7.1 output, else 5.1 |
+| Audio output | **Auto**, Stereo, 5.1, 7.1 | `PORT_AUDIO_CHANNELS=2\|6\|8` | Auto = the Windows device's speaker setup |
 | Audio buffer | **Auto** (100 ms; 150 ms under 12 CPU threads), 80, 100, 150, 200 ms | `PORT_AUDIO_BUFFER_MS` | See *Audio*. |
 | In the background | **Pause and mute**, Mute only, Keep running | `RSX_FOCUS_PAUSE=0\|1`, `RSX_FOCUS_MUTE=0\|1` | What happens on Alt+Tab or a click on another window. Pausing frees the CPU/GPU, releases the mouse and resumes exactly where you were. |
 
@@ -510,7 +511,9 @@ The overlay and the port's notifications (toasts: "Screenshot saved", the movie-
 | `RFOM_ZOOM_SENS` | `1.0` | Zoom-matched mouse speed when aiming / scoped: 1 = a mouse move covers the same part of the screen zoomed or not, 0 = off, up to 2. |
 | `RFOM_KEY_PROMPTS` | `1` | `0` = no keyboard / Xbox prompt text (PlayStation prompts always). |
 | `RFOM_PC_TEXT` | `1` | PC wording in the game's text, all languages: "PLAYSTATION®3" → "PC", "PLAYSTATION®Network" → "online service", HDD / save-icon / power-off warnings and "press and hold the PS button" → PC wording ("Press F10 to quit the game."), "wireless controller" → "controller". Only the text in memory changes (the game files aren't touched). Log: `[prompts] text file: N console wording(s) -> PC wording`. `0` = the original console wording. |
-| `RFOM_SPEAKERS` | `6` | Speaker layout: 6 = 5.1, 8 = 7.1, 2 = the game's stereo layout. |
+| `RFOM_SPEAKERS` | auto | Speaker layout: 6 = 5.1, 8 = 7.1, 2 = the game's stereo layout. Unset: 8 when the host output is 7.1, else 6. |
+| `PORT_AUDIO_CHANNELS` | auto | Host output channels: 2 / 6 / 8 (`stereo` / `5.1` / `7.1`). Unset: the Windows default device's mix format; a 5.1 / 7.1 device gets every PS3 channel on its own speaker (L R C LFE, Ls/Rs on the side pair, Lb/Rb on the back pair). The `[audio] host output:` log line shows what was opened. |
+| `PORT_AUDIO_SWAP_SURROUND` | `0` | `1`: PS3 Ls/Rs to the back speakers and Lb/Rb to the sides (if 7.1 surrounds sound swapped). |
 | `RFOM_GORE` | `1` | Full gore (as the US release); `0` = the console setting, `-1` = reduced. |
 | `PS3_MUTE`, `PS3_NO_AUDIO` | off | Mute / disable audio. |
 

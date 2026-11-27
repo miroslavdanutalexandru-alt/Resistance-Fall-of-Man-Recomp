@@ -30,6 +30,7 @@ typedef struct AudioOutConfig {
     unsigned resume_frames;  /* after an underrun, resume once this much is ready */
     unsigned device_frames;  /* most audio to hand to the device at once (PORT_AUDIO_DEVICE_MS) */
     unsigned ring_frames;    /* ring capacity; the oldest audio is dropped when full */
+    unsigned channels;       /* interleaved channels per frame (2; 6 / 8 for a surround device) */
 } AudioOutConfig;
 
 typedef struct AudioOutStats {
@@ -58,14 +59,14 @@ const AudioOutConfig* audio_out_config(const AudioOut* ao);
  * Returns the target applied, frames. Size ring_frames for the largest target at create. */
 unsigned  audio_out_set_target(AudioOut* ao, unsigned target_frames);
 
-/* Producer side: append mixed stereo frames. Returns frames stored. */
-unsigned audio_out_push(AudioOut* ao, const float* stereo, unsigned frames);
+/* Producer side: append mixed frames (cfg.channels interleaved). Returns frames stored. */
+unsigned audio_out_push(AudioOut* ao, const float* frames_in, unsigned frames);
 
 /* Once per guest block: update the tempo from the buffer level (device_queued
  * = frames the device holds, not yet played) and the statistics. */
 void audio_out_tick(AudioOut* ao, unsigned device_queued);
 
-/* Device side: write up to max_frames stereo frames to out; returns how many.
+/* Device side: write up to max_frames frames (cfg.channels interleaved) to out; returns how many.
  * May return silence (while dry) and 0 (nothing to do yet). */
 unsigned audio_out_render(AudioOut* ao, float* out, unsigned max_frames, unsigned device_queued);
 
