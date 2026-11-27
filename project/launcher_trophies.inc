@@ -10,7 +10,7 @@
 // shown (lt_layout -> lt_refresh); afterwards the files are re-read only when their size or time changes.
 //
 // R2 / R3 sources (the same the game uses, project/r*_trophies.cpp):
-//   trophy list + icons  gamefiles\PS3_GAME\TROPDIR\<comm id>_00\TROPHY.TRP  (TROP.SFM, TROPnnn.PNG)
+//   trophy list + icons  <game files folder>\PS3_GAME\TROPDIR\<comm id>_00\TROPHY.TRP  (TROP.SFM, TROPnnn.PNG)
 //   unlocks              (PS3_GAMEDATA_ROOT or gamedata)\trophies\<comm id>.json   (the runtime's record)
 //                        Saved Games\<game>\trophies.json                          (the port's mirror)
 //   merged: a trophy counts as earned if either has it; the earliest time wins.
@@ -126,7 +126,7 @@ static std::string lt_signature() { return lt_stat(lt_r1_profile()) + val(S_SAVE
 static std::string lt_comm_dir()
 {
     WIN32_FIND_DATAA fd; std::string comm;
-    HANDLE h = FindFirstFileA(path_of("gamefiles\\PS3_GAME\\TROPDIR\\*").c_str(), &fd);
+    HANDLE h = FindFirstFileA(gf_path("PS3_GAME\\TROPDIR\\*").c_str(), &fd);
     if (h != INVALID_HANDLE_VALUE) {
         do {
             if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && fd.cFileName[0] != '.') { comm = fd.cFileName; break; }
@@ -138,7 +138,7 @@ static std::string lt_comm_dir()
 static void lt_paths(std::string& trp, std::string& hle, std::string& mirror)
 {
     std::string comm = lt_comm_dir();
-    trp = comm.empty() ? "" : path_of(("gamefiles\\PS3_GAME\\TROPDIR\\" + comm + "\\TROPHY.TRP").c_str());
+    trp = comm.empty() ? "" : gf_path(("PS3_GAME\\TROPDIR\\" + comm + "\\TROPHY.TRP").c_str());
     if (comm.size() > 3 && comm.compare(comm.size() - 3, 3, "_00") == 0) comm.resize(comm.size() - 3);
     const char* gd = getenv("PS3_GAMEDATA_ROOT");
     hle = comm.empty() ? "" : (gd && *gd ? std::string(gd) : path_of("gamedata")) + "\\trophies\\" + comm + ".json";
@@ -177,7 +177,7 @@ static void lt_load()
     g_lt.source = "Earned in game and kept on this PC (Saved Games\\" LT_GAME "\\trophies.json).";
     std::vector<r2t::Trophy> list;
     if (trp.empty() || !r2t::load_trp(trp.c_str(), list)) {
-        g_lt.status = "The trophy list is read from the game's files (gamefiles\\PS3_GAME\\TROPDIR) after Setup.";
+        g_lt.status = "The trophy list is read from the game's files (PS3_GAME\\TROPDIR in the game files folder) after Setup.";
         return;
     }
     if (lt_trp_cached != trp + lt_stat(trp)) { lt_free_icons(); lt_read_icons(trp); lt_trp_cached = trp + lt_stat(trp); }

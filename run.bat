@@ -29,10 +29,15 @@ set "CHILD_RSX_MIDFLUSH=1"
 rem developer diagnostics are off in normal play. For a bug report only (not needed otherwise):
 rem   set "PS3_DEBUG=%~dp0logs\dbg.txt" + set "CHILD_PS3_FTRACE=99999:6:%~dp0logs\ftrace.txt" = F7 frame trace / F11 profile keys,
 rem   set "PORT_DEBUG_KEYS=1" = the renderer's debug keys. These keys overlap the photo mode / benchmark / extras keys.
-rem your copy of the game (Setup.bat put it here)
-set "PS3_VFS_ROOT=%~dp0gamefiles"
+rem your copy of the game: gamefiles\ (Setup.bat put it there), or the folder set in the launcher (Saves and tools,
+rem Game files folder: settings.bat PORT_GAMEFILES). A PS3_VFS_ROOT set before this line (in the environment, or by
+rem hand right here, like set "PS3_VFS_ROOT=E:\Games\gamefiles") wins over both. Updates replace run.bat, so prefer
+rem the launcher setting.
 rem Launcher.exe writes settings.bat (display mode, frame limit, vsync, filtering, keys)
 if exist settings.bat call settings.bat
+if not defined PS3_VFS_ROOT if defined PORT_GAMEFILES set "PS3_VFS_ROOT=%PORT_GAMEFILES%"
+if not defined PS3_VFS_ROOT set "PS3_VFS_ROOT=%~dp0gamefiles"
+if not exist "%PS3_VFS_ROOT%\PS3_GAME\USRDIR\" (set "RUNERR=Your game files were not found - run Setup.bat, or check the game files folder in the launcher, Saves and tools page." & goto missing)
 rem portable.txt: saves stay in this folder (gamedata) too
 if exist portable.txt set "RFOM_SAVE_DIR=portable"
 rem shader cache backup (outside the game folder, so Setup/updates can't wipe it): restore missing files before, save new ones after

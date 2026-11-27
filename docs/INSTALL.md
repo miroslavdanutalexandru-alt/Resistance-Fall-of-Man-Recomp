@@ -48,6 +48,9 @@ Disk space on the port drive, measured on a complete install:
 If you pick a game folder on the same drive as the port, Setup can move it instead of copying it, which saves
 the 15.5 GB for the game files. An ISO is always copied from (it is left as it is).
 
+The game files can live on another drive: after Setup, move the `gamefiles` folder and pick it in the launcher
+(**Saves & tools > Game files folder**). Updates and rebuilds then use it too (see the README FAQ).
+
 The build tools take about 8 GB on C: (Visual Studio Build Tools with the Windows SDK about 5 GB, LLVM about
 2.8 GB, CMake, Ninja and Python about 0.5 GB), plus temporary installer files.
 

@@ -463,6 +463,25 @@ std::string system_info(const std::string& root)
     s += fmt("Version:   %s\r\n", ver.empty() ? "?" : ver.c_str());
     const std::string git = git_info(root);
     if (!git.empty()) s += fmt("Git:       %s\r\n", git.c_str());
+    {   /* the game files folder (project\port_gamefiles.h): PS3_VFS_ROOT > settings.ini gamefiles= > <root>\gamefiles */
+        std::string gf, from = "default", ini;
+        char env[1024] = "";
+        const DWORD n = GetEnvironmentVariableA("PS3_VFS_ROOT", env, sizeof env);
+        if (n > 0 && n < sizeof env) { gf = env; from = "PS3_VFS_ROOT"; }
+        else if (read_file(root + "\\settings.ini", ini)) {
+            for (size_t at = 0; (at = ini.find("gamefiles=", at)) != std::string::npos; at += 10)
+                if (at == 0 || ini[at - 1] == '\n') {
+                    std::string v = ini.substr(at + 10, ini.find_first_of("\r\n", at) - at - 10);
+                    if (!v.empty()) { gf = v; from = "launcher setting"; } else { gf.clear(); from = "default"; }
+                }
+        }
+        while (gf.size() > 3 && (gf.back() == '\\' || gf.back() == '/')) gf.pop_back();
+        if (gf.empty()) gf = root + "\\gamefiles";
+        if (!_stricmp(gf.c_str(), (root + "\\gamefiles").c_str())) from = "default";
+        const bool ok = GetFileAttributesA((gf + "\\PS3_GAME\\PARAM.SFO").c_str()) != INVALID_FILE_ATTRIBUTES &&
+                        GetFileAttributesA((gf + "\\PS3_GAME\\USRDIR\\EBOOT.BIN").c_str()) != INVALID_FILE_ATTRIBUTES;
+        s += fmt("Game files: %s (%s)%s\r\n", gf.c_str(), from.c_str(), ok ? "" : " - NOT FOUND (PS3_GAME\\USRDIR\\EBOOT.BIN)");
+    }
     WIN32_FIND_DATAA fd;
     HANDLE h = FindFirstFileA((root + "\\build\\*.exe").c_str(), &fd);
     if (h != INVALID_HANDLE_VALUE) {

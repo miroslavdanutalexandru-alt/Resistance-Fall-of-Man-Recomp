@@ -607,16 +607,41 @@ static bool InstallPortable(const Lines& ids, bool msLicense, wstring& err, wstr
 }
 
 // ---------------------------------------------------------------- 2. the game copy
+// The game files folder: PS3_VFS_ROOT (environment), else the launcher's Game files folder (settings.ini gamefiles=),
+// else gamefiles\ here - the order of run.bat and setup.ps1 (project\port_gamefiles.h). Uninstall only ever deletes
+// gamefiles\ here, never a folder the player chose.
+static wstring GameDir() {
+    wstring d;
+    wchar_t v[1024];
+    const DWORD n = GetEnvironmentVariableW(L"PS3_VFS_ROOT", v, 1024);
+    if (n > 0 && n < 1024) d = v;
+    else if (FILE* f = _wfopen(P(L"settings.ini").c_str(), L"r")) {
+        char l[1024];
+        while (fgets(l, sizeof l, f)) {
+            if (strncmp(l, "gamefiles=", 10)) continue;
+            l[strcspn(l, "\r\n")] = 0;
+            wchar_t w[1024] = L"";
+            MultiByteToWideChar(CP_ACP, 0, l + 10, -1, w, 1024);   // the launcher writes it with the ANSI functions
+            d = w;                                                 // the last line wins, as in the launcher
+        }
+        fclose(f);
+    }
+    for (auto& c : d) if (c == L'/') c = L'\\';
+    while (d.size() > 3 && d.back() == L'\\') d.pop_back();
+    return d.empty() ? P(L"gamefiles") : d;
+}
+static bool GameDirCustom() { return _wcsicmp(GameDir().c_str(), P(L"gamefiles").c_str()) != 0; }
 static bool HaveGameFiles() {
-    if (Exists(P(L"gamefiles.copying"))) return false;
-    if (g_prof.required.empty()) return Exists(P(L"gamefiles\\PS3_GAME\\USRDIR\\EBOOT.BIN"));
-    for (auto& r : g_prof.required) if (!Exists(P(L"gamefiles\\" + r))) return false;
+    const wstring gd = GameDir();
+    if (Exists(gd + L".copying")) return false;
+    if (g_prof.required.empty()) return Exists(gd + L"\\PS3_GAME\\USRDIR\\EBOOT.BIN");
+    for (auto& r : g_prof.required) if (!Exists(gd + L"\\" + r)) return false;
     return true;
 }
 static KV CheckGame(const wstring& path) {
     wstring out = P(L"logs\\game_check.txt");
     DeleteFileW(out.c_str());
-    Run(PsFile(P(L"tools\\installer\\check_game.ps1")) + L" -Game " + Arg(path) + L" -Dest " + Arg(P(L"gamefiles")) + L" -Out " + Arg(out),
+    Run(PsFile(P(L"tools\\installer\\check_game.ps1")) + L" -Game " + Arg(path) + L" -Dest " + Arg(GameDir()) + L" -Out " + Arg(out),
         [](const wstring& l) { LogRaw(L"  check_game: " + l); });
     KV kv = ReadKV(out);
     if (kv.keys.empty()) { kv.keys = {L"status", L"code", L"problem"}; kv.vals = {L"skip", L"SCRIPT", L"The game check did not run (PowerShell blocked?)."}; }
@@ -1131,7 +1156,7 @@ static int RunSetupOnce(const Choice& c, const Jobs& j, wstring& stopMsg) {
                     int copyProg = -1;
                     if (StartsWith(base, L"2/5") && g_prof.minBytes > 0) {
                         if (copyTick++ % 2 == 0) {
-                            copyNow = dirBytes(P(L"gamefiles"));
+                            copyNow = dirBytes(GameDir());
                             if (copy0 < 0) { copy0 = copyNow; copyT0 = now; }
                         }
                         double total = std::max(g_prof.minBytes, copyNow * 1.01);
@@ -1293,9 +1318,14 @@ static void SetupWorker(Choice c) {
         PutState(L"phase", L"game");
         SetStep(L"Checking your game copy");
         bool have = HaveGameFiles();
+        if (!have && GameDirCustom()) {   // a folder the player chose is never filled here (setup.ps1 stops too)
+            Fail(L"Your game files folder " + GameDir() + L" is missing or not complete.",
+                 L"Connect its drive, or pick it again in the launcher (Saves & tools > Game files folder), or choose Use default there.");
+            goto out;
+        }
         if (!have) {
             if (c.game.empty()) {
-                Fail(Exists(P(L"gamefiles.copying")) ? L"Copying the game was interrupted." : L"No game copy picked yet.",
+                Fail(Exists(GameDir() + L".copying") ? L"Copying the game was interrupted." : L"No game copy picked yet.",
                      L"Pick your " + g_prof.name + L" ISO or game folder (ISO... or Folder...) and click " + (Exists(StatePath()) ? L"Resume." : L"Install."));
                 goto out;
             }
@@ -1327,7 +1357,7 @@ static void SetupWorker(Choice c) {
         } else {
             c.game.clear();
             c.copyMode.clear();
-            Say(L"Game files already in place: " + P(L"gamefiles"));
+            Say(L"Game files already in place: " + GameDir());
             double freeB = (double)FreeBytes(g_port);
             if (!Exists(P(L"Launcher.exe")) && freeB < g_prof.buildBytes)
                 Say(L"Warning: only " + GB(freeB) + L" free; the build needs about " + GB(g_prof.buildBytes) + L".");
@@ -1440,9 +1470,9 @@ static int DryRun() {
     bool have = HaveGameFiles();
     double gameBytes = 0;
     wstring copyMode;
-    ConsoleWrite(have ? L"   gamefiles\\ is complete: setup.ps1 skips the copy\r\n"
-                      : Exists(P(L"gamefiles.copying")) ? L"   gamefiles.copying exists: the last copy was interrupted, it is redone\r\n"
-                                                         : L"   no game copy in gamefiles\\ yet\r\n");
+    ConsoleWrite(have ? L"   " + GameDir() + L" is complete: setup.ps1 skips the copy\r\n"
+                      : Exists(GameDir() + L".copying") ? L"   " + GameDir() + L".copying exists: the last copy was interrupted, it is redone\r\n"
+                                                         : L"   no game copy in " + GameDir() + L" yet\r\n");
     wstring game = g_opt.game.empty() ? GetState(L"game") : g_opt.game;
     if (!game.empty()) {
         KV kv = CheckGame(game);
@@ -1528,8 +1558,8 @@ static void UpdateGoButton() {
     SetWindowTextW(h_go, phase.empty() ? L"Install" : phase == L"done" ? L"Rebuild" : L"Resume");
 }
 static void ShowGameState() {
-    if (HaveGameFiles()) SetWindowTextW(h_gameSt, (L"\x2713 Your game is already copied into " + P(L"gamefiles") + L". You don't need to pick it again.").c_str());
-    else if (Exists(P(L"gamefiles.copying"))) SetWindowTextW(h_gameSt, L"The last copy of the game was interrupted. Pick the same ISO or folder again (it is filled in if Setup remembers it) and click Resume.");
+    if (HaveGameFiles()) SetWindowTextW(h_gameSt, (L"\x2713 Your game is already copied into " + GameDir() + L". You don't need to pick it again.").c_str());
+    else if (Exists(GameDir() + L".copying")) SetWindowTextW(h_gameSt, L"The last copy of the game was interrupted. Pick the same ISO or folder again (it is filled in if Setup remembers it) and click Resume.");
     else SetWindowTextW(h_gameSt, (L"Pick your own copy of " + g_prof.name + L" (" + g_prof.region + L" disc, " + g_prof.titleId + L", " + g_prof.sizeLabel +
                                    L"): a decrypted .iso, or the folder that contains PS3_GAME.").c_str());
 }
