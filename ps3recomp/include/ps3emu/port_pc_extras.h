@@ -170,6 +170,58 @@ static inline int pcx_btn_conv(PcxBtnConv* c, int mode, int pressed, unsigned lo
     if (c->phase == 0 && c->held != (pressed != 0)) { c->phase = 1; c->t0 = now_ms; c->held = !c->held; }
     return c->phase == 1;
 }
+/* Hold-to-zoom on a game whose zoom button is a toggle (Resistance R3). After the button is let go, while the
+ * game is still zoomed (zoomed / fov: the view FOV it set), the button is clicked for it. Timed in game frames
+ * as well as ms (frames: a counter the game's per-frame code bumps), so a slow frame can't swallow the gap
+ * before the click or the click itself; and checked afterwards: if the game is still zoomed and its FOV isn't
+ * widening (it missed or ignored the click, or zoomed again on its own -- e.g. after a reload), it is clicked
+ * again, up to PCX_AIM_TRIES times within PCX_AIM_WINDOW_MS of letting go. reset = in a menu: no clicks, the
+ * release is still remembered. Returns whether the button is to be pressed in addition to the real one. */
+#define PCX_AIM_GAP_MS 40u
+#define PCX_AIM_PULSE_MS 60u
+#define PCX_AIM_FRAMES 3u
+#define PCX_AIM_VERIFY_MS 400u
+#define PCX_AIM_VERIFY_FRAMES 8u
+#define PCX_AIM_WINDOW_MS 3000u
+#define PCX_AIM_WINDOW_FRAMES 60u
+#define PCX_AIM_GIVEUP_MS 10000u
+#define PCX_AIM_TRIES 3
+#define PCX_AIM_WIDEN_DEG 0.25
+typedef struct {
+    int prev;                 /* physical state last call */
+    int armed;                /* let go recently: the game should end up not zoomed */
+    int pulse;                /* a click is being held */
+    int tries;                /* clicks sent since the release */
+    unsigned long long rel_t, t0;
+    unsigned long rel_f, f0;
+    double fov0;              /* FOV at t0 (or the last time it was not zoomed) */
+} PcxAimHold;
+static inline int pcx_aim_hold(PcxAimHold* a, int pressed, int zoomed, double fov, unsigned long long now_ms,
+                               unsigned long frames, int reset)
+{
+    const int released = !pressed && a->prev;
+    a->prev = pressed;
+    if (pressed) { a->armed = 0; a->pulse = 0; return 0; }
+    if (released) {
+        a->armed = 1; a->pulse = 0; a->tries = 0;
+        a->rel_t = a->t0 = now_ms; a->rel_f = a->f0 = frames; a->fov0 = fov;
+    }
+    if (!a->armed) return 0;
+    if (a->pulse) {
+        if (!reset && (now_ms - a->t0 < PCX_AIM_PULSE_MS || frames - a->f0 < PCX_AIM_FRAMES)) return 1;
+        a->pulse = 0; a->t0 = now_ms; a->f0 = frames; a->fov0 = fov;
+    }
+    if (now_ms - a->rel_t >= PCX_AIM_GIVEUP_MS ||
+        (now_ms - a->rel_t >= PCX_AIM_WINDOW_MS && frames - a->rel_f >= PCX_AIM_WINDOW_FRAMES)) { a->armed = 0; return 0; }
+    if (reset) return 0;
+    if (!zoomed) { a->fov0 = fov; return 0; }
+    if (now_ms - a->t0 < (a->tries ? PCX_AIM_VERIFY_MS : PCX_AIM_GAP_MS) ||
+        frames - a->f0 < (a->tries ? PCX_AIM_VERIFY_FRAMES : PCX_AIM_FRAMES)) return 0;
+    if (fov > a->fov0 + PCX_AIM_WIDEN_DEG) { a->t0 = now_ms; a->f0 = frames; a->fov0 = fov; return 0; }   /* zooming out */
+    if (a->tries >= PCX_AIM_TRIES) { a->armed = 0; return 0; }
+    a->tries++; a->pulse = 1; a->t0 = now_ms; a->f0 = frames;
+    return 1;
+}
 /* Sprint toggle on a button the game shares with crouch (Resistance 2 L2: a tap crouches, holding it while
  * moving sprints). Once the button has been held PCX_SPRINT_LATCH_MS while moving (the game is sprinting),
  * letting go keeps it held for the game until the player stops moving for PCX_SPRINT_STOP_MS or presses the

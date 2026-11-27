@@ -10,6 +10,37 @@ static int s_fail = 0, s_n = 0;
 static void put16(unsigned char* p, unsigned v) { p[0] = (unsigned char)v; p[1] = (unsigned char)(v >> 8); }
 static void put32(unsigned char* p, unsigned v) { put16(p, v & 0xFFFF); put16(p + 2, v >> 16); }
 
+/* A game whose zoom toggles on a button press it reads once a frame, with the FOV easing between 82 and
+ * 65 degrees. The player holds the zoom button for hold_ms from t=100; the game ignores the first
+ * `ignore` presses it reads after the release (busy), and with rezoom_ms it zooms in again by itself
+ * that long after the release (e.g. after a reload). Returns whether it is zoomed at the end. */
+static int aim_sim(unsigned frame_ms, unsigned hold_ms, int ignore, unsigned rezoom_ms, int* clicks)
+{
+    PcxAimHold a; unsigned long long t; unsigned long frames = 0;
+    int zoom = 0, last_read = 0, out = 0, released = 0;
+    double fov = 82.0;
+    memset(&a, 0, sizeof a);
+    *clicks = 0;
+    for (t = 0; t < 5000; t++) {
+        const int held = t >= 100 && t < 100 + hold_ms;
+        if (t >= 100 + hold_ms) released = 1;
+        if (t % 4 == 0) {
+            const int o = pcx_aim_hold(&a, held, fov < 81.5, fov, t, frames, 0);
+            if (o && !out) (*clicks)++;
+            out = o || held;
+        }
+        if (t % frame_ms == 0) {
+            frames++;
+            if (out && !last_read) { if (released && ignore > 0) ignore--; else zoom = !zoom; }
+            last_read = out;
+            if (rezoom_ms && t == 100 + hold_ms + rezoom_ms - (100 + hold_ms + rezoom_ms) % frame_ms) zoom = 1;
+            fov += ((zoom ? 65.0 : 82.0) - fov) * 0.3;
+            if (fov > 81.95) fov = 82.0;
+        }
+    }
+    return zoom;
+}
+
 int main(void)
 {
     /* 1 */
@@ -97,6 +128,31 @@ int main(void)
       pcx_btn_conv(&c, PCX_BTN_HOLD, 1, 10, 1);
       for (t = 20; t < 400; t += 10) { const int o = pcx_btn_conv(&c, PCX_BTN_HOLD, 1, t, 0); if (o && !last) downs++; last = o; }
       CHECK(downs == 0 && c.held == 1); }
+    { /* hold-to-zoom on a toggle (issue #37): whatever the frame time, letting go ends zoomed out */
+      static const unsigned fms[] = { 8, 16, 33, 45, 50, 70, 100 };
+      int k, j, clicks;
+      for (k = 0; k < (int)(sizeof fms / sizeof fms[0]); k++)
+      for (j = 0; j < 8; j++) {   /* let go at different points of a frame */
+          CHECK(aim_sim(fms[k], 600 + 11 * j, 0, 0, &clicks) == 0 && clicks == 1);
+          CHECK(aim_sim(fms[k], 30 + 11 * j, 0, 0, &clicks) == 0 && clicks <= 1);    /* a tap */
+          CHECK(aim_sim(fms[k], 600 + 11 * j, 1, 0, &clicks) == 0 && clicks == 2);   /* first click ignored */
+      }
+      CHECK(aim_sim(33, 600, 0, 1500, &clicks) == 0 && clicks == 2);        /* zoomed again by itself */
+      CHECK(aim_sim(33, 600, 0, 3500, &clicks) == 1);                       /* not long after the release */
+      CHECK(aim_sim(33, 600, 5, 0, &clicks) == 1 && clicks == PCX_AIM_TRIES); /* gives up */
+    }
+    { /* zoom hold: let go while the game zooms out on its own (sprint): no click; a menu sends none */
+      PcxAimHold a; unsigned long long t; unsigned long f = 0; double fov = 65.0; int o = 0;
+      memset(&a, 0, sizeof a);
+      pcx_aim_hold(&a, 1, 1, fov, 0, f, 0);
+      for (t = 4; t < 300; t += 4) { if (t % 16 == 0) { f++; fov += 1.0; } o |= pcx_aim_hold(&a, 0, fov < 81.5, fov, t, f, 0); }
+      CHECK(o == 0);
+      memset(&a, 0, sizeof a);
+      pcx_aim_hold(&a, 1, 1, 65.0, 0, 0, 0);
+      for (t = 4, o = 0; t < 1000; t += 4) o |= pcx_aim_hold(&a, 0, 1, 65.0, t, (unsigned long)(t / 16), 1);
+      CHECK(o == 0 && a.armed == 1);
+      for (o = 0; t < 1200; t += 4) o |= pcx_aim_hold(&a, 0, 1, 65.0, t, (unsigned long)(t / 16), 0);
+      CHECK(o == 1); }   /* out of the menu: the click */
     { /* hold: quick press + release (bounce) ends with the game standing */
       PcxBtnConv c; unsigned long long t; int downs = 0, last = 0;
       memset(&c, 0, sizeof c);

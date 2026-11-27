@@ -120,7 +120,7 @@ More input options (launcher → Controls page, written to `settings.bat`; log l
 |---|---|---|---|
 | Vertical sensitivity | 50%, 75%, **Same as horizontal**, 125%, 150%, 200% | `PAD_MOUSE_SENS_Y=0.1..4` | Up/down mouse speed relative to left/right (direct and stick mouse look). |
 | Zoomed sensitivity | 50%, 75%, **Same**, 125%, 150% | `RFOM_ADS_SENS=0.1..3` | Extra mouse multiplier while zoomed or scoped, on top of the automatic zoom matching (`RFOM_ZOOM_SENS`). |
-| Zoom | **Toggle** (PS3), Hold | `PAD_AIM_HOLD=1` | Hold: zoomed only while the zoom key / R3 is held. The game's zoom is a toggle, so the port presses zoom again when you let go (keyboard, mouse and the first controller). |
+| Zoom | **Toggle** (PS3), Hold | `PAD_AIM_HOLD=1` | Hold: zoomed only while the zoom key / R3 is held. The game's zoom is a toggle, so the port presses zoom again when you let go (keyboard, mouse and the first controller), timed in game frames, and again if the game is still zoomed a moment later (`PAD_AIM_HOLD_OLD=1`: the old one-shot press). |
 | Stick deadzone | **Default** (24%, per axis, as on PS3), 5-30% | `PAD_DEADZONE=0..0.9` | A radial deadzone for both controller sticks, rescaled so the full range stays usable. Raise it if the view drifts. |
 | Stick response curve | **Linear**, Fast, Precise, Very precise | `PAD_CURVE=0.5..3` (exponent; 1 = linear) | Above 1: small movements are slower for fine aiming; below 1: quicker. A curve other than 1 also switches the sticks to a radial 24% deadzone when none is chosen. |
 | Stick outer deadzone | **Off**, 5, 10, 15% | `PAD_OUTER_DEADZONE=0..50` | The outermost part of the stick's travel already counts as full deflection (worn sticks reach full turn speed). |

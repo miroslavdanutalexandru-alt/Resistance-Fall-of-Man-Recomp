@@ -451,13 +451,48 @@ static void pad_feat_init(void)
            s_pad_dz < 0.0 ? "per-axis " : "radial ", s_pad_dz < 0.0 ? 7849.0 / 32767.0 : s_pad_dz, s_pad_curve,
            s_pad_aim_hold ? "hold" : "toggle (game)");
 }
-/* Hold-to-zoom on top of the game's R3 toggle. `src` 0 keyboard, 1 controller; reset != 0
- * (menus) forgets the state. After R3 is let go, if the game is still zoomed (stubs.cpp
- * rfom_is_zoomed: the FOV it set is narrowed) within 0.5 s, R3 is pressed for 60 ms, starting
- * 40 ms after the release so the game sees a separate click. */
+/* Hold-to-zoom on top of the game's R3 toggle (pcx_aim_hold). `src` 0 keyboard, 1 controller; reset != 0
+ * (menus) sends no clicks. After R3 is let go, while the game is zoomed (stubs.cpp rfom_is_zoomed: the FOV
+ * it set is narrowed) R3 is clicked for it, timed in game frames (g_rfom_play_frames) as well as ms, and
+ * clicked again if the game stays zoomed (issue #37: a slow frame merged the 40 ms gap and the 60 ms click
+ * into one press, or the game zoomed again later, and the zoom stuck on). PAD_AIM_HOLD_OLD=1: the old
+ * one-shot click (40 ms after the release, 60 ms long, only within 0.5 s). */
 extern int rfom_is_zoomed(void);
+extern volatile double g_rfom_view_fov;
+volatile unsigned long g_rfom_play_frames = 0;   /* stubs.cpp rfom_mouselook_pre: one per player per frame in play */
 static u16 pad_aim_hold(int src, u16 btns, int reset)
 {
+    static int old = -1;
+    pad_feat_init();
+    if (!s_pad_aim_hold) return btns;
+    if (old < 0) { const char* e = getenv("PAD_AIM_HOLD_OLD"); old = (e && *e && *e != '0') ? 1 : 0;
+                   printf("[controls] zoom hold: %s\n", old ? "old one-shot click (PAD_AIM_HOLD_OLD)" : "frame-timed, checked"); }
+    if (!old) {
+        static PcxAimHold st[2];
+        static int said = 0;
+        const int was = st[src].tries;
+        if (pcx_aim_hold(&st[src], (btns & CELL_PAD_CTRL_R3) != 0, rfom_is_zoomed(), g_rfom_view_fov,
+                         GetTickCount64(), g_rfom_play_frames, reset)) btns |= CELL_PAD_CTRL_R3;
+        /* PAD_AIM_LIVE=1: every state change to logs\aimhold_live_<pid>.txt, flushed at once (watch it live) */
+        { static int live = -1; static FILE* lf = NULL; static int last[2] = { -1, -1 };
+          if (live < 0) { const char* e = getenv("PAD_AIM_LIVE"); live = (e && *e && *e != '0') ? 1 : 0;
+                          if (live) { char fn[64]; snprintf(fn, sizeof fn, "logs\\aimhold_live_%lu.txt", (unsigned long)GetCurrentProcessId());
+                                      lf = fopen(fn, "w"); } }
+          const PcxAimHold* a = &st[src];
+          const int key = a->prev | (a->armed << 1) | (a->pulse << 2) | (a->tries << 3) | ((reset != 0) << 6) | (rfom_is_zoomed() << 7);
+          if (lf && key != last[src]) {
+              last[src] = key;
+              fprintf(lf, "t=%llu src=%d frames=%lu held=%d armed=%d click=%d tries=%d menu=%d zoomed=%d fov=%.2f\n",
+                      GetTickCount64(), src, (unsigned long)g_rfom_play_frames, a->prev, a->armed, a->pulse, a->tries,
+                      reset != 0, rfom_is_zoomed(), (double)g_rfom_view_fov);
+              fflush(lf);
+          } }
+        if (st[src].tries != was && st[src].tries > 1 && said < 40) {
+            said++;
+            printf("[controls] zoom hold: still zoomed (FOV %.1f), R3 clicked again (%d)\n", (double)g_rfom_view_fov, st[src].tries);
+        }
+        return btns;
+    }
     static int prev[2];
     static ULONGLONG rel[2], pulse[2];
     pad_feat_init();
