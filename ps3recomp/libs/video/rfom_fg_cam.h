@@ -8,6 +8,8 @@
 #ifndef RFOM_FG_CAM_H
 #define RFOM_FG_CAM_H
 
+#include <math.h>
+
 /* 4x4 inverse (Gauss-Jordan, partial pivoting); 0 when singular */
 static inline int rfom_fgcam_inv(const double* m, double* out)
 {
@@ -52,6 +54,95 @@ static inline int rfom_fgcam_sl(const double* M, float* c2p, float* p2c)
         p2c[i] = ok ? (float)Mi[c * 4 + r] : (r == c ? 1.0f : 0.0f);
     }
     return ok;
+}
+
+/* RFOM_DLSS_FG_REAL_CAMERA (rfom_dlssg.cpp, default 1): Streamline's camera position / axes (cameraPos / Right / Up / Fwd) from the solved camera
+ * motion. R1 has no world view matrix (cam_solve only finds M = prevVP * inverse(curVP)), so the pose is accumulated:
+ * it starts at the identity and each frame applies the view-to-previous-view motion. Rotation: M's homography at
+ * infinite depth (stored depth f / (f - n)) through the intrinsics diag(xs, ys, 1); it does not depend on M's depth row,
+ * which cam_solve determines poorly (the full view-space map is 5-20 degrees off rigid on R1 dumps, the homography
+ * within 1e-3). Translation: the full map's, in the previous camera's axes. The axes are re-orthonormalised every frame
+ * (DLSS-G's scene change detection runs only when [right up fwd] is orthonormal). c2p: Streamline's clipToPrevClip
+ * (row vectors, the transpose of M); n / f: the depth range; xs / ys: the projection's x / y scales. A frame whose map
+ * is unusable keeps the last pose. Returns 1 when the pose moved with this frame's map. */
+typedef struct { double pos[3], right[3], up[3], fwd[3]; int init; } rfom_fgpose_t;
+
+static inline void rfom_fgpose_reset(rfom_fgpose_t* s)
+{
+    int i;
+    for (i = 0; i < 3; ++i) { s->pos[i] = 0.0; s->right[i] = i == 0; s->up[i] = i == 1; s->fwd[i] = i == 2; }
+    s->init = 1;
+}
+
+static inline int rfom_fgpose_orth(double* fw, double* rt, double* up)
+{
+    double l, a;
+    int i;
+    l = sqrt(fw[0] * fw[0] + fw[1] * fw[1] + fw[2] * fw[2]);
+    if (!(l > 1e-9)) return 0;
+    for (i = 0; i < 3; ++i) fw[i] /= l;
+    a = rt[0] * fw[0] + rt[1] * fw[1] + rt[2] * fw[2];
+    for (i = 0; i < 3; ++i) rt[i] -= a * fw[i];
+    l = sqrt(rt[0] * rt[0] + rt[1] * rt[1] + rt[2] * rt[2]);
+    if (!(l > 1e-9)) return 0;
+    for (i = 0; i < 3; ++i) rt[i] /= l;
+    up[0] = fw[1] * rt[2] - fw[2] * rt[1];   /* up = fwd x right: x right, y up, z forward */
+    up[1] = fw[2] * rt[0] - fw[0] * rt[2];
+    up[2] = fw[0] * rt[1] - fw[1] * rt[0];
+    return 1;
+}
+
+static inline int rfom_fgpose_step(rfom_fgpose_t* s, const float* c2p, double n, double f, double xs, double ys)
+{
+    double M[4][4], H[3][3], R[3][3], k[3], P[16], Pi[16], T[16], D[16], t[3], A, det, sc, ax[3][3], nx[3][3];
+    int i, j, r, q;
+    static const int rows[3] = { 0, 1, 3 };
+    if (!s->init) rfom_fgpose_reset(s);
+    if (!c2p || !(n > 0.0) || !(f > n) || !(xs > 0.0) || !(ys > 0.0)) return 0;
+    for (i = 0; i < 4; ++i)
+        for (j = 0; j < 4; ++j) {
+            M[i][j] = c2p[j * 4 + i];
+            if (!(M[i][j] == M[i][j]) || M[i][j] > 1e30 || M[i][j] < -1e30) return 0;
+        }
+    A = f / (f - n);
+    k[0] = xs; k[1] = ys; k[2] = 1.0;
+    for (i = 0; i < 3; ++i) {
+        H[i][0] = M[rows[i]][0]; H[i][1] = M[rows[i]][1]; H[i][2] = M[rows[i]][2] * A + M[rows[i]][3];
+    }
+    for (i = 0; i < 3; ++i)
+        for (j = 0; j < 3; ++j) R[i][j] = H[i][j] * k[j] / k[i];   /* column vectors: previous view dir = R * view dir */
+    det = R[0][0] * (R[1][1] * R[2][2] - R[1][2] * R[2][1]) - R[0][1] * (R[1][0] * R[2][2] - R[1][2] * R[2][0]) +
+        R[0][2] * (R[1][0] * R[2][1] - R[1][1] * R[2][0]);
+    if (!(det > 1e-12)) return 0;
+    sc = cbrt(det);
+    /* translation: the full view-to-previous-view map P * clipToPrevClip * P^-1 (row vectors), its last row */
+    for (i = 0; i < 16; ++i) P[i] = 0.0;
+    P[0] = xs; P[5] = ys; P[10] = A; P[11] = 1.0; P[14] = -n * A;
+    if (!rfom_fgcam_inv(P, Pi)) return 0;
+    for (i = 0; i < 4; ++i)
+        for (j = 0; j < 4; ++j) {
+            double a = 0.0;
+            for (r = 0; r < 4; ++r) a += P[i * 4 + r] * (double)c2p[r * 4 + j];
+            T[i * 4 + j] = a;
+        }
+    for (i = 0; i < 4; ++i)
+        for (j = 0; j < 4; ++j) {
+            double a = 0.0;
+            for (r = 0; r < 4; ++r) a += T[i * 4 + r] * Pi[r * 4 + j];
+            D[i * 4 + j] = a;
+        }
+    for (i = 0; i < 3; ++i) t[i] = D[15] != 0.0 ? D[12 + i] / D[15] : 0.0;
+    if (!(t[0] == t[0]) || !(t[1] == t[1]) || !(t[2] == t[2]) || fabs(t[0]) + fabs(t[1]) + fabs(t[2]) > 1e4) t[0] = t[1] = t[2] = 0.0;
+    /* this camera's axes / position in the previous camera's axes, then in the world */
+    for (q = 0; q < 3; ++q) { ax[0][q] = s->right[q]; ax[1][q] = s->up[q]; ax[2][q] = s->fwd[q]; }
+    for (i = 0; i < 3; ++i)
+        for (q = 0; q < 3; ++q) nx[i][q] = (R[0][i] * ax[0][q] + R[1][i] * ax[1][q] + R[2][i] * ax[2][q]) / sc;
+    if (!rfom_fgpose_orth(nx[2], nx[0], nx[1])) return 0;
+    for (q = 0; q < 3; ++q) {
+        s->pos[q] += t[0] * ax[0][q] + t[1] * ax[1][q] + t[2] * ax[2][q];
+        s->right[q] = nx[0][q]; s->up[q] = nx[1][q]; s->fwd[q] = nx[2][q];
+    }
+    return 1;
 }
 
 /* RFOM_DLSS_FG_REAL_CAM (default 1): the solved camera goes to DLSS-G; 0 = identity (camera never moves) */

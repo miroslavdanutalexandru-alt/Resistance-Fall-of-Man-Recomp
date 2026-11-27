@@ -247,6 +247,50 @@ static void row_mul(const double* v, const float* m, double* o)   // o = v * m (
 {
 	for (int j = 0; j < 4; ++j) o[j] = v[0] * m[j] + v[1] * m[4 + j] + v[2] * m[8 + j] + v[3] * m[12 + j];
 }
+// RFOM_DLSS_FG_REAL_CAMERA: the pose accumulated from clipToPrevClip is each camera in the first camera's axes
+static void test_pose()
+{
+	const double cam[3][5] = { { 0.27, 0.06, 0.9, 1.7, -3.3 }, { 0.30, 0.05, 1.0, 1.7, -3.0 }, { 0.45, -0.02, 1.4, 1.75, -2.6 } };
+	const auto rot = [](const double* c, double R[3][3]) {   // rows: right, up, fwd in the world (view_proj's Rx * Ry)
+		const double cy = std::cos(c[0]), sy = std::sin(c[0]), cp = std::cos(c[1]), sp = std::sin(c[1]);
+		const double Rm[3][3] = { { cy, 0, -sy }, { -sp * sy, cp, -sp * cy }, { cp * sy, sp, cp * cy } };
+		std::memcpy(R, Rm, sizeof Rm);
+	};
+	const double n = 0.25, f = 4000.0, ys = 1.0 / std::tan(0.55), xs = ys / (16.0 / 9.0);
+	rfom_fgpose_t s{};
+	double R0[3][3];
+	rot(cam[0], R0);
+	for (int k = 1; k < 3; ++k)
+	{
+		double cur[16], prev[16], ci[16], M[16];
+		view_proj(cam[k][0], cam[k][1], cam[k][2], cam[k][3], cam[k][4], cur);
+		view_proj(cam[k - 1][0], cam[k - 1][1], cam[k - 1][2], cam[k - 1][3], cam[k - 1][4], prev);
+		CHECK(rfom_fgcam_inv(cur, ci));
+		mul4(prev, ci, M);
+		float c2p[16], p2c[16];
+		CHECK(rfom_fgcam_sl(M, c2p, p2c) == 1);
+		CHECK(rfom_fgpose_step(&s, c2p, n, f, xs, ys) == 1);
+		double Rk[3][3];
+		rot(cam[k], Rk);
+		const double d[3] = { cam[k][2] - cam[0][2], cam[k][3] - cam[0][3], cam[k][4] - cam[0][4] };
+		const double* got[3] = { s.right, s.up, s.fwd };
+		for (int a = 0; a < 3; ++a)
+			for (int i = 0; i < 3; ++i)
+			{
+				const double want = R0[i][0] * Rk[a][0] + R0[i][1] * Rk[a][1] + R0[i][2] * Rk[a][2];
+				CHECK(std::fabs(got[a][i] - want) < 1e-4);
+				if (a == 0) CHECK(std::fabs(s.pos[i] - (R0[i][0] * d[0] + R0[i][1] * d[1] + R0[i][2] * d[2])) < 2e-3);
+			}
+	}
+	// unusable input keeps the pose
+	rfom_fgpose_t h = s;
+	float bad[16] = {};
+	CHECK(!rfom_fgpose_step(&h, bad, n, f, xs, ys) && h.fwd[0] == s.fwd[0] && h.pos[2] == s.pos[2]);
+	CHECK(!rfom_fgpose_step(&h, nullptr, n, f, xs, ys));
+	float id[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
+	CHECK(rfom_fgpose_step(&h, id, n, f, xs, ys) && std::fabs(h.fwd[0] - s.fwd[0]) < 1e-9 && std::fabs(h.pos[0] - s.pos[0]) < 1e-9);
+}
+
 static void test_cam_hold()
 {
     rfom_fgcam_hold_t h; std::memset(&h, 0, sizeof h);
@@ -644,6 +688,7 @@ int main()
 	test_gate();
 #ifdef PFG_R1
 	test_real_camera();
+	test_pose();
 	test_cam_hold();
 	test_medoid();
 	test_medoid_rel();
