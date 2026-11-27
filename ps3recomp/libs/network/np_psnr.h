@@ -34,15 +34,17 @@ int np_psnr_connected(void);
 /* Settle the player's name and server at startup, before the title runs; the
  * runtime's main passes --username and --psnr (either may be NULL).
  *   --psnr host[:port]  sets PS3_NET_ONLINE=1 and PSNR_SERVER.
- *   The name is --username, else PS3_NP_ONLINE_ID, else -- online only -- a
- *   random name (np_psnr_random_id). Offline with neither, nothing changes
- *   ("PS3Player").
+ *   The name is --username, else PS3_NP_ONLINE_ID, else -- online only
+ *   (PS3_NET_ONLINE, psnr server or not) -- the name saved in
+ *   PS3_NP_ID_FILE (default online_id.txt), else a new random name
+ *   (np_psnr_random_id) that is then saved there. Offline with neither,
+ *   nothing changes ("PS3Player").
  * Names follow PSN's online ID rules: 3-16 letters, digits, '-' or '_',
  * starting with a letter. */
 void np_psnr_setup(const char* username, const char* server);
 
-/* A random valid online ID, adjective + animal ("ExcitingHippo"). A port that
- * wants it to stick saves it (e.g. as PS3_NP_ONLINE_ID) for later runs. */
+/* A random valid online ID, adjective + animal ("ExcitingHippo").
+ * np_psnr_setup saves the one it picks, so it sticks across runs. */
 void np_psnr_random_id(char out[17]);
 
 /* The name the NP ID, psnr and the console identity (OpenPSID, MAC) derive
@@ -50,6 +52,14 @@ void np_psnr_random_id(char out[17]);
  * so offline saves are untouched. Resolves from the environment if main never
  * called np_psnr_setup. */
 const char* np_psnr_identity(void);
+
+/* What the console identity (OpenPSID, MAC) and the NP account ID derive
+ * from: the name plus the salt saved with it (PS3_NP_ID_FILE), so two players
+ * who end up with the same name are still two consoles and two accounts. A
+ * name set outright (--username, PS3_NP_ONLINE_ID) has no salt: the same name
+ * is the same player, which is what lets two local instances be told apart
+ * by name. NULL whenever np_psnr_identity is. */
+const char* np_psnr_identity_key(void);
 
 /* The player's online ID, and the P2P port this instance binds and advertises. */
 const char* np_psnr_online_id(void);

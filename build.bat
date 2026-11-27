@@ -1,45 +1,88 @@
 @echo off
 setlocal
+set "NOPAUSE="
+for %%A in (%*) do if /i "%%~A"=="nopause" set "NOPAUSE=1"
 cd /d "%~dp0"
 if not exist logs mkdir logs
 if not exist recompiled_game\ppu_recomp.h (echo The game code has not been generated yet - run Setup.bat first. & goto fail)
 rem A game window left open locks the .exe and the link fails -- close any that are still running.
-taskkill /IM ResistanceFoMGame.exe /F >nul 2>&1 && echo Closed a ResistanceFoMGame.exe that was still running.
-taskkill /IM ResistanceFoM.exe /F >nul 2>&1 && echo Closed a ResistanceFoM.exe that was still running.
+rem Close only a copy of ResistanceFoMGame.exe started from THIS folder (never one from another checkout).
+powershell -NoProfile -Command "$d=[IO.Path]::GetFullPath('%~dp0'); $k=0; Get-Process ResistanceFoMGame -EA 0 | ?{ $_.Path -and $_.Path.StartsWith($d,'OrdinalIgnoreCase') } | ForEach-Object { Stop-Process -Id $_.Id -Force; $k=1 }; if($k){ 'Closed a ResistanceFoMGame.exe that was still running.' }"
+rem Close only a copy of ResistanceFoM.exe started from THIS folder (never one from another checkout).
+powershell -NoProfile -Command "$d=[IO.Path]::GetFullPath('%~dp0'); $k=0; Get-Process ResistanceFoM -EA 0 | ?{ $_.Path -and $_.Path.StartsWith($d,'OrdinalIgnoreCase') } | ForEach-Object { Stop-Process -Id $_.Id -Force; $k=1 }; if($k){ 'Closed a ResistanceFoM.exe that was still running.' }"
 echo ============================================================
 echo  Resistance: Fall of Man - native PC build
 echo  Builds two programs: the front end (EBOOT) and the game (game.self).
 echo  The first build takes a long time. Leave it running.
 echo ============================================================
-set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
-set "VSDIR="
-for /f "usebackq delims=" %%I in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSDIR=%%I"
-if not defined VSDIR (echo Visual Studio C++ build tools not found - run Setup.bat. & goto fail)
-rem vcvars looks for vswhere on PATH (else it prints "'vswhere.exe' is not recognized")
-set "PATH=%PATH%;%ProgramFiles(x86)%\Microsoft Visual Studio\Installer"
-call "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" >nul
-if errorlevel 1 (echo Could not set up the Visual Studio build tools. & goto fail)
-set "PATH=C:\Program Files\LLVM\bin;C:\Program Files\CMake\bin;%LOCALAPPDATA%\Microsoft\WinGet\Links;%PATH%"
-set "FFOPT=-DPS3RECOMP_FFMPEG_RUNTIME=ON -DPS3RECOMP_FFMPEG_INCLUDE_DIR=%~dp0ffmpeg\include"
+rem Visual Studio (vcvars64) or the portable build tools in tools_cache\ - see tools\toolchain_env.bat
+call "%~dp0tools\toolchain_env.bat"
+if errorlevel 1 goto fail
+rem An MSYS2/Cygwin cmake found first on PATH reads D:/... as a relative path (configure then fails with paths like
+rem /d/<folder>/D:/...): fall back to the CMake that comes with Visual Studio, else stop with a clear message.
+if not exist tools\cmake_native_probe.cmake goto cmake_ok
+cmake -P tools/cmake_native_probe.cmake >nul 2>&1 && goto cmake_ok
+set "VSCMK=%VSDIR%\Common7\IDE\CommonExtensions\Microsoft\CMake"
+if exist "%VSCMK%\CMake\bin\cmake.exe" set "PATH=%VSCMK%\CMake\bin;%VSCMK%\Ninja;%PATH%"
+cmake -P tools/cmake_native_probe.cmake >nul 2>&1 || goto cmake_bad
+echo Using the CMake that comes with Visual Studio - the cmake found first on PATH is not a Windows build.
+goto cmake_ok
+:cmake_bad
+echo No Windows CMake was found. The cmake on PATH, if any, is an MSYS2/Cygwin build, which cannot build this port:
+where cmake 2>nul
+echo Install CMake for Windows - winget install Kitware.CMake, or https://cmake.org/download/ - or run Setup.bat, then try again.
+goto fail
+:cmake_ok
+rem the header path goes on the cmake lines in quotes of its own: quotes nested in set "..." would leave %~dp0
+rem unquoted, and a folder name with "&" or ")" would then break the line
+set "FFOPT=-DPS3RECOMP_FFMPEG_RUNTIME=ON"
+set "FFINC=%~dp0ffmpeg\include"
 set "PS=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
+rem files dated in the future (zip/installer time zones) make Ninja regenerate forever
+"%PS%" -NoProfile -ExecutionPolicy Bypass -File "%~dp0tools\fix_timestamps.ps1"
 if not defined RFOM_JOBS set "RFOM_JOBS=4"
+rem PGO (profile-guided optimisation): when pgo\r1.profdata exists (recorded with tools\pgo_train.bat, see README),
+rem the runtime (incl. the D3D12 renderer), the hand-written and the lifted SPU code of both programs are optimised
+rem with it. A profile older than the sources only loses part of the gain (changed functions are built without it).
+rem Opt out: set PORT_PGO=0 or "build.bat nopgo".
+set "PGOMODE=off"
+set "PGOPROF="
+if exist "%~dp0pgo\r1.profdata" set "PGOMODE=use"
+if "%PORT_PGO%"=="0" set "PGOMODE=off"
+if /i "%PORT_PGO%"=="off" set "PGOMODE=off"
+for %%A in (%*) do if /i "%%~A"=="nopgo" set "PGOMODE=off"
+rem pgo\r1.profdata is indexed profile format 13, which only clang 22 or newer can read (older clang stops with
+rem "unsupported instrumentation profile format version" on every file).
+set "CLANGMAJ=0"
+for /f "tokens=3" %%V in ('clang-cl --version 2^>nul ^| findstr /b /c:"clang version"') do for /f "delims=." %%M in ("%%V") do set "CLANGMAJ=%%M"
+set "CLANGFOUND=clang-cl %CLANGMAJ%"
+if "%CLANGMAJ%"=="0" set "CLANGFOUND=no clang-cl"
+if "%PGOMODE%"=="use" if %CLANGMAJ% LSS 22 (
+  echo ERROR: this build needs LLVM / clang-cl 22 or newer, found %CLANGFOUND%.
+  echo The PGO profile pgo\r1.profdata is in LLVM's profile format 13, which older clang cannot read.
+  echo Run Setup.exe or Setup.bat again to update LLVM, or install LLVM 22+ from https://github.com/llvm/llvm-project/releases
+  echo - or build without the profile: set PORT_PGO=0 or run "build.bat nopgo".
+  goto fail
+)
+if "%PGOMODE%"=="use" set "PGOPROF=%~dp0pgo\r1.profdata"
+if "%PGOMODE%"=="use" echo PGO: optimising with pgo\r1.profdata - set PORT_PGO=0 or run "build.bat nopgo" to build without it
 
 (
   echo Configuring front end...
-  cmake -S project -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DPORT_NAME=ResistanceFoM -DPS3RECOMP_DIR="%~dp0ps3recomp" -DRECOMP_DIR="%~dp0recompiled" -DRFOM_SPU_AVX2=ON %FFOPT% > logs\configure.log 2>&1
+  cmake -S project -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DPORT_NAME=ResistanceFoM -DPS3RECOMP_DIR="%~dp0ps3recomp" -DRECOMP_DIR="%~dp0recompiled" -DRFOM_SPU_AVX2=ON -DPORT_PGO=%PGOMODE% "-DPORT_PGO_PROFILE=%PGOPROF%" %FFOPT% "-DPS3RECOMP_FFMPEG_INCLUDE_DIR=%FFINC%" > logs\configure.log 2>&1
   if errorlevel 1 (echo Configure FAILED - see logs\configure.log & type logs\configure.log & goto fail)
 )
 echo [1/2] Building front end (EBOOT)...
-"%PS%" -NoProfile -Command "cmake --build build -j %RFOM_JOBS% 2>&1 | Tee-Object -FilePath logs\build.log; $c = $LASTEXITCODE; if (Select-String -Path logs\build.log -Pattern '^FAILED: |^ninja: build stopped' -Quiet) { $c = 1 }; exit $c"
+"%PS%" -NoProfile -ExecutionPolicy Bypass -File "%~dp0tools\build_tee.ps1" -BuildDir build -Jobs "%RFOM_JOBS%" -Log logs\build.log
 if errorlevel 1 (echo. & echo BUILD FAILED - see logs\build.log & goto fail)
 
 (
   echo Configuring game...
-  cmake -S project -B build_game -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DPORT_NAME=ResistanceFoMGame -DPS3RECOMP_DIR="%~dp0ps3recomp" -DRECOMP_DIR="%~dp0recompiled_game" -DRFOM_SPU_AVX2=ON %FFOPT% > logs\configure_game.log 2>&1
+  cmake -S project -B build_game -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DPORT_NAME=ResistanceFoMGame -DPS3RECOMP_DIR="%~dp0ps3recomp" -DRECOMP_DIR="%~dp0recompiled_game" -DRFOM_SPU_AVX2=ON -DPORT_PGO=%PGOMODE% "-DPORT_PGO_PROFILE=%PGOPROF%" %FFOPT% "-DPS3RECOMP_FFMPEG_INCLUDE_DIR=%FFINC%" > logs\configure_game.log 2>&1
   if errorlevel 1 (echo Configure FAILED - see logs\configure_game.log & type logs\configure_game.log & goto fail)
 )
 echo [2/2] Building game (game.self)...
-"%PS%" -NoProfile -Command "cmake --build build_game -j %RFOM_JOBS% 2>&1 | Tee-Object -FilePath logs\build_game.log; $c = $LASTEXITCODE; if (Select-String -Path logs\build_game.log -Pattern '^FAILED: |^ninja: build stopped' -Quiet) { $c = 1 }; exit $c"
+"%PS%" -NoProfile -ExecutionPolicy Bypass -File "%~dp0tools\build_tee.ps1" -BuildDir build_game -Jobs "%RFOM_JOBS%" -Log logs\build_game.log
 if errorlevel 1 (echo. & echo BUILD FAILED - see logs\build_game.log & goto fail)
 
 echo Building the launcher...
@@ -50,6 +93,11 @@ if errorlevel 1 (echo Launcher build failed - see logs\build_launcher.log) else 
 rem RFoMSwitch.exe keeps a black cover over the game window while a level load switches programs
 clang-cl /nologo /O2 /EHsc /W0 project\rfom_switch.cpp /Fo:build\rfom_switch.obj /Fe:build\RFoMSwitch.exe /link /SUBSYSTEM:WINDOWS user32.lib gdi32.lib > logs\build_switch.log 2>&1
 if errorlevel 1 (echo RFoMSwitch build failed - see logs\build_switch.log) else (copy /Y build\RFoMSwitch.exe build_game\ >nul)
+rem HDUIPack.exe: the launcher's Create HD UI pack button (project\hd_ui_pack.cpp + hd_ui_game_r1.h; reads the
+rem game's archive, upscales with tools\hdui_upscaler on the GPU (CPU if that fails), writes mods\hd_ui). Failure only disables that button.
+if not exist build\hdui mkdir build\hdui
+clang-cl /nologo /O2 /EHsc /W0 /std:c++17 /D_CRT_SECURE_NO_WARNINGS /I ps3recomp\include /I ps3recomp\libs\video /I ps3recomp\third_party\miniz /I ps3recomp\third_party\stb /I project project\hd_ui_pack.cpp ps3recomp\libs\video\rsx_texture_layout.c ps3recomp\libs\video\rsx_native_hot.c ps3recomp\third_party\miniz\miniz.c /Fo:build\hdui\ /Fe:HDUIPack.exe /link urlmon.lib bcrypt.lib > logs\build_hdui.log 2>&1
+if errorlevel 1 (echo HDUIPack build failed - see logs\build_hdui.log) else (echo HDUIPack.exe built)
 
 rem shaderscan: the launcher's optional offline shader-cache seeding. It lives in its own repository
 rem (https://github.com/miroslavdanutalexandru-alt/shaderscan, GPL-2.0); tools\get_shaderscan.ps1 downloads the release
@@ -89,8 +137,8 @@ for %%D in (build build_game) do if exist "tools\xess\bin\libxess.dll" copy /Y "
 echo.
 echo BUILD SUCCEEDED: build\ResistanceFoM.exe and build_game\ResistanceFoMGame.exe
 echo Start the game with Launcher.exe
-if /i not "%~1"=="nopause" pause
+if not defined NOPAUSE pause
 exit /b 0
 :fail
-if /i not "%~1"=="nopause" pause
+if not defined NOPAUSE pause
 exit /b 1

@@ -32,6 +32,21 @@ void spu_lockline_unlock(void) {}
 void spu_lockguard_check(spu_context* c,uint32_t ea,const uint8_t* p,uint32_t n,const char* what)
 { (void)c;(void)ea;(void)p;(void)n;(void)what; }
 void spu_ch_wake(spu_context* c) { (void)c; }
+/* DMA trace / put-record diagnostics referenced by spu_dma.h (spu_channels.c
+ * owns them in the runtime); inert here. */
+SPU_THREAD_LOCAL spu_dma_trace_ent g_spu_dma_ring[512];
+SPU_THREAD_LOCAL uint32_t g_spu_dma_ring_n;
+SPU_THREAD_LOCAL void* g_spu_putrec;
+SPU_THREAD_LOCAL int g_spu_dry_put;
+void spu_phys_trace(const spu_context* s,uint32_t cmd,uint32_t lsa,uint32_t ea,uint32_t size)
+{ (void)s;(void)cmd;(void)lsa;(void)ea;(void)size; }
+void spu_putrec_note(uint32_t ea,const uint8_t* src,uint32_t size) { (void)ea;(void)src;(void)size; }
+void spu_pmtrace(const void* c,uint32_t spu,uint32_t type,uint32_t a,uint32_t b,uint32_t d)
+{ (void)c;(void)spu;(void)type;(void)a;(void)b;(void)d; }
+/* SPU_DMA_FAST reads the reservation bitmap inline: one bit per 128-byte line
+ * of the 4 GB space, all clear (matches spu_coh_is_reserved above). */
+static unsigned char s_coh_bitmap[(0x100000000ull >> 7) >> 3];
+unsigned char* g_spu_coh_bitmap_p = s_coh_bitmap;
 
 static void check(int ok,const char* what)
 { if(!ok){fprintf(stdout,"FAIL: %s\n",what);exit(2);} }

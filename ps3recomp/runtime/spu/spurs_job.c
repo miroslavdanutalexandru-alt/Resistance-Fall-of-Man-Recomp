@@ -42,6 +42,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdatomic.h>
 #include "ps3emu/log_first.h"
 
 extern uint8_t* vm_base;
@@ -155,6 +156,55 @@ SPURS_JOB_TLS int g_spurs_job_mbox_valid;
 SPURS_JOB_TLS uint32_t g_spurs_job_spu_num;
 void spurs_job_set_spu_num(uint32_t n) { g_spurs_job_spu_num = n; }
 
+/* SPURS_JOB_DUMP, read once (it was two CRT getenv calls -- environment lock
+ * plus scan -- on every job). */
+static int spurs_job_dump_on(void)
+{
+    static int s_on = -1;
+    if (s_on < 0) s_on = getenv("SPURS_JOB_DUMP") ? 1 : 0;
+    return s_on;
+}
+
+/* A job's 256 KB local store was calloc'd and freed on every job: a heap round
+ * trip whose freed block the heap may decommit, so the next job paid page
+ * faults on top of the zeroing. A few buffers are kept and reused instead,
+ * zeroed on use exactly as calloc did; a job that finds every slot busy falls
+ * back to calloc. PORT_SPURS_JOB_LS_REUSE=0 restores calloc/free (perf final
+ * pass). */
+#define JOB_LS_POOL 8
+static uint8_t*   s_job_ls_pool[JOB_LS_POOL];
+static atomic_int s_job_ls_busy[JOB_LS_POOL];
+
+static int job_ls_reuse_on(void)
+{
+    static int s_on = -1;
+    if (s_on < 0) { const char* e = getenv("PORT_SPURS_JOB_LS_REUSE"); s_on = !(e && *e == '0'); }
+    return s_on;
+}
+
+static uint8_t* job_ls_get(int* slot)
+{
+    *slot = -1;
+    if (job_ls_reuse_on()) {
+        for (int i = 0; i < JOB_LS_POOL; i++) {
+            int z = 0;
+            if (!atomic_compare_exchange_strong(&s_job_ls_busy[i], &z, 1)) continue;
+            if (!s_job_ls_pool[i]) s_job_ls_pool[i] = (uint8_t*)malloc(SPU_LS_SIZE);
+            if (!s_job_ls_pool[i]) { atomic_store(&s_job_ls_busy[i], 0); break; }
+            memset(s_job_ls_pool[i], 0, SPU_LS_SIZE);
+            *slot = i;
+            return s_job_ls_pool[i];
+        }
+    }
+    return (uint8_t*)calloc(1, SPU_LS_SIZE);
+}
+
+static void job_ls_put(uint8_t* ls, int slot)
+{
+    if (slot < 0) free(ls);
+    else atomic_store(&s_job_ls_busy[slot], 0);
+}
+
 int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
                       uint32_t job_ea, uint32_t job_desc_size)
 {
@@ -179,7 +229,8 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
         return -1;
     }
 
-    uint8_t* ls = (uint8_t*)calloc(1, SPU_LS_SIZE);
+    int ls_slot;
+    uint8_t* ls = job_ls_get(&ls_slot);
     if (!ls) return -1;
 
     /* ---- binary at LS 0 (PIC, so delta 0 keeps the lifted addresses) ---- */
@@ -328,7 +379,7 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
      * The header's input-DMA-list/io fields are legitimately zero for it. Dump
      * the user data + that command block so the bail path is attributable. */
     uint32_t dump_cmd = 0;
-    if (getenv("SPURS_JOB_DUMP")) {
+    if (spurs_job_dump_on()) {
         uint64_t ud  = g64(job_ea + JH_SIZE);        /* desc+0x30 */
         uint32_t cmd = (uint32_t)ud;                 /* low word = EA */
         fprintf(stderr, "[spurs-job] job 0x%08X userdata: %016llX %016llX %016llX %016llX\n",
@@ -433,7 +484,7 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
           fprintf(stderr, "[spurs-job] job 0x%08X posted mbox=0x%08X intr=0x%08X\n",
                   job_ea, g_spurs_job_mbox, g_spurs_job_mbox_intr); }
 
-    if (getenv("SPURS_JOB_DUMP")) {
+    if (spurs_job_dump_on()) {
         fprintf(stderr, "[spurs-job] job 0x%08X exit: status=0x%X stop=0x%X pc=0x%05X\n",
                 job_ea, ctx.status, ctx.stop_code, ctx.pc);
         /* Post-run view of the same command block: the game polls result/status
@@ -453,6 +504,6 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
     spu_mfc_release(&ctx);
     spu_coh_unregister(&ctx);   /* stack local: out of the reserver set */
     { extern void spu_mfc_release(spu_context*); spu_mfc_release(&ctx); }
-    free(ls);
+    job_ls_put(ls, ls_slot);
     return 0;
 }

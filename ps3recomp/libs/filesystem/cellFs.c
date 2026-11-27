@@ -128,9 +128,14 @@ static int host_path_is_absolute(const char* path)
             (path[2] == '/' || path[2] == '\\'));
 }
 
+/* runtime/syscalls/sys_fs.c */
+extern int ps3_vfs_open_is_read_only(uint32_t flags);
+
 /* Translate a PS3 path to a host path. Returns 0 on success, -1 on failure.
+ * reading: the caller only reads the path, so a mods override may stand in for
+ * it (ps3_vfs_ps3game_fallback_ex); 0 for anything that writes or modifies.
  * Also exposed publicly as cellfs_translate_path() for use by other modules. */
-static int translate_path(const char* ps3_path, char* host_buf, size_t buf_size)
+static int translate_path(const char* ps3_path, char* host_buf, size_t buf_size, int reading)
 {
     init_default_mappings();
 
@@ -203,8 +208,8 @@ static int translate_path(const char* ps3_path, char* host_buf, size_t buf_size)
 #endif
     }
 
-    extern void ps3_vfs_ps3game_fallback(char* path, size_t cap);
-    ps3_vfs_ps3game_fallback(translated, sizeof(translated));
+    extern void ps3_vfs_ps3game_fallback_ex(char* path, size_t cap, int reading);
+    ps3_vfs_ps3game_fallback_ex(translated, sizeof(translated), reading);
     const size_t final_size = strlen(translated) + 1;
     if (final_size > buf_size) {
         host_buf[0] = '\0';
@@ -241,9 +246,11 @@ static const char* gpath(const char* guest)
     return (ea && vm_base) ? (const char*)(vm_base + ea) : (const char*)0;
 }
 
+/* Host code that only READS the file (the image decoders): a mods override may
+ * stand in for it. Not for a path that will be written. */
 int cellfs_translate_path(const char* ps3_path, char* host_buf, size_t buf_size)
 {
-    return translate_path(ps3_path, host_buf, buf_size);
+    return translate_path(ps3_path, host_buf, buf_size, 1);
 }
 
 /* ---------------------------------------------------------------------------
@@ -445,7 +452,7 @@ s32 cellFsOpen(const char* path, s32 flags, CellFsFd* fd, const void* arg, u64 s
         return CELL_EFAULT;
 
     char host_path[CELL_FS_MAX_FS_PATH_LENGTH];
-    if (translate_path(gpath(path), host_path, sizeof(host_path)) != 0) {
+    if (translate_path(gpath(path), host_path, sizeof(host_path), ps3_vfs_open_is_read_only((uint32_t)flags)) != 0) {
         /* gpath(), not the raw parameter: `path` is a GUEST address, and
          * printing it as a host string faults. The failure path was
          * crashing the moment any lookup missed. */
@@ -651,7 +658,7 @@ s32 cellFsStat(const char* path, CellFsStat* sb)
         return CELL_EFAULT;
 
     char host_path[CELL_FS_MAX_FS_PATH_LENGTH];
-    if (translate_path(gpath(path), host_path, sizeof(host_path)) != 0)
+    if (translate_path(gpath(path), host_path, sizeof(host_path), 1) != 0)
         return (s32)CELL_ENOENT;
 
     HOST_STAT_T hst;
@@ -683,7 +690,7 @@ s32 cellFsTruncate(const char* path, u64 size)
         return CELL_EFAULT;
 
     char host_path[CELL_FS_MAX_FS_PATH_LENGTH];
-    if (translate_path(gpath(path), host_path, sizeof(host_path)) != 0)
+    if (translate_path(gpath(path), host_path, sizeof(host_path), 0) != 0)
         return (s32)CELL_ENOENT;
 
 #ifdef _WIN32
@@ -757,7 +764,7 @@ s32 cellFsGetFreeSize(const char* path, u32* block_size, u64* free_block_count)
 #ifdef _WIN32
     {
         char host_path[CELL_FS_MAX_FS_PATH_LENGTH];
-        if (translate_path(gpath(path), host_path, sizeof(host_path)) == 0) {
+        if (translate_path(gpath(path), host_path, sizeof(host_path), 0) == 0) {
             ULARGE_INTEGER free_bytes;
             if (GetDiskFreeSpaceExA(host_path, &free_bytes, NULL, NULL)) {
                 free_blocks = (u64)(free_bytes.QuadPart / 4096);
@@ -796,7 +803,7 @@ s32 cellFsOpendir(const char* path, CellFsDir* fd)
         return CELL_EFAULT;
 
     char host_path[CELL_FS_MAX_FS_PATH_LENGTH];
-    if (translate_path(gpath(path), host_path, sizeof(host_path)) != 0)
+    if (translate_path(gpath(path), host_path, sizeof(host_path), 1) != 0)
         return (s32)CELL_ENOENT;
 
     CellFsDir slot = alloc_dir();
@@ -928,7 +935,7 @@ s32 cellFsMkdir(const char* path, s32 mode)
         return CELL_EFAULT;
 
     char host_path[CELL_FS_MAX_FS_PATH_LENGTH];
-    if (translate_path(gpath(path), host_path, sizeof(host_path)) != 0)
+    if (translate_path(gpath(path), host_path, sizeof(host_path), 0) != 0)
         return (s32)CELL_ENOENT;
 
     ensure_parent_dirs(host_path);
@@ -957,9 +964,9 @@ s32 cellFsRename(const char* from, const char* to)
     char host_from[CELL_FS_MAX_FS_PATH_LENGTH];
     char host_to[CELL_FS_MAX_FS_PATH_LENGTH];
 
-    if (translate_path(gpath(from), host_from, sizeof(host_from)) != 0)
+    if (translate_path(gpath(from), host_from, sizeof(host_from), 0) != 0)
         return (s32)CELL_ENOENT;
-    if (translate_path(gpath(to), host_to, sizeof(host_to)) != 0)
+    if (translate_path(gpath(to), host_to, sizeof(host_to), 0) != 0)
         return (s32)CELL_ENOENT;
 
     ensure_parent_dirs(host_to);
@@ -982,7 +989,7 @@ s32 cellFsUnlink(const char* path)
         return CELL_EFAULT;
 
     char host_path[CELL_FS_MAX_FS_PATH_LENGTH];
-    if (translate_path(gpath(path), host_path, sizeof(host_path)) != 0)
+    if (translate_path(gpath(path), host_path, sizeof(host_path), 0) != 0)
         return (s32)CELL_ENOENT;
 
     if (remove(host_path) != 0) {

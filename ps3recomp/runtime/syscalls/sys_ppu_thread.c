@@ -18,6 +18,7 @@
 #endif
 static PPU_TLS jmp_buf s_exit_jmp;
 static PPU_TLS int     s_exit_armed = 0;
+static PPU_TLS int     s_exit_finished = 0;   /* sys_ppu_thread_exit handed the slot to the joiner */
 
 #include <stddef.h>
 #include "sys_ppu_thread.h"
@@ -64,11 +65,97 @@ int ps3_host_prio_boost(void)
     }
     return (int)s;
 }
+
+/* Resistance port: low-core "no-spin" profile. Below 12 logical CPUs (in the
+ * process affinity mask) every busy-wait in the SPU / SPURS / usleep wait
+ * paths competes with the SPURS audio synth lane and the main thread for one
+ * of very few cores (scratch\cpu_nospin.md).
+ * When on, the wait paths whose own env var is unset switch to a short
+ * pause-only spin followed by a park on a writer-woken CV/event:
+ * spu_ch_wait (PORT_SPU_SPINWAIT=wait), sys_timer_usleep (PS3_USLEEP_PARK),
+ * SPURS (SPURS_TARGETED_WAKE). PORT_NOSPIN=0/old forces the old spinning
+ * behaviour (also off/false/no); unset or 1/on = the new one, on every CPU
+ * (the tested default); auto = on below 12 CPUs only, so
+ * >= 12-thread CPUs behave exactly as before. */
+int ps3_host_nospin(void)
+{
+    static volatile LONG s = -1;
+    if (s < 0) {
+        int v, n = 0;
+        DWORD_PTR pm = 0, sm = 0;
+        if (GetProcessAffinityMask(GetCurrentProcess(), &pm, &sm))
+            for (; pm; pm &= pm - 1) n++;
+        const char* e = getenv("PORT_NOSPIN");
+        if (!(e && *e)) v = 1;
+        else if (_stricmp(e, "auto")) v = !(!strcmp(e, "0") || !_stricmp(e, "old") || !_stricmp(e, "off") ||
+                                            !_stricmp(e, "false") || !_stricmp(e, "no"));
+        else v = n > 0 && n < 12;
+        if (InterlockedCompareExchange(&s, v, -1) == -1)
+            fprintf(stderr, "[nospin] %s (%d logical CPUs, PORT_NOSPIN=%s)\n",
+                    v ? "on: SPU/SPURS/usleep waits park after a short spin" : "off: spin waits as before",
+                    n, e && *e ? e : "default 1");
+    }
+    return (int)s;
+}
+
+/* Resistance port: physical-core scarcity (adapted from the inFAMOUS 2 PC
+ * port's ps3_host_core_scarce, host_place.c, MIT -- THIRD_PARTY_NOTICES.md).
+ * Counts the physical cores (SMT siblings share one) that hold a logical CPU of
+ * the process affinity mask; "scarce" = fewer than PORT_CORE_SCARCE_BELOW
+ * (default 6: a 4-core i3 / i5 is scarce, a 6-core is not). A scarce CPU gets
+ * the event-woken RSX frame clock instead of the busy spin (RFOM project/main.cpp
+ * RSX_SPINWAIT); Resistance 2 / 3 report it at start-up ([cores]).
+ * PORT_CORE_SCARCE=0/1 forces it. */
+int ps3_host_core_scarce(void)
+{
+    static volatile LONG s = -1;
+    if (s < 0) {
+        int phys = 0, logical = 0, below = 6, v;
+        /* The process's groups: GetProcessAffinityMask reports 0 for both masks once the
+         * process has threads in more than one processor group (Windows 11 / Server 2022
+         * with > 64 logical CPUs), so with one group compare that group's mask, and with
+         * several (or no answer) count every core in every group. */
+        USHORT groups[4] = { 0 }, ng = 4;
+        if (!GetProcessGroupAffinity(GetCurrentProcess(), &ng, groups)) ng = 0;
+        DWORD_PTR pm = 0, sm = 0;
+        if (ng != 1 || !GetProcessAffinityMask(GetCurrentProcess(), &pm, &sm)) pm = 0;
+        const int whole = pm == 0;   /* every group, every core */
+        if (whole) logical = (int)GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+        else for (DWORD_PTR m = pm; m; m &= m - 1) logical++;
+        DWORD len = 0;
+        GetLogicalProcessorInformationEx(RelationProcessorCore, NULL, &len);
+        unsigned char* buf = len ? (unsigned char*)malloc(len) : NULL;
+        if (buf && GetLogicalProcessorInformationEx(RelationProcessorCore,
+                       (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)buf, &len)) {
+            for (DWORD off = 0; off < len; ) {
+                const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX* p = (const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*)(buf + off);
+                if (p->Size == 0) break;
+                if (whole) phys++;
+                else
+                    for (WORD g = 0; g < p->Processor.GroupCount; g++)
+                        if (p->Processor.GroupMask[g].Group == groups[0] && (p->Processor.GroupMask[g].Mask & pm)) { phys++; break; }
+                off += p->Size;
+            }
+        }
+        free(buf);
+        if (phys <= 0 && logical > 0) phys = logical > 1 ? logical / 2 : 1;   /* SMT assumed */
+        const char* e = getenv("PORT_CORE_SCARCE_BELOW");
+        if (e && atoi(e) > 0) below = atoi(e);
+        v = phys > 0 && phys < below;   /* unknown core count: not scarce */
+        e = getenv("PORT_CORE_SCARCE");
+        if (e && *e) v = !(!strcmp(e, "0") || !_stricmp(e, "off") || !_stricmp(e, "false") || !_stricmp(e, "no"));
+        if (InterlockedCompareExchange(&s, v, -1) == -1)
+            fprintf(stderr, "[cores] %d physical / %d logical CPUs for this process%s -> %s (PORT_CORE_SCARCE%s, below %d)\n",
+                    phys, logical, whole ? " (all groups)" : "", v ? "scarce" : "plenty", e && *e ? "=forced" : "", below);
+    }
+    return (int)s;
+}
 #endif
 
 /* Port pause (PC menu, window-in-background pause): set by the port while the
  * game is paused. SPU channel polls nap instead of spinning while it is set. */
 volatile int g_ps3_host_paused = 0;
+volatile long g_ps3_host_pause_gen = 0;   /* bumped on every pause and resume (cellVdec stall log) */
 
 /* ---------------------------------------------------------------------------
  * Globals
@@ -130,6 +217,14 @@ static int find_free_slot(void)
             return i;
     }
     return -1;
+}
+
+/* PS3_THREAD_SLOT_FIX (default 1): see the thread proc epilogue. 0 = the old behaviour. */
+static int ppu_thread_slot_fix(void)
+{
+    static volatile int s = -1;
+    if (s < 0) { const char* e = getenv("PS3_THREAD_SLOT_FIX"); s = (e && *e == '0') ? 0 : 1; }
+    return s;
 }
 
 /* Find thread by ID. The ID is the index + 1 (0 is invalid). */
@@ -206,6 +301,22 @@ static void* ppu_host_thread_proc(void* param)
     } else {
         fprintf(stderr, "[THREAD %llu] g_ppu_thread_entry_trampoline is NULL — thread is a no-op!\n",
                 (unsigned long long)info->ctx.thread_id);
+    }
+
+    /* sys_ppu_thread_exit already marked this joinable thread FINISHED and woke its joiner, and the joiner may have
+     * freed the slot by now -- or a new thread taken it. Re-marking it FINISHED here leaked the slot for good (nobody
+     * joins it again): Resistance leaked several per movie until all 64 were gone, and the next movie's Demuxer /
+     * SourceFile creates failed with EAGAIN, which the game ignores and then waits forever (black screen, R1 #17).
+     * PS3_THREAD_SLOT_FIX=0: the old re-mark. */
+    if (s_exit_finished) {
+        s_exit_finished = 0;
+        if (ppu_thread_slot_fix()) {
+#ifdef _WIN32
+            return 0;
+#else
+            return NULL;
+#endif
+        }
     }
 
     /* Mark as finished */
@@ -402,6 +513,15 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
 
     int slot = find_free_slot();
     if (slot < 0) {
+        /* Games often ignore this error and then wait for a thread that never started: say so in the log. */
+        static int n_full = 0;
+        if (n_full++ < 8) {
+            int fin = 0;
+            for (int i = 0; i < PPU_THREAD_MAX; i++) fin += g_ppu_threads[i].state == PPU_THREAD_STATE_FINISHED;
+            const char* nm = name_addr ? (const char*)vm_to_host(name_addr) : "";
+            fprintf(stderr, "[SYS] sys_ppu_thread_create name=\"%.27s\" FAILED: all %d thread slots in use (%d finished, not joined)\n",
+                    nm, PPU_THREAD_MAX, fin);
+        }
         table_unlock();
         return (int64_t)(int32_t)CELL_EAGAIN;
     }
@@ -596,8 +716,10 @@ int64_t sys_ppu_thread_exit(ppu_context* ctx)
         /* A non-joinable host thread frees its slot in ppu_host_thread_proc, right after the
          * unwind below (freeing it here let a new thread take the slot while this one still ran its epilogue).
          * The main thread (slot 0) has no such epilogue and is marked FINISHED as before. */
-        if (t->joinable || t == &g_ppu_threads[0])
+        if (t->joinable || t == &g_ppu_threads[0]) {
             t->state = PPU_THREAD_STATE_FINISHED;
+            s_exit_finished = 1;   /* the slot is the joiner's now; the thread proc epilogue must not touch it */
+        }
 
 #ifdef _WIN32
         SetEvent(t->finish_event);

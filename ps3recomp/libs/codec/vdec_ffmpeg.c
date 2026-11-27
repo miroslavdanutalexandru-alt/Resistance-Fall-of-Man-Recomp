@@ -116,6 +116,19 @@ VdecFf* vdec_ff_open(u32 codec_type)
         /* One thread: pictures come out of the call that decoded them (or
          * the next ones, for reordering) rather than a frame-thread later. */
         d->ctx->thread_count = 1;
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#endif
+        /* VDEC_THREADS=N (opt-in; default 1 = unchanged, 0 = libavcodec auto):
+         * slice threading only -- frame threading would delay pictures. */
+        { const char* e = getenv("VDEC_THREADS");
+          if (e) { int t = atoi(e); if (t >= 0 && t <= 16 && t != 1) {
+              d->ctx->thread_count = t; d->ctx->thread_type = FF_THREAD_SLICE;
+              printf("[cellVdec] VDEC_THREADS=%d (slice threading)\n", t); } } }
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
     }
     if (!d->ctx || !d->pkt || !d->frame || ff->avcodec_open2(d->ctx, codec, NULL) < 0) {
         printf("[cellVdec] could not open the libavcodec decoder\n");

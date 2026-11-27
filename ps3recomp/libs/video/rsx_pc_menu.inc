@@ -10,18 +10,18 @@
  * anti-aliasing the next time the game starts. Quit to Desktop opens the
  * usual "Quit to desktop?" prompt (pc_prompt_run).
  *
- * A small hint box ("PC menu: F10") is shown while the game's own pause menu
- * is up (a pause press during play, then the look code stops) and once
- * ~12 s after start-up.
+ * No hint box is drawn over the game any more: the PC settings live in the
+ * game's own Options menu (project/rfom_menurows.cpp), and a topmost popup over
+ * the borderless flip-model swap chain forced DWM composition (flicker with
+ * V-Sync on, e.g. over the intro cutscene) and attached the window threads'
+ * input queues (owned window created from this thread).
  *
  *   RFOM_MENU_PC=0       F10 & co. open only the quit prompt (old behaviour)
- *   RFOM_MENU_PC_HINT=0  no hint box
  * -------------------------------------------------------------------------*/
 extern double cellpad_mouse_sens(void);               /* cellPad.c */
 extern void cellpad_set_mouse_sens(double s);
 extern void cellpad_set_glyph_pref(const char* v);
 extern void rfom_fov_set_live(double deg);             /* project/stubs.cpp */
-extern volatile unsigned long long g_rfom_play_ms;     /* project/stubs.cpp: look code ran */
 
 static int pm_enabled(void)
 {
@@ -119,10 +119,10 @@ static void pm_opts_init(void)
 {
     if (s_pm_init) return;
     s_pm_init = 1;
-    static const char* const fps[] = { "30  (PS3 original)", "30", "55", "55", "60", "60", "72", "72", "82", "82", "90", "90",
+    static const char* const fps[] = { "30  (PS3 original)", "30", "40", "40", "45", "45", "55", "55", "60", "60", "72", "72", "82", "82", "90", "90",
                                        "120", "120", "144", "144", "165", "165", "Unlimited", "0", NULL };
     const char* rf = getenv("CHILD_RFOM_FPS"); if (!rf || !*rf) rf = pm_env("RFOM_FPS", "60");
-    pm_add(PM_FPS, "Frame rate limit", "The game runs at the same speed at any limit. 60 is the most tested.",
+    pm_add(PM_FPS, "Frame rate", "The game runs at the same speed at any limit. 60 is the most tested.",
            "fps", "CHILD_RFOM_FPS", 1, fps, rf);
     static const char* const fsr[] = { "Off  (PS3 original)", "0", "AMD FSR 3.1", "1", "NVIDIA DLSS / DLAA", "2", "Intel XeSS", "3", NULL };
     pm_add(PM_FSR, "Anti-aliasing", "DLSS needs a GeForce RTX, XeSS runs on any GPU (both fall back to FSR). Upscaling preset: launcher.",
@@ -143,8 +143,8 @@ static void pm_opts_init(void)
     pm_add(PM_SENS, "Mouse sensitivity", "Also multiplied by the game's own Look Sensitivity option.", NULL, NULL, 0, NULL, "");
     static const char* const fov[] = { "82  (PS3 original)", "82", "90", "90", "100", "100", "110", "110", "120", "120", NULL };
     char fv[16]; snprintf(fv, sizeof fv, "%d", atoi(pm_env("RFOM_FOV", "82")) ? atoi(pm_env("RFOM_FOV", "82")) : 82);
-    pm_add(PM_FOV, "Field of view", "Horizontal degrees. Zoomed views keep their zoom.", "fov", "RFOM_FOV", 0, fov, fv);
-    static const char* const gl[] = { "Auto", "", "Xbox", "xbox", "PlayStation", "ps", NULL };
+    pm_add(PM_FOV, "Field of view", "Horizontal degrees. Applies at the next camera change (aim, respawn, checkpoint, level). Zoom kept.", "fov", "RFOM_FOV", 0, fov, fv);
+    static const char* const gl[] = { "Auto", "", "Keyboard keys", "keys", "Xbox", "xbox", "PlayStation", "ps", "Nintendo", "nintendo", NULL };
     pm_add(PM_PROMPTS, "Button prompts", "Which buttons the game shows with a controller (keyboard shows keys).",
            "padglyphs", "RFOM_PAD_GLYPHS", 0, gl, pm_env("RFOM_PAD_GLYPHS", ""));
 }
@@ -179,6 +179,19 @@ static void pm_step(int i, int d)
     }
     pm_apply(i);
 }
+/* The same rows for the game's own Options screen (project/rfom_menurows.cpp). */
+int rfom_pm_rows(void) { pm_opts_init(); return PM_COUNT; }
+void rfom_pm_row(int i, char* title, int tcap, char* val, int vcap)
+{
+    pm_opts_init();
+    title[0] = val[0] = 0;
+    if (i < 0 || i >= PM_COUNT) return;
+    snprintf(title, (size_t)tcap, "%s", s_pm[i].title);
+    if (i == PM_SENS) { snprintf(val, (size_t)vcap, "%.2fx", s_pm_sens); return; }
+    const PmOpt* o = &s_pm[i];
+    snprintf(val, (size_t)vcap, "%s%s", o->ch[o->sel].label, o->restart && o->sel != o->run ? " (restart)" : "");
+}
+void rfom_pm_change(int i, int d) { pm_opts_init(); if (i >= 0 && i < PM_COUNT && d) pm_step(i, d < 0 ? -1 : 1); }
 
 /* ---- the window ---------------------------------------------------------- */
 static int s_pm_page = 0, s_pm_sel = 0;
@@ -280,26 +293,11 @@ static LRESULT CALLBACK pm_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         HBITMAP bm = CreateCompatibleBitmap(dc, rc.right - rc.left, rc.bottom - rc.top);
         HGDIOBJ obm = SelectObject(mdc, bm);
         HBRUSH bg = CreateSolidBrush(RGB(18, 18, 20)); FillRect(mdc, &rc, bg); DeleteObject(bg);
-        const int hint = GetWindowLongPtrA(hwnd, GWLP_USERDATA) != 0;
-        HBRUSH fr = CreateSolidBrush(hint ? RGB(90, 90, 100) : RGB(170, 40, 30));
+        HBRUSH fr = CreateSolidBrush(RGB(170, 40, 30));
         FrameRect(mdc, &rc, fr);
         RECT r2 = { rc.left + 1, rc.top + 1, rc.right - 1, rc.bottom - 1 }; FrameRect(mdc, &r2, fr); DeleteObject(fr);
         SetBkMode(mdc, TRANSPARENT);
-        if (!hint) pm_paint(mdc, rc);
-        else {
-            const int H = rc.bottom - rc.top;
-            HFONT f1 = CreateFontA(-(H * 30 / 100), 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, OUT_TT_PRECIS, 0, ANTIALIASED_QUALITY, 0, "Bahnschrift SemiBold");
-            HFONT f2 = CreateFontA(-(H * 20 / 100), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, OUT_TT_PRECIS, 0, ANTIALIASED_QUALITY, 0, "Bahnschrift");
-            HGDIOBJ of = SelectObject(mdc, f1);
-            SetTextColor(mdc, RGB(240, 240, 240));
-            RECT t1 = { rc.left, rc.top + H * 10 / 100, rc.right, rc.top + H * 55 / 100 };
-            DrawTextA(mdc, "PC menu:  F10   or hold Esc / Start", -1, &t1, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-            SelectObject(mdc, f2);
-            SetTextColor(mdc, RGB(190, 190, 190));
-            RECT t2 = { rc.left, rc.top + H * 55 / 100, rc.right, rc.top + H * 90 / 100 };
-            DrawTextA(mdc, "PC Options  -  Quit to Desktop", -1, &t2, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-            SelectObject(mdc, of); DeleteObject(f1); DeleteObject(f2);
-        }
+        pm_paint(mdc, rc);
         BitBlt(dc, 0, 0, rc.right - rc.left, rc.bottom - rc.top, mdc, 0, 0, SRCCOPY);
         SelectObject(mdc, obm); DeleteObject(bm); DeleteDC(mdc);
         EndPaint(hwnd, &ps);
@@ -307,7 +305,7 @@ static LRESULT CALLBACK pm_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     }
     return DefWindowProcA(hwnd, msg, wp, lp);
 }
-static HWND pm_window(int hint)
+static HWND pm_window(void)
 {
     static int reg = 0;
     if (!reg) { reg = 1; WNDCLASSEXA wc = {0}; wc.cbSize = sizeof wc; wc.lpfnWndProc = pm_wndproc;
@@ -315,24 +313,36 @@ static HWND pm_window(int hint)
                 RegisterClassExA(&wc); }
     HWND w = CreateWindowExA(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, "rfom_pc_menu", "PC menu", WS_POPUP,
                              0, 0, 10, 10, s_d3d.hwnd, NULL, GetModuleHandle(NULL), NULL);
-    if (w) SetWindowLongPtrA(w, GWLP_USERDATA, hint);
     return w;
 }
-static void pm_place(HWND w, int hint)
+/* PORT_UI_SCALE (launcher, More PC Options "UI scale"): the menus already follow the output size,
+ * so auto = 100 %; 75..200 scales the panels (also rfom_pcextra.cpp's). Live via pc_ui_scale_set. */
+static volatile int s_pc_ui_scale = -1;
+void pc_ui_scale_set(const char* v) { s_pc_ui_scale = pcx_ui_scale_parse(v); }
+int pc_ui_scale_menu(void)
+{
+    if (s_pc_ui_scale < 0) pc_ui_scale_set(getenv("PORT_UI_SCALE"));
+    return s_pc_ui_scale > 0 ? s_pc_ui_scale : 100;
+}
+static void pm_place(HWND w)
 {
     RECT gr; if (!GetWindowRect(s_d3d.hwnd, &gr)) return;
     const int gw = gr.right - gr.left, gh = gr.bottom - gr.top;
     int ww, hh, x, y;
-    if (hint) {
-        ww = gw * 30 / 100; if (ww < 380) ww = 380;
-        hh = gh * 7 / 100; if (hh < 54) hh = 54;
-        x = gr.left + (gw - ww) / 2; y = gr.top + gh - hh - gh * 4 / 100;
-    } else {
-        int rh = gh * 55 / 1000; if (rh < 34) rh = 34;
+    {   int rh = gh * 55 / 1000; if (rh < 34) rh = 34;
         ww = gw * 44 / 100; if (ww < 560) ww = 560; if (ww > gw) ww = gw;
         hh = rh * (pm_rows() + 4); if (hh > gh) hh = gh;
         x = gr.left + (gw - ww) / 2; y = gr.top + (gh - hh) / 2;
     }
+    {   const int us = pc_ui_scale_menu();
+        if (us != 100) {
+            const int cx = x + ww / 2;
+            ww = pcx_ui_px(ww, us); hh = pcx_ui_px(hh, us);
+            if (ww > gw) ww = gw;
+            if (hh > gh) hh = gh;
+            x = cx - ww / 2;
+            y = gr.top + (gh - hh) / 2;
+        } }
     SetWindowPos(w, HWND_TOPMOST, x, y, ww, hh, SWP_NOACTIVATE | SWP_SHOWWINDOW);
     InvalidateRect(w, NULL, FALSE); UpdateWindow(w);
 }
@@ -393,11 +403,11 @@ static void pm_wait_release(void)
 static int pm_run(void)
 {
     pm_opts_init();
-    HWND w = pm_window(0);
+    HWND w = pm_window();
     if (!w) return pc_prompt_run();
     s_pm_page = 0; s_pm_sel = 0; s_pm_click = 0;
     pm_mouse_reset();
-    pm_place(w, 0);
+    pm_place(w);
     ClipCursor(NULL);
     fprintf(stderr, "[pcmenu] shown%c", 10);
     int armed = 0, prev = 0, result = -1;
@@ -417,20 +427,20 @@ static int pm_run(void)
         else if (e & (PM_LEFT | PM_RIGHT)) { if (s_pm_page == 1 && s_pm_sel < PM_COUNT) act = (e & PM_LEFT) ? -1 : 1; }
         else if (e & PM_YES) act = 1;
         else if (e & PM_CLOSE) result = 0;
-        else if (e & PM_NO) { if (s_pm_page == 1) { s_pm_page = 0; s_pm_sel = 1; pm_place(w, 0); } else result = 0; }
+        else if (e & PM_NO) { if (s_pm_page == 1) { s_pm_page = 0; s_pm_sel = 1; pm_place(w); } else result = 0; }
         if (!act) continue;
         if (s_pm_page == 0) {
             if (act < 0) continue;
             if (s_pm_sel == 0) result = 0;
-            else if (s_pm_sel == 1) { s_pm_page = 1; s_pm_sel = 0; pm_place(w, 0); }
+            else if (s_pm_sel == 1) { s_pm_page = 1; s_pm_sel = 0; pm_place(w); }
             else if (pm_more() && s_pm_sel == 2) { g_pc_more_menu(); result = 0; }   /* opens once this menu is closed */
             else {
                 ShowWindow(w, SW_HIDE);
                 if (pc_prompt_run()) result = 1;
-                else { pm_mouse_reset(); pm_place(w, 0); armed = 0; }  /* No: back to the menu */
+                else { pm_mouse_reset(); pm_place(w); armed = 0; }  /* No: back to the menu */
             }
         } else if (s_pm_sel >= PM_COUNT) {
-            if (act > 0) { s_pm_page = 0; s_pm_sel = 1; pm_place(w, 0); }
+            if (act > 0) { s_pm_page = 0; s_pm_sel = 1; pm_place(w); }
         } else { pm_step(s_pm_sel, act); InvalidateRect(w, NULL, FALSE); }
     }
     DestroyWindow(w);
@@ -438,35 +448,4 @@ static int pm_run(void)
     return result;
 }
 
-/* the hint box; called from pc_quit_thread every ~30 ms while no prompt is up */
-static HWND s_pm_hint = NULL;
-static int s_pm_hint_shown = 0;
-static void pm_hint_hide(void) { if (s_pm_hint_shown) { ShowWindow(s_pm_hint, SW_HIDE); s_pm_hint_shown = 0; } }
-static void pm_hint_tick(int fg)
-{
-    static int on = -1;
-    static ULONGLONG t_first = 0, pause_t = 0;
-    static int was_d = 0;
-    if (on < 0) {
-        const char* e = getenv("RFOM_MENU_PC_HINT");
-        on = pm_enabled() && (e && *e ? atoi(e) != 0 : 1);
-    }
-    if (!on || !s_d3d.hwnd) return;
-    const ULONGLONG now = GetTickCount64();
-    if (!t_first) t_first = now;
-    const ULONGLONG look = g_rfom_play_ms;
-    const int playing = look && now - look < 200;
-    const int d = (fg && ((GetAsyncKeyState(VK_ESCAPE) & 0x8000) || (GetAsyncKeyState(VK_RETURN) & 0x8000))) ||
-                  (pc_xinput_buttons() & XINPUT_GAMEPAD_START);
-    if (d && !was_d && playing) pause_t = now;
-    was_d = d;
-    if (pause_t && ((playing && now - pause_t > 600) || now - pause_t > 120000)) pause_t = 0;
-    const int want = fg && !s_quit_prompt && !rsx_focus_paused &&
-                     ((pause_t && !playing && now - pause_t > 250) || (!look && now - t_first > 12000 && now - t_first < 22000));
-    if (want && !s_pm_hint_shown) {
-        if (!s_pm_hint) s_pm_hint = pm_window(1);
-        if (s_pm_hint) { pm_place(s_pm_hint, 1); s_pm_hint_shown = 1; }
-    } else if (!want) pm_hint_hide();
-    if (s_pm_hint) pm_pump();
-}
 #undef PM_KD

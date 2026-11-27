@@ -31,6 +31,17 @@
  * and copy the top of their stack, then walked from that copy (DbgHelp
  * StackWalk64, unwind data from RtlLookupFunctionEntry, no PDB needed).
  *
+ * When a PDB sits next to the exe, frames and the fault address also get
+ * {symbol+0xNN file:line} (DbgHelp SymFromAddr, best-effort, not after heap
+ * corruption). With PortCrashConfig::guest_state the faulting thread's guest
+ * PPU state is captured too (thread id, lr, sp, syscall in flight / last
+ * syscall, last syscall callsite). A crash also writes the exception section
+ * and the faulting thread's stack to stderr (run.log), not only crashes.txt.
+ * With PortCrashConfig::guest_threads every report (crash and hang) also
+ * gets a "guest threads" section: per guest thread the syscall it is blocked
+ * in, its first argument (the wait object / address), for how long, and the
+ * last syscall callsite -- the per-thread heartbeat of a hang.
+ *
  * Switches (environment; settings.bat / run.bat):
  *   PORT_CRASH_DUMPS=0 (or <prefix>_CRASH_DUMPS=0)  everything off
  *   PORT_CRASH_DUMPS=full (or <prefix>_CRASH_DUMPS=full, CRASH_DUMP_FULL=1)
@@ -43,6 +54,8 @@
  *                                <prefix>_HANG_S seconds (default 90)
  *   PORT_HANG_S=<s>              the strict watchdog's limit (default 20, >= 5)
  *   PORT_CRASH_KEEP=<n>          dumps kept in logs\crash (default 12)
+ *   PORT_CRASH_SYMBOLS=0         no PDB symbol lookup in reports
+ *   PORT_CRASH_EXTRA=0           report as before the guest-state / guest-threads / symbols / run.log summary additions
  */
 #pragma once
 #ifdef _WIN32
@@ -51,6 +64,7 @@
 #endif
 #include <windows.h>
 #include <dbghelp.h>
+#include "port_dbghelp_lock.h"   /* DbgHelp is single-threaded: shared with port_hitchcatch.cpp */
 #include <tlhelp32.h>
 #include <psapi.h>
 #include <intrin.h>
@@ -61,6 +75,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+struct PortGuestState {                  /* filled on the faulting thread (loads only) */
+    int valid;                           /* 0: not a guest thread */
+    uint64_t thread_id;                  /* guest PPU thread id */
+    uint32_t lr, sp;                     /* guest link register, r1 */
+    uint32_t syscall_inflight;           /* lv2 syscall the thread is inside (0 = none) */
+    uint32_t syscall_last;               /* last lv2 syscall it made */
+    uint32_t callsite;                   /* guest function of the last syscall / HLE call */
+};
 
 struct PortCrashConfig {
     const char* tag;                     /* file-name prefix: "R3" -> R3_<time>_crash.dmp */
@@ -75,6 +98,16 @@ struct PortCrashConfig {
     uint64_t vm_size;
     uint32_t (*guest_resolve)(void* host_pc);   /* host pc -> nearest lifted guest function (0 = none) */
     void (*before_report)(void);         /* crash only, on the reporter thread: e.g. give the display mode back */
+    /* optional (NULL = none), on the faulting thread before the report; must
+     * not allocate or use much stack (a stack overflow lands here too) */
+    void (*guest_state)(PortGuestState* out);
+    /* optional (NULL = none), on the reporter / watchdog thread: write a text
+     * table of all guest threads into buf (NUL-terminated, at most cap bytes);
+     * returns the length. Must only read (the game may still be running). */
+    size_t (*guest_threads)(char* buf, size_t cap);
+    /* optional (NULL = none), on the reporter thread after each report (kind:
+     * 0 crash, 1 hang): e.g. write the frame-time summary (port_frametime.h) */
+    void (*after_report)(int kind);
 };
 
 namespace port_crash {
@@ -96,6 +129,7 @@ struct Request {
     char detail[200];            /* hang: what stalled */
     char out_txt[MAX_PATH];      /* result: the .txt written ("" = none) */
     char out_dmp[MAX_PATH];      /* result: the .dmp written ("" = none) */
+    PortGuestState guest;        /* crash: the faulting thread's guest state */
 };
 
 struct Mod { DWORD64 base, end; char name[64]; };
@@ -117,6 +151,28 @@ static HANDLE s_req_ev, s_done_ev, s_thread;
 static DWORD s_thread_id, s_watch_id;
 static SRWLOCK s_lock = SRWLOCK_INIT;
 static volatile LONG s_crashed;
+
+/* Best-effort PDB symbols (DbgHelp SymFromAddr), only on the reporter thread,
+ * never after heap corruption. PORT_CRASH_SYMBOLS=0 turns them off. */
+typedef DWORD (WINAPI* sso_t)(DWORD);
+typedef BOOL (WINAPI* si_t)(HANDLE, PCSTR, BOOL);
+typedef BOOL (WINAPI* sfa_t)(HANDLE, DWORD64, PDWORD64, PSYMBOL_INFO);
+typedef BOOL (WINAPI* sgl_t)(HANDLE, DWORD64, PDWORD, PIMAGEHLP_LINE64);
+static sso_t s_sso;
+static si_t s_si;
+static sfa_t s_sfa;
+static sgl_t s_sgl;
+static int s_sym_state;          /* 0 = not tried, 1 = on, -1 = off */
+static int s_sym_allowed;        /* per report */
+static int s_nosym;              /* PORT_CRASH_SYMBOLS=0 (or PORT_CRASH_EXTRA=0) */
+static int s_nodbg;              /* per report: another thread holds the DbgHelp lock -> no DbgHelp call at all */
+static DWORD s_dbg_wait_ms;      /* PORT_CRASH_DBGHELP_WAIT_MS; 0 = crash 20 s, hang 30 s */
+static int s_noextra;            /* PORT_CRASH_EXTRA=0: no guest state / symbols / run.log summary */
+
+/* The crash summary also written to stderr (run.log): exception + faulting stack. */
+static char s_tee[12288];
+static size_t s_teelen;
+static int s_tee_on;
 static Request s_req;
 static Mod s_mods[MAX_MODS];
 static int s_nmods;
@@ -133,6 +189,10 @@ static void flush_out()
 }
 static void put(const char* s, size_t n)
 {
+    if (s_tee_on && s_teelen < sizeof s_tee) {
+        const size_t k = n < sizeof s_tee - s_teelen ? n : sizeof s_tee - s_teelen;
+        memcpy(s_tee + s_teelen, s, k); s_teelen += k;
+    }
     while (n) {
         if (s_olen == sizeof s_obuf) flush_out();
         size_t k = sizeof s_obuf - s_olen; if (k > n) k = n;
@@ -219,6 +279,44 @@ static uint32_t guest_of(DWORD64 pc, int* exact, DWORD64* host_start)
     return s_cfg.guest_resolve((void*)pc);
 }
 
+static int sym_ready()
+{
+    if (!s_sym_allowed) return 0;
+    if (s_sym_state) return s_sym_state > 0;
+    s_sym_state = -1;
+    if (s_nosym || !s_sso || !s_si || !s_sfa) return 0;
+    s_sso(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES | SYMOPT_FAIL_CRITICAL_ERRORS | SYMOPT_NO_PROMPTS);
+    char dir[MAX_PATH]; snprintf(dir, sizeof dir, "%s", s_exe);
+    if (char* s = strrchr(dir, '\\')) *s = 0;
+    /* FALSE when something else already initialised DbgHelp for this process:
+     * its session works for lookups too, so carry on either way. */
+    s_si(GetCurrentProcess(), dir, TRUE);
+    s_sym_state = 1;
+    return 1;
+}
+
+/* " {name+0xNN file.c:123}" for a pc, "" when there is no symbol. */
+static void sym_of(char* b, size_t n, DWORD64 pc)
+{
+    b[0] = 0;
+    if (!sym_ready()) return;
+    static union { SYMBOL_INFO si; char raw[sizeof(SYMBOL_INFO) + 256]; } u;
+    memset(&u.si, 0, sizeof u.si);
+    u.si.SizeOfStruct = sizeof(SYMBOL_INFO); u.si.MaxNameLen = 255;
+    DWORD64 off = 0;
+    if (!s_sfa(GetCurrentProcess(), pc, &off, &u.si)) return;
+    int len = snprintf(b, n, " {%s+0x%llX", u.si.Name, (unsigned long long)off);
+    if (len < 0 || (size_t)len >= n) { b[0] = 0; return; }
+    IMAGEHLP_LINE64 ln; memset(&ln, 0, sizeof ln); ln.SizeOfStruct = sizeof ln;
+    DWORD lo = 0;
+    if (s_sgl && s_sgl(GetCurrentProcess(), pc, &lo, &ln) && ln.FileName) {
+        const char* f = strrchr(ln.FileName, '\\'); f = f ? f + 1 : ln.FileName;
+        const int k = snprintf(b + len, n - len, " %s:%lu", f, (unsigned long)ln.LineNumber);
+        if (k > 0 && (size_t)(len + k) < n) len += k;
+    }
+    if ((size_t)len + 2 <= n) { b[len] = '}'; b[len + 1] = 0; }
+}
+
 static void describe(char* b, size_t n, DWORD64 pc, int is_return)
 {
     const Mod* m = find_mod(pc);
@@ -227,7 +325,13 @@ static void describe(char* b, size_t n, DWORD64 pc, int is_return)
     if (len < 0 || (size_t)len >= n) return;
     int exact = 0; DWORD64 hs = 0;
     const uint32_t g = guest_of(is_return ? pc - 1 : pc, &exact, &hs);
-    if (g && exact) snprintf(b + len, n - len, "  [func_%08X+0x%llX]", g, (unsigned long long)(pc - hs));
+    if (g && exact) {
+        const int k = snprintf(b + len, n - len, "  [func_%08X+0x%llX]", g, (unsigned long long)(pc - hs));
+        if (k < 0 || (size_t)(len + k) >= n) return;
+        len += k;
+    }
+    char s[384]; sym_of(s, sizeof s, is_return ? pc - 1 : pc);
+    if (s[0]) snprintf(b + len, n - len, "%s", s);
 }
 
 /* ---- stack walking from a copy of the stack ---- */
@@ -258,8 +362,60 @@ static void snap_stack(DWORD64 rsp)
     }
 }
 
+/* DbgHelp-free walk, for a report while another thread is inside DbgHelp:
+ * RtlLookupFunctionEntry / RtlVirtualUnwind (ntdll) on a copy of the stack
+ * (s_snap) whose pointers into itself are rebased; every read SEH-guarded. */
+alignas(16) static unsigned char s_rw[SNAP_BYTES + 512];
+static int rtl_steps(CONTEXT* c, DWORD64 lo, DWORD64 hi, DWORD64* pcs, int max)
+{
+    int n = 0;
+    __try {
+        while (n < max) {
+            const DWORD64 pc = c->Rip, sp = c->Rsp;
+            if (!pc) break;
+            pcs[n++] = pc;
+            if (sp < lo || sp + 8 > hi) break;
+            DWORD64 base = 0;
+            if (PRUNTIME_FUNCTION f = RtlLookupFunctionEntry(pc, &base, NULL)) {
+                PVOID hd = NULL; DWORD64 est = 0;
+                RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, pc, f, c, &hd, &est, NULL);
+            } else {
+                if (n > 1) break;   /* only the leaf may be frameless */
+                c->Rip = *(const DWORD64*)sp; c->Rsp = sp + 8;
+            }
+            if (c->Rsp < lo + 8 || c->Rsp > hi || (c->Rsp <= sp && c->Rip == pc)) break;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+    return n;
+}
+static void walk_rtl(const CONTEXT& c0, int max_frames)
+{
+    static DWORD64 pcs[64];
+    if (max_frames > 64) max_frames = 64;
+    int n = 0;
+    const DWORD64 lo = s_snap.lo, len = s_snap.hi - s_snap.lo;
+    if (len) {
+        memcpy(s_rw, s_snap.buf, (size_t)len);
+        memset(s_rw + len, 0, sizeof s_rw - (size_t)len);
+        const DWORD64 delta = (DWORD64)(uintptr_t)s_rw - lo;
+        DWORD64* w = (DWORD64*)s_rw;
+        for (DWORD64 i = 0; i < len / 8; i++) if (w[i] >= lo && w[i] < lo + len) w[i] += delta;
+        CONTEXT c = c0;
+        DWORD64* regs[] = { &c.Rsp, &c.Rbp, &c.Rbx, &c.Rsi, &c.Rdi, &c.R12, &c.R13, &c.R14, &c.R15 };
+        for (DWORD64* x : regs) if (*x >= lo && *x < lo + len) *x += delta;
+        n = rtl_steps(&c, (DWORD64)(uintptr_t)s_rw, (DWORD64)(uintptr_t)s_rw + len, pcs, max_frames);
+    }
+    if (n <= 0) { pcs[0] = c0.Rip; n = 1; }
+    for (int i = 0; i < n; i++) {
+        char d[640]; describe(d, sizeof d, pcs[i], i > 0);
+        out("    #%-2d %s\n", i, d);
+    }
+}
+
 static void walk(HANDLE th, const CONTEXT& c0, int max_frames)
 {
+    if (s_nodbg) { walk_rtl(c0, max_frames); return; }
     if (!s_sw64) { out("    (no DbgHelp StackWalk64)\n"); return; }
     CONTEXT c = c0;
     STACKFRAME64 sf; memset(&sf, 0, sizeof sf);
@@ -271,7 +427,7 @@ static void walk(HANDLE th, const CONTEXT& c0, int max_frames)
         if (!s_sw64(IMAGE_FILE_MACHINE_AMD64, GetCurrentProcess(), th, &sf, &c, sw_read, sw_fta, sw_base, NULL)) break;
         const DWORD64 pc = sf.AddrPC.Offset;
         if (!pc) break;
-        char d[256]; describe(d, sizeof d, pc, i > 0);
+        char d[640]; describe(d, sizeof d, pc, i > 0);
         out("    #%-2d %s\n", i, d);
         if (i > 0 && sf.AddrStack.Offset <= last_sp) break;   /* not moving: a bad unwind */
         last_sp = sf.AddrStack.Offset;
@@ -329,7 +485,14 @@ static void all_threads(const Request& r)
         }
         if (!have) { out("    (no context)\n"); if (h) CloseHandle(h); continue; }
         if (faulting) snap_stack(c.Rsp);
+        if (faulting && s_teelen < sizeof s_tee) {
+            const int k = snprintf(s_tee + s_teelen, sizeof s_tee - s_teelen, "faulting thread %lu%s%s%s stack:\n",
+                                   (unsigned long)tid, name[0] ? " \"" : "", name, name[0] ? "\"" : "");
+            if (k > 0) s_teelen = s_teelen + k < sizeof s_tee ? s_teelen + k : sizeof s_tee;
+        }
+        s_tee_on = faulting;
         walk(h ? h : GetCurrentThread(), c, faulting ? 64 : 24);
+        s_tee_on = 0;
         s_snap.lo = s_snap.hi = 0;
         if (h) CloseHandle(h);
     }
@@ -449,6 +612,90 @@ static void hex_line(const char* names[], const DWORD64* v, int n)
     out("\n");
 }
 
+/* CRT invalid parameter (0xC0000417): the handler runs several frames below
+ * whoever passed the bad argument (caller -> fread -> _invalid_parameter ->
+ * on_invparam), so RtlCaptureContext there only ever names on_invparam.
+ * on_invparam records its stack on its own stack frame; crash() copies it
+ * into s_ip_* only on the thread that wins the report, so a second
+ * concurrent invalid parameter can't lend its stack to the first one's
+ * report. The report then names the first frame outside the handler and the
+ * CRT as the call site, makes it the exception address, and lists the stack.
+ * The dump keeps the real handler context (walkable) plus a comment stream
+ * with the same text. */
+struct IpCapture { void* fr[32]; int n; const wchar_t* func; const wchar_t* file; unsigned line; };
+static thread_local const IpCapture* t_ip;   /* set by on_invparam for its crash_here() */
+static void* s_ip_frames[32];
+static int s_ip_n;
+static char s_ip_func[128], s_ip_file[160];
+static unsigned s_ip_line;
+static int s_ip_site = -1;              /* index into s_ip_frames, -1 = none */
+static char s_ip_text[1024];            /* dump comment stream */
+
+static int crt_mod(const Mod* m)
+{
+    if (!m) return 0;
+    return !_strnicmp(m->name, "ucrtbase", 8) || !_strnicmp(m->name, "vcruntime", 9) ||
+           !_strnicmp(m->name, "msvcr", 5) || !_strnicmp(m->name, "msvcp", 5) || !_strnicmp(m->name, "api-ms-", 7) ||
+           !_stricmp(m->name, "ntdll.dll") || !_stricmp(m->name, "KERNELBASE.dll");
+}
+static void frame_where(char* b, size_t n, DWORD64 pc)
+{
+    const Mod* m = find_mod(pc);
+    if (m) snprintf(b, n, "%s+0x%llX", m->name, (unsigned long long)(pc - m->base));
+    else snprintf(b, n, "0x%016llX", (unsigned long long)pc);
+}
+/* Picks the call site for an invalid-parameter report (after load_mods). */
+static void invparam_site(const Request& r)
+{
+    s_ip_site = -1; s_ip_text[0] = 0;
+    if (r.kind != KIND_CRASH || !r.ep || !r.ep->ExceptionRecord || r.ep->ExceptionRecord->ExceptionCode != 0xC0000417 ||
+        s_ip_n < 2)
+        return;
+    /* frame 0 is in on_invparam: skip it and anything else in that function */
+    DWORD64 b0 = 0, b = 0;
+    PRUNTIME_FUNCTION f0 = RtlLookupFunctionEntry((DWORD64)s_ip_frames[0], &b0, NULL);
+    int crt_in_exe = 0;
+    for (int i = 1; i < s_ip_n; i++) {
+        const DWORD64 pc = (DWORD64)s_ip_frames[i];
+        PRUNTIME_FUNCTION fi = RtlLookupFunctionEntry(pc, &b, NULL);
+        if (f0 && fi && b == b0 && fi->BeginAddress == f0->BeginAddress) continue;
+        if (crt_mod(find_mod(pc))) continue;
+        /* a statically linked CRT: its invalid-parameter machinery is in the
+         * exe (needs symbols to see), and the frame above it is the CRT
+         * function that got the bad argument (strcpy_s, fread) */
+        char s[384]; sym_of(s, sizeof s, pc - 1);
+        if (strstr(s, "{_invalid_parameter") || strstr(s, "{_invoke_watson") || strstr(s, "{port_crash::")) { crt_in_exe = 1; continue; }
+        if (crt_in_exe == 1) { crt_in_exe = 2; continue; }
+        s_ip_site = i;
+        break;
+    }
+    if (s_ip_site < 0) return;
+    /* a return address points after the call: pc - 1 is inside the call instruction */
+    r.ep->ExceptionRecord->ExceptionAddress = (PVOID)((DWORD64)s_ip_frames[s_ip_site] - 1);
+    size_t k = 0;
+    char w[160];
+    frame_where(w, sizeof w, (DWORD64)s_ip_frames[s_ip_site] - 1);
+    k += snprintf(s_ip_text + k, sizeof s_ip_text - k, "CRT invalid parameter, call site %s", w);
+    if (s_ip_func[0] && k < sizeof s_ip_text)
+        k += snprintf(s_ip_text + k, sizeof s_ip_text - k, " (%s, %s:%u)", s_ip_func, s_ip_file, s_ip_line);
+    if (k < sizeof s_ip_text) k += snprintf(s_ip_text + k, sizeof s_ip_text - k, "; stack:");
+    for (int i = 1; i < s_ip_n && i < 17 && k < sizeof s_ip_text; i++) {
+        frame_where(w, sizeof w, (DWORD64)s_ip_frames[i]);
+        k += snprintf(s_ip_text + k, sizeof s_ip_text - k, " %s", w);
+    }
+}
+static void invparam_section()
+{
+    if (s_ip_site < 0) return;
+    if (s_ip_func[0]) out("crt check:  %s (%s:%u)\n", s_ip_func, s_ip_file, s_ip_line);
+    out("call stack: (from the invalid-parameter handler; the address above is the call site)\n");
+    for (int i = 1; i < s_ip_n && i < 13; i++) {
+        const DWORD64 pc = (DWORD64)s_ip_frames[i];
+        char w[512]; describe(w, sizeof w, pc, 1);
+        out("  #%-2d %s%s\n", i - 1, w, i == s_ip_site ? "  <== call site" : "");
+    }
+}
+
 static void exception_section(const Request& r, char* line, size_t linen)
 {
     const EXCEPTION_RECORD* er = r.ep->ExceptionRecord;
@@ -469,10 +716,12 @@ static void exception_section(const Request& r, char* line, size_t linen)
             snprintf(fault, sizeof fault, ", %s 0x%llX", op, (unsigned long long)fa);
     }
     out("\n==== exception ====\n");
+    s_tee_on = 1;
     out("what:       %s\n", r.how);
     out("code:       0x%08lX (%s)%s\n", (unsigned long)er->ExceptionCode, code_name(er->ExceptionCode),
         (er->ExceptionFlags & EXCEPTION_NONCONTINUABLE) ? ", non-continuable" : "");
-    out("address:    0x%016llX = %s%s\n", (unsigned long long)pc, where, fault);
+    char sym[384]; sym_of(sym, sizeof sym, pc);
+    out("address:    0x%016llX = %s%s%s\n", (unsigned long long)pc, where, fault, sym);
     int exact = 0; DWORD64 hs = 0;
     const uint32_t g = guest_of(pc, &exact, &hs);
     if (g && exact)
@@ -481,7 +730,18 @@ static void exception_section(const Request& r, char* line, size_t linen)
         out("guest fn:   none exact -- nearest lifted function below is func_%08X (the address is in runtime code or a split part)\n", g);
     else
         out("guest fn:   none (not in the game exe's lifted code)\n");
+    invparam_section();
     out("thread:     %lu\n", (unsigned long)r.tid);
+    if (r.guest.valid) {
+        out("guest:      PPU thread %llu, lr=0x%08X sp=0x%08X\n", (unsigned long long)r.guest.thread_id,
+            r.guest.lr, r.guest.sp);
+        if (r.guest.syscall_inflight) out("syscall:    inside %u, last %u", r.guest.syscall_inflight, r.guest.syscall_last);
+        else out("syscall:    none in flight, last %u", r.guest.syscall_last);
+        if (r.guest.callsite) out(" (last syscall/HLE call from func_%08X)", r.guest.callsite);
+        out("\n");
+    } else if (s_cfg.guest_state) {
+        out("guest:      (not a guest PPU thread)\n");
+    }
     if (const CONTEXT* c = r.ep->ContextRecord) {
         out("registers:\n");
         const char* n1[] = { "rax", "rbx", "rcx", "rdx" };  const DWORD64 v1[] = { c->Rax, c->Rbx, c->Rcx, c->Rdx };
@@ -491,6 +751,7 @@ static void exception_section(const Request& r, char* line, size_t linen)
         hex_line(n1, v1, 4); hex_line(n2, v2, 4); hex_line(n3, v3, 4); hex_line(n4, v4, 4);
         out("    rip=%016llX eflags=%08lX\n", (unsigned long long)c->Rip, (unsigned long)c->EFlags);
     }
+    s_tee_on = 0;
     char gf[32] = "";
     if (g && exact) snprintf(gf, sizeof gf, " in func_%08X", g);
     snprintf(line, linen, "code 0x%08lX (%s) at %s%s%s (thread %lu)", (unsigned long)er->ExceptionCode,
@@ -520,8 +781,12 @@ static int write_dump(const char* path, const Request& r)
         ? (MINIDUMP_TYPE)(MiniDumpWithFullMemory | MiniDumpWithThreadInfo | MiniDumpWithHandleData | MiniDumpWithUnloadedModules)
         : (MINIDUMP_TYPE)(MiniDumpWithIndirectlyReferencedMemory | MiniDumpWithThreadInfo |
                           MiniDumpScanMemory | MiniDumpWithUnloadedModules);
+    MINIDUMP_USER_STREAM us;
+    MINIDUMP_USER_STREAM_INFORMATION usi;
+    us.Type = CommentStreamA; us.Buffer = s_ip_text; us.BufferSize = (ULONG)strlen(s_ip_text) + 1;
+    usi.UserStreamCount = 1; usi.UserStreamArray = &us;
     const BOOL ok = s_mdw(GetCurrentProcess(), GetCurrentProcessId(), f, type,
-                          r.kind == KIND_CRASH && r.ep ? &mei : NULL, NULL, NULL);
+                          r.kind == KIND_CRASH && r.ep ? &mei : NULL, s_ip_text[0] ? &usi : NULL, NULL);
     CloseHandle(f);
     if (!ok) DeleteFileA(path);
     return ok != FALSE;
@@ -531,6 +796,27 @@ static void do_report(Request& r)
 {
     if (r.kind == KIND_CRASH && s_cfg.before_report) s_cfg.before_report();
     load_mods();
+    s_teelen = 0; s_tee_on = 0;
+    /* DbgHelp allocates and loads the PDB: crashes only (a hang report must not
+     * grow a still-running game), never after heap corruption */
+    s_sym_allowed = r.kind == KIND_CRASH && !(r.ep && r.ep->ExceptionRecord && r.ep->ExceptionRecord->ExceptionCode == 0xC0000374);
+    /* DbgHelp (dump, StackWalk64, symbols) is single-threaded and PORT_HITCHCATCH
+     * uses it too: hold the shared lock for the whole report, taken before any
+     * thread is suspended. If another thread still holds it after 20 s (hang:
+     * 30 s), that thread may be inside DbgHelp: this report then makes no DbgHelp
+     * call (RtlVirtualUnwind stacks, module+offset names) and writes the minidump
+     * at the end if the lock frees within the same wait. A crash on the thread
+     * that holds the lock is reported as before, without symbols. Uncontended
+     * (PORT_HITCHCATCH off) this is the old path. */
+    InterlockedExchange(&g_port_dbghelp_report, 1);
+    const DWORD dbg_wait = s_dbg_wait_ms ? s_dbg_wait_ms : r.kind == KIND_CRASH ? 20000 : 30000;
+    const DWORD dbg_owner = (DWORD)g_port_dbghelp_owner;
+    const int self_owned = r.kind == KIND_CRASH && dbg_owner && dbg_owner == r.tid;
+    int dbg_locked = !self_owned && port_dbghelp_trylock(dbg_wait);
+    const DWORD dbg_holder = dbg_locked ? 0 : self_owned ? dbg_owner : (DWORD)g_port_dbghelp_owner;
+    s_nodbg = !dbg_locked && !self_owned;
+    if (!dbg_locked) s_sym_allowed = 0;
+    invparam_site(r);
     char ts[32]; stamp(ts, sizeof ts, 1);
     char stem[MAX_PATH];
     const char* kind = r.kind == KIND_CRASH ? "crash" : "hang";
@@ -541,7 +827,7 @@ static void do_report(Request& r)
     char dmp[MAX_PATH], txt[MAX_PATH];
     snprintf(dmp, sizeof dmp, "%s.dmp", stem);
     snprintf(txt, sizeof txt, "%s.txt", stem);
-    const int dump_ok = write_dump(dmp, r);
+    int dump_ok = s_nodbg ? 0 : write_dump(dmp, r);
     snprintf(r.out_dmp, sizeof r.out_dmp, "%s", dump_ok ? dmp : "");
 
     char line[1024] = "";
@@ -557,12 +843,24 @@ static void do_report(Request& r)
     if (s_cfg.paused) out(" | paused %d", s_cfg.paused());
     out("\n");
     out("command:    %s\n", GetCommandLineA());
-    out("dump:       %s\n", dump_ok ? dmp : "(failed)");
+    out("dump:       %s\n", dump_ok ? dmp : s_nodbg ? "(deferred: DbgHelp busy, see the end of this report)" : "(failed)");
+    if (s_nodbg)
+        out("note:       DbgHelp lock held by thread %lu for %lu ms: stacks unwound without DbgHelp, no symbols, minidump deferred\n",
+            (unsigned long)dbg_holder, (unsigned long)dbg_wait);
+    else if (!dbg_locked) out("note:       DbgHelp lock held by the crashing thread %lu; no symbols\n", (unsigned long)dbg_holder);
     if (r.kind == KIND_CRASH && r.ep && r.ep->ExceptionRecord) {
         exception_section(r, line, sizeof line);
     } else {
         out("\n==== hang ====\n%s\n", r.detail);
         snprintf(line, sizeof line, "%s", r.detail);
+    }
+    if (s_cfg.guest_threads) {
+        static char gb[16384];
+        gb[0] = 0;
+        size_t gn = s_cfg.guest_threads(gb, sizeof gb);
+        if (gn >= sizeof gb) gn = sizeof gb - 1;
+        out("\n==== guest threads ====\n");
+        if (gn) put(gb, gn); else out("(none)\n");
     }
     all_threads(r);
     log_tail();
@@ -571,16 +869,43 @@ static void do_report(Request& r)
     for (int i = 0; i < s_nmods; i++)
         out("%016llX %8lluK %s\n", (unsigned long long)s_mods[i].base,
             (unsigned long long)((s_mods[i].end - s_mods[i].base) >> 10), s_mods[i].name);
+    if (s_nodbg) {
+        flush_out();   /* the report so far is on disk before the second wait */
+        if (port_dbghelp_trylock(dbg_wait)) {
+            dbg_locked = 1;
+            dump_ok = write_dump(dmp, r);
+            out("\nnote:       DbgHelp lock freed after the report; minidump (taken now, after the report): %s\n", dump_ok ? dmp : "(failed)");
+        } else {
+            out("\nnote:       DbgHelp lock still held by thread %lu after another %lu ms: no minidump\n",
+                (unsigned long)g_port_dbghelp_owner, (unsigned long)dbg_wait);
+        }
+        snprintf(r.out_dmp, sizeof r.out_dmp, "%s", dump_ok ? dmp : "");
+    }
     flush_out();
     const int txt_ok = s_out != INVALID_HANDLE_VALUE;
     if (txt_ok) CloseHandle(s_out);
     s_out = INVALID_HANDLE_VALUE;
     snprintf(r.out_txt, sizeof r.out_txt, "%s", txt_ok ? txt : "");
 
+    if (r.kind == KIND_CRASH && s_teelen && !s_noextra) {
+        HANDLE e = GetStdHandle(STD_ERROR_HANDLE);
+        if (e && e != INVALID_HANDLE_VALUE) {
+            static const char hd[] = "\n[crash] ======== crash report summary (full report in logs\\crash) ========\n";
+            static const char ft[] = "[crash] ==================================================================\n";
+            DWORD w;
+            WriteFile(e, hd, (DWORD)(sizeof hd - 1), &w, NULL);
+            WriteFile(e, s_tee, (DWORD)s_teelen, &w, NULL);
+            WriteFile(e, ft, (DWORD)(sizeof ft - 1), &w, NULL);
+        }
+    }
+    s_teelen = 0;
     char nl[1400];
     snprintf(nl, sizeof nl, "[%s] %s%s%s -> %s", kind, r.kind == KIND_CRASH ? r.how : "", r.kind == KIND_CRASH ? ": " : "",
              line, dump_ok ? dmp : txt_ok ? txt : "report FAILED");
     note_line(nl);
+    if (dbg_locked) port_dbghelp_unlock();
+    if (r.kind != KIND_CRASH) InterlockedExchange(&g_port_dbghelp_report, 0);
+    if (s_cfg.after_report) s_cfg.after_report(r.kind);
 }
 
 static DWORD WINAPI reporter(LPVOID)
@@ -610,13 +935,27 @@ static void run(Request& r)
 static void crash(EXCEPTION_POINTERS* ep, const char* how)
 {
     if (!s_on || GetCurrentThreadId() == s_thread_id) return;   /* the reporter itself failed: let it die */
+    /* guest state from this thread's TLS, before handing over to the reporter */
+    PortGuestState gs; memset(&gs, 0, sizeof gs);
+    if (s_cfg.guest_state) s_cfg.guest_state(&gs);
     /* one report per process: a thread that faults while another reports
      * waits here until that report is written, then goes on dying */
     AcquireSRWLockExclusive(&s_lock);
     if (InterlockedCompareExchange(&s_crashed, 1, 0) != 0) { ReleaseSRWLockExclusive(&s_lock); return; }
+    if (const IpCapture* ip = t_ip) {
+        memcpy(s_ip_frames, ip->fr, sizeof(void*) * (size_t)ip->n);
+        s_ip_n = ip->n;
+        /* only the debug CRT passes these */
+        if (ip->func) WideCharToMultiByte(CP_UTF8, 0, ip->func, -1, s_ip_func, (int)sizeof s_ip_func - 1, NULL, NULL);
+        if (ip->file) {
+            const wchar_t* b = wcsrchr(ip->file, L'\\');
+            WideCharToMultiByte(CP_UTF8, 0, b ? b + 1 : ip->file, -1, s_ip_file, (int)sizeof s_ip_file - 1, NULL, NULL);
+        }
+        s_ip_line = ip->line;
+    }
     static Request r;
     memset(&r, 0, sizeof r);
-    r.kind = KIND_CRASH; r.ep = ep; r.tid = GetCurrentThreadId(); r.how = how;
+    r.kind = KIND_CRASH; r.ep = ep; r.tid = GetCurrentThreadId(); r.how = how; r.guest = gs;
     run(r);
     ReleaseSRWLockExclusive(&s_lock);
 }
@@ -625,9 +964,11 @@ static void crash(EXCEPTION_POINTERS* ep, const char* how)
  * report it with the caller's registers. */
 static void crash_here(const char* how, DWORD code)
 {
-    static CONTEXT c;
-    static EXCEPTION_RECORD er;
-    static EXCEPTION_POINTERS ep;
+    /* on this thread's stack: it stays here (blocked in crash()) while its
+     * report is written, and a concurrent loser can't overwrite it */
+    CONTEXT c;
+    EXCEPTION_RECORD er;
+    EXCEPTION_POINTERS ep;
     RtlCaptureContext(&c);
     memset(&er, 0, sizeof er);
     er.ExceptionCode = code; er.ExceptionFlags = EXCEPTION_NONCONTINUABLE; er.ExceptionAddress = (PVOID)c.Rip;
@@ -665,7 +1006,12 @@ static void __cdecl on_purecall()
 }
 static void __cdecl on_invparam(const wchar_t* e, const wchar_t* f, const wchar_t* file, unsigned line, uintptr_t res)
 {
+    IpCapture ip;
+    ip.n = (int)RtlCaptureStackBackTrace(0, 32, ip.fr, NULL);
+    ip.func = f; ip.file = file; ip.line = line;
+    t_ip = &ip;
     crash_here("CRT invalid parameter", 0xC0000417);
+    t_ip = NULL;
     if (s_prev_invparam) { s_prev_invparam(e, f, file, line, res); return; }
     __fastfail(FAST_FAIL_INVALID_ARG);   /* what the default handler does */
 }
@@ -753,6 +1099,16 @@ static void init(const PortCrashConfig& cfg)
     done = 1;
     s_cfg = cfg;
     s_start_ms = GetTickCount64();
+    {
+        char x[4] = "", sy[4] = "";
+        if (GetEnvironmentVariableA("PORT_CRASH_EXTRA", x, sizeof x) >= sizeof x) x[0] = 0;
+        if (GetEnvironmentVariableA("PORT_CRASH_SYMBOLS", sy, sizeof sy) >= sizeof sy) sy[0] = 0;
+        s_noextra = x[0] == '0';
+        s_nosym = s_noextra || sy[0] == '0';
+        char dw[16] = "";
+        if (GetEnvironmentVariableA("PORT_CRASH_DBGHELP_WAIT_MS", dw, sizeof dw) < sizeof dw && dw[0]) s_dbg_wait_ms = (DWORD)strtoul(dw, NULL, 10);
+        if (s_noextra) { s_cfg.guest_state = nullptr; s_cfg.guest_threads = nullptr; }
+    }
     char nb[64];
     const char* pe = getenv("PORT_CRASH_DUMPS");
     const char* le = cfg.env_prefix ? env2(cfg.env_prefix, "CRASH_DUMPS", nb, sizeof nb) : NULL;
@@ -779,6 +1135,10 @@ static void init(const PortCrashConfig& cfg)
     if (HMODULE dh = LoadLibraryA("dbghelp.dll")) {
         s_mdw = (mdw_t)GetProcAddress(dh, "MiniDumpWriteDump");
         s_sw64 = (sw64_t)GetProcAddress(dh, "StackWalk64");
+        s_sso = (sso_t)GetProcAddress(dh, "SymSetOptions");
+        s_si = (si_t)GetProcAddress(dh, "SymInitialize");
+        s_sfa = (sfa_t)GetProcAddress(dh, "SymFromAddr");
+        s_sgl = (sgl_t)GetProcAddress(dh, "SymGetLineFromAddr64");
     }
     s_gtd = (gtd_t)GetProcAddress(GetModuleHandleA("kernel32.dll"), "GetThreadDescription");
 

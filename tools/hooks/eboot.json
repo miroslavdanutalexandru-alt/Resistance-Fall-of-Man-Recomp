@@ -34,26 +34,6 @@
 ]
 }
 ],
-"func_001B70C0": [
-{
-"at": 1,
-"ctx": "void func_001B70C0(ppu_context* ctx) {",
-"rm": [],
-"add": [
-"        rfom_mp_glog(1, ctx);   /* v184: game network debug log -> logs/mp_game.log */"
-]
-}
-],
-"func_001B7284": [
-{
-"at": 1,
-"ctx": "void func_001B7284(ppu_context* ctx) {",
-"rm": [],
-"add": [
-"        rfom_mp_glog(0, ctx);   /* v184: game network debug log -> logs/mp_game.log */"
-]
-}
-],
 "func_00513A7C": [
 {
 "at": 6,
@@ -168,13 +148,111 @@
 ]
 }
 ],
-"func_00627748": [
+"func_0070FD60": [
 {
-"at": 54,
-"ctx": "         * is why it defaults to off. */",
+"at": 1,
+"ctx": "void func_0070FD60(ppu_context* ctx) {",
 "rm": [],
 "add": [
-"        rfom_mp_scert_note(1, (uint32_t)ctx->gpr[31], (uint32_t)ctx->gpr[30], (uint32_t)ctx->gpr[29], 0);"
+"        const uint32_t _jb_ea = ((uint32_t)ctx->gpr[3] + 15u) & ~15u;   /* v145 */"
+]
+},
+{
+"at": 75,
+"ctx": "        { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t result = ctx->gpr[4] + ca; ctx->xer = (ctx->xer & ~(1u << 29)) | ((result < ctx->gpr[4]) ? (1u << 29) : 0); ctx->gpr[3] = result; }",
+"rm": [],
+"add": [
+"        rfom_jb_jump(ctx, _jb_ea);   /* v145: back to the setjmp frame (does not return if found) */"
+]
+}
+],
+"func_00269A00": [
+{
+"at": 1,
+"ctx": "void func_00269A00(ppu_context* ctx) {",
+"rm": [],
+"add": [
+"        int rfom_menu_rows_getkey(ppu_context*); if (rfom_menu_rows_getkey(ctx)) return;   /* PC rows in the A/V options (rfom_menurows.cpp) */"
+]
+}
+],
+"func_00269A34": [
+{
+"at": 1,
+"ctx": "void func_00269A34(ppu_context* ctx) {",
+"rm": [],
+"add": [
+"        int rfom_menu_rows_getnum(ppu_context*); if (rfom_menu_rows_getnum(ctx)) return;   /* PC rows in the A/V options (rfom_menurows.cpp) */"
+]
+}
+],
+"func_00269A68": [
+{
+"at": 1,
+"ctx": "void func_00269A68(ppu_context* ctx) {",
+"rm": [],
+"add": [
+"        int rfom_menu_rows_getstr(ppu_context*); if (rfom_menu_rows_getstr(ctx)) return;   /* PC rows in the A/V options (rfom_menurows.cpp) */"
+]
+}
+],
+"func_0054BD24": [
+{
+"at": 1,
+"ctx": "void func_0054BD24(ppu_context* ctx) {",
+"rm": [],
+"add": [
+"        int rfom_menu_rows_loadbuf(ppu_context*, void (*)(ppu_context*)); if (rfom_menu_rows_loadbuf(ctx, func_0054BD24)) return;   /* OptionHandler chunk -> PC rows source, falls back to the chunk (rfom_menurows.cpp) */"
+]
+}
+],
+"func_000320F8": [
+{
+"at": 49,
+"ctx": "loc_000321A0:",
+"rm": [],
+"add": [
+"        ctx->gpr[3] = rfom_movie_skip_unseen((uint32_t)ctx->gpr[3], (uint32_t)vm_read32(ctx->gpr[31] + 0x38));   /* unwatched-movie skip */"
+]
+}
+],
+"func_001B70C0": [
+{
+"at": 1,
+"ctx": "void func_001B70C0(ppu_context* ctx) {",
+"rm": [],
+"add": [
+"        rfom_mp_glog(1, ctx);   /* v184: game network debug log -> logs/mp_game.log */"
+]
+}
+],
+"func_001B7284": [
+{
+"at": 1,
+"ctx": "void func_001B7284(ppu_context* ctx) {",
+"rm": [],
+"add": [
+"        rfom_mp_glog(0, ctx);   /* v184: game network debug log -> logs/mp_game.log */"
+]
+}
+],
+"func_00627748": [
+{
+"at": 45,
+"ctx": "        ctx->lr = 0x006277E4; func_00624D00(ctx); DRAIN_TRAMPOLINE(ctx);",
+"rm": [],
+"add": [
+"        /* Resistance port (v170, online only): the peer-certificate verdict of the",
+"         * Medius SCERT handshake is in r31 here -- 0 accepted, 2 no session, 3 no",
+"         * handler, else the verifier's code; every non-zero value aborts the",
+"         * connection. A community server cannot present a Sony-signed SCERT",
+"         * certificate, so with PS3_MP_SCERT_ACCEPT (main.cpp sets it only when",
+"         * online play is on) a rejection is turned into an acceptance, and the",
+"         * game's own success path does the bookkeeping. It never makes the check",
+"         * stricter, and offline the variable is unset -- which is why it defaults",
+"         * to off. RFOM_MP_TRACE=1 logs the verdict (logs/mp_scert.log). */",
+"        rfom_mp_scert_note(1, (uint32_t)ctx->gpr[31], (uint32_t)ctx->gpr[30], (uint32_t)ctx->gpr[29], 0);",
+"        if ((uint32_t)ctx->gpr[31] != 0 && rfom_mp_scert_accept()) ctx->gpr[31] = 0;"
 ]
 }
 ],
@@ -263,27 +341,17 @@
 "        rfom_mp_scert_note(3, (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[29], 0, 0);   /* v170 diag: pump step status */"
 ]
 }
-],
-"func_0070FD60": [
-{
-"at": 1,
-"ctx": "void func_0070FD60(ppu_context* ctx) {",
-"rm": [],
-"add": [
-"        const uint32_t _jb_ea = ((uint32_t)ctx->gpr[3] + 15u) & ~15u;   /* v145 */"
-]
-},
-{
-"at": 75,
-"ctx": "        { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t result = ctx->gpr[4] + ca; ctx->xer = (ctx->xer & ~(1u << 29)) | ((result < ctx->gpr[4]) ? (1u << 29) : 0); ctx->gpr[3] = result; }",
-"rm": [],
-"add": [
-"        rfom_jb_jump(ctx, _jb_ea);   /* v145: back to the setjmp frame (does not return if found) */"
-]
-}
 ]
 },
 "preamble": [
+"extern \"C\" void rfom_text_patch(uint32_t file_obj);",
+"extern \"C\" void rfom_snd_note(int kind, uint32_t v, uint32_t lr, uint32_t extra);",
+"extern \"C\" uint32_t rfom_speakers(uint32_t configured);",
+"#include <setjmp.h>",
+"extern \"C\" jmp_buf* rfom_jb_arm(ppu_context* ctx);",
+"extern \"C\" void rfom_jb_landed(ppu_context* ctx);",
+"extern \"C\" void rfom_jb_jump(ppu_context* ctx, uint32_t buf_ea);",
+"extern \"C\" uint32_t rfom_movie_skip_unseen(uint32_t seen, uint32_t id);   /* RFOM_CUTSCENE_SKIP_ALL (project/rfom_pcextra.cpp) */",
 "extern \"C\" int rfom_mp_scert_accept(void);",
 "extern \"C\" void rfom_mp_scert_note(int kind, uint32_t a, uint32_t b, uint32_t c, uint32_t d);",
 "extern \"C\" void rfom_mp_scert_win(int tag, uint32_t sess);",

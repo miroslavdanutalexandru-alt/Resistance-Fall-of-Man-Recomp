@@ -41,7 +41,7 @@ Complete guide to building the ps3recomp runtime library and game projects.
 
 **Windows:**
 - Visual Studio 2022 (MSVC 17.x) or Clang/LLVM 14+
-- Windows SDK 10.0.19041+
+- Windows SDK 10.0.20348+ (10.0.26100 recommended; the D3D12 renderer reads newer feature checks through `libs/video/rsx_d3d12_compat.h`)
 - System libraries (auto-linked): `ws2_32.lib`, `xinput.lib`, `ole32.lib`, `bcrypt.lib`
 
 **Linux:**

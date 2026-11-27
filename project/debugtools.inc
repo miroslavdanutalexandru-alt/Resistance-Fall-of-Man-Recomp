@@ -35,7 +35,7 @@ extern "C" void spu_dbg_dump_ls(unsigned which, unsigned lsa, unsigned len, void
 static void dbg_out_str(const char* s) { dbg_printf("%s", s); }
 extern "C" volatile int g_rfom_trace_left;
 extern "C" volatile unsigned long long g_pad_inj_until;
-extern "C" volatile unsigned int g_pad_inj_btn, g_pad_inj_sticks;
+extern "C" volatile unsigned int g_pad_inj_btn, g_pad_inj_sticks, g_pad_inj_clear;
 extern "C" unsigned long long ps3_ms_now(void);
 /* While dump_threads holds a thread suspended, dbg_printf formats into this
  * buffer instead of a stream: the suspended thread may own stderr's CRT lock,
@@ -549,7 +549,20 @@ static void dbg_prof_frame_threads(unsigned sec)
  * second: main -> logical CPU RFOM_MAIN_CPU (default 2), every other thread
  * of the process -> all CPUs except that one and its sibling (CPU ^ 1).
  * RFOM_MAIN_CORE=0 disables. */
+/* What main_core_keeper decided, for the P-core placement (pcore_keeper below, port_cpu_sets.h): state 0 = not
+ * yet, 1 = it hard-pins (rest = the mask every other thread gets), 2 = it does not pin. tid: the threads it pinned
+ * -- main, RSX FIFO thread (the R2 / R3 slots for rawSPU0 and the synth lane stay 0). */
+static volatile long port_keeper_state = 0;
+static volatile unsigned long long port_keeper_rest = 0;
+static volatile unsigned long port_keeper_tid[4] = { 0, 0, 0, 0 };
+static DWORD main_core_keeper_pin(void);
 static DWORD WINAPI main_core_keeper(LPVOID)
+{
+    const DWORD r = main_core_keeper_pin();   /* returns only when it does not pin */
+    InterlockedExchange(&port_keeper_state, 2);
+    return r;
+}
+static DWORD main_core_keeper_pin(void)
 {
     const char* e = getenv("RFOM_MAIN_CPU");
     const int cpu = e ? atoi(e) : 2;   /* not CPU 0: Windows routes most interrupts there */
@@ -582,6 +595,9 @@ static DWORD WINAPI main_core_keeper(LPVOID)
     if (!(proc & mine) || !rest) return 0;
     fprintf(stderr, "[affinity] main thread %lu -> CPU %d, RSX FIFO thread -> CPU %d, other threads -> mask 0x%llX%c",
             (unsigned long)s_dbg_main_tid, cpu, fmine ? fcpu : -1, (unsigned long long)rest, 10);
+    port_keeper_rest = (unsigned long long)rest;
+    port_keeper_tid[0] = s_dbg_main_tid;
+    InterlockedExchange(&port_keeper_state, 1);
     DWORD fifo_done = 0;
     static DWORD done[512]; int nd = 0;
     const DWORD pid = GetCurrentProcessId();
@@ -595,7 +611,7 @@ static DWORD WINAPI main_core_keeper(LPVOID)
                 if (ftid && te.th32ThreadID == ftid) {
                     if (fifo_done != ftid) {
                         HANDLE fh = OpenThread(THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION, FALSE, ftid);
-                        if (fh) { SetThreadAffinityMask(fh, fmine); CloseHandle(fh); fifo_done = ftid;
+                        if (fh) { SetThreadAffinityMask(fh, fmine); CloseHandle(fh); fifo_done = ftid; port_keeper_tid[1] = ftid;
                                   fprintf(stderr, "[affinity] RSX FIFO thread %lu pinned to CPU %d%c", (unsigned long)ftid, fcpu, 10); }
                     }
                     continue;
@@ -613,6 +629,99 @@ static DWORD WINAPI main_core_keeper(LPVOID)
         if (snap != INVALID_HANDLE_VALUE) CloseHandle(snap);
         Sleep(1000);
     }
+}
+
+/* P-cores on hybrid CPUs (port_cpu_sets.h, the same rules in all three ports):
+ * the threads the frame rate hangs on -- main guest thread, RSX FIFO (vblank
+ * clock) and render threads, raw SPUs, SPURS lanes, audio mixer -- get thread
+ * CPU sets = the usable P-cores (SetThreadSelectedCpuSets; with an affinity
+ * mask the thread runs on the intersection), as many of them as the usable
+ * P-cores allow (port_pcore_role_ok), and power throttling (EcoQoS) is turned
+ * off for them, so Thread Director does not park them on E-cores when the
+ * window loses focus or Windows runs "Balanced". Other threads are left alone.
+ * While main_core_keeper hard-pins, the hot threads are planned against its
+ * rest mask and the threads it pins get no CPU sets. A CPU whose cores all
+ * share one EfficiencyClass is left untouched. PORT_CPU_PCORES=off (older name
+ * PORT_PCORE_HOT) or PORT_THREAD_PLACEMENT=off disables; PORT_THREAD_PRIORITY=on
+ * raises main / RSX threads to above normal; PORT_KEEPER_MS = the rescan period
+ * once no new threads appear (default 5000). */
+#include "port_cpu_sets.h"
+extern "C" unsigned long cellAudio_mix_host_tid(void);
+static port_pcore_plan s_pcore, s_pcore_rest;   /* process plan; the hot threads' plan while the keeper pins */
+static int s_keeper_expected = 0;
+static int port_keeper_pinned(DWORD tid)
+{
+    if (!tid || port_keeper_state != 1) return 0;
+    for (int i = 0; i < 4; i++) if (port_keeper_tid[i] == tid) return 1;
+    return 0;
+}
+static DWORD WINAPI pcore_keeper(LPVOID)
+{
+    typedef HRESULT (WINAPI *sd_t)(HANDLE, PCWSTR);
+    if (sd_t sd = (sd_t)GetProcAddress(GetModuleHandleA("kernel32.dll"), "SetThreadDescription"))
+        sd(GetCurrentThread(), L"P-core keeper");
+    const char* ke = getenv("PORT_KEEPER_MS");
+    const DWORD idle_ms = ke && atoi(ke) >= 250 ? (DWORD)atoi(ke) : 5000;
+    /* hot roles: last tid placed for each (threads restart, e.g. a raw SPU on a checkpoint reload) */
+    enum { R_RENDER, R_FIFO, R_AUDIO, R_RAW0, R_LANE0 = R_RAW0 + 4, R_N = R_LANE0 + 16 };
+    DWORD done[R_N] = {};
+    DWORD kpin_done[4] = {};
+    const port_pcore_plan* hp = &s_pcore;
+    int quiet = 0, kwait = 0, replanned = 0;
+    for (;;) {
+        int fresh = 0;
+        /* main_core_keeper decides once, shortly after start-up: wait for it (<= 30 s) before placing hot threads */
+        const long kst = s_keeper_expected ? port_keeper_state : 2;
+        if (!kst && kwait < 30) { kwait++; Sleep(1000); continue; }
+        if (kst == 1 && !replanned) {
+            char kb[512];
+            replanned = 1;
+            port_pcore_query(&s_pcore_rest, port_keeper_rest);
+            if (s_pcore.why_off) s_pcore_rest.why_off = s_pcore.why_off;
+            hp = &s_pcore_rest;
+            fprintf(stderr, "[cpu] core keeper pins: hot threads by its rest mask 0x%llX: %s%c",
+                    (unsigned long long)port_keeper_rest, port_pcore_describe(&s_pcore_rest, kb, sizeof kb), 10);
+            fresh = 1;
+        }
+        /* threads the keeper hard-pins (main, RSX FIFO): no CPU sets */
+        if (kst == 1) {
+            static const char* const kn[4] = { "main guest thread", "RSX FIFO thread", "raw SPU 0", "audio synth lane" };
+            for (int i = 0; i < 4; i++) {
+                const DWORD t = (DWORD)port_keeper_tid[i];
+                if (!t || t == kpin_done[i]) continue;
+                port_pcore_place_tid(&s_pcore, t, kn[i], PORT_PCORE_PINNED | (i < 2 ? PORT_PCORE_PRIO : 0));
+                kpin_done[i] = t; fresh = 1;
+            }
+        }
+        for (int r = 0; r < R_N; r++) {
+            DWORD tid; char nm[48]; int role, idx = 0;
+            if (r == R_RENDER) { tid = (DWORD)rsx_render_host_tid(); snprintf(nm, sizeof nm, "RSX render thread"); role = PORT_PCORE_RENDER; }
+            else if (r == R_FIFO) { tid = (DWORD)rsx_fifo_host_tid(); snprintf(nm, sizeof nm, "RSX FIFO thread"); role = PORT_PCORE_FIFO; }
+            else if (r == R_AUDIO) { tid = (DWORD)cellAudio_mix_host_tid(); snprintf(nm, sizeof nm, "audio mixer"); role = PORT_PCORE_AUDIO; }
+            else if (r < R_LANE0) { idx = r - R_RAW0; tid = (DWORD)spu_raw_host_tid((unsigned)idx); snprintf(nm, sizeof nm, "raw SPU %d", idx); role = PORT_PCORE_RAW; }
+            else { idx = r - R_LANE0; tid = (DWORD)spurs_lane_host_tid((unsigned)idx); snprintf(nm, sizeof nm, "SPURS lane %d", idx); role = PORT_PCORE_LANE; }
+            if (!tid || tid == done[r] || tid == s_dbg_main_tid || port_keeper_pinned(tid)) continue;
+            port_pcore_place_role(hp, tid, nm, role, idx, r == R_RENDER || r == R_FIFO ? PORT_PCORE_PRIO : 0);
+            done[r] = tid; fresh = 1;
+        }
+        quiet = fresh ? 0 : quiet + 1;
+        Sleep(quiet >= 5 ? idle_ms : 2000);
+    }
+}
+/* Called on the main guest thread. */
+static void pcore_hot_start(void)
+{
+    char buf[256];
+    port_pcore_query(&s_pcore, 0);
+    fprintf(stderr, "[cpu] %s%c", port_pcore_describe(&s_pcore, buf, sizeof buf), 10);
+    if (s_pcore.why_off && !(port_thread_priority_env() && port_thread_placement_env())) return;
+    { const char* mc = getenv("RFOM_MAIN_CORE");   /* main_core_keeper's own start / pin rules */
+      DWORD_PTR pa = 0, sa = 0; int n = 0;
+      if (GetProcessAffinityMask(GetCurrentProcess(), &pa, &sa)) for (DWORD_PTR m = pa; m; m &= m - 1) n++;
+      s_keeper_expected = !(mc && atoi(mc) == 0) && (n >= 12 || (mc && atoi(mc) > 0)); }
+    port_pcore_place_role(&s_pcore, GetCurrentThreadId(), "main guest thread", PORT_PCORE_MAIN, 0, PORT_PCORE_PRIO);
+    HANDLE h = CreateThread(NULL, 0, pcore_keeper, NULL, 0, NULL);
+    if (h) CloseHandle(h);
 }
 /* v147: F6 = 10 s "pad watch". Hardware data breakpoints (debug registers)
  * on the main thread over the right-stick bytes of the guest's pad buffer
@@ -971,7 +1080,7 @@ static DWORD WINAPI debug_console(LPVOID param)
             /* pad <hexbuttons> <lx> <ly> <rx> <ry> <ms>: hold on port 0 (sticks 0..255, 128 = centre) */
             unsigned bt = 0, lx = 128, ly = 128, rx = 128, ry = 128, ms = 500;
             sscanf(cmd, "%*s %x %u %u %u %u %u", &bt, &lx, &ly, &rx, &ry, &ms);
-            g_pad_inj_btn = bt; g_pad_inj_sticks = ((lx & 255) << 24) | ((ly & 255) << 16) | ((rx & 255) << 8) | (ry & 255);
+            g_pad_inj_clear = 0; g_pad_inj_btn = bt; g_pad_inj_sticks = ((lx & 255) << 24) | ((ly & 255) << 16) | ((rx & 255) << 8) | (ry & 255);
             g_pad_inj_until = ps3_ms_now() + ms;
             dbg_printf("  pad btn=0x%04X l=(%u,%u) r=(%u,%u) for %u ms%c", bt, lx, ly, rx, ry, ms, 10);
         } else if (!strcmp(verb, "spu")) {

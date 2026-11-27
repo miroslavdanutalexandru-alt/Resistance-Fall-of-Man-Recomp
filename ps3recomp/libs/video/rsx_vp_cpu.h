@@ -331,6 +331,51 @@ static int vpcpu_vote(const double (*Ms)[16], int n, double tol, int* agree)
     if (bc < 2 || bc * 2 < n) return -1;
     return best;
 }
+/* RFOM_DLSS_CAM_TOL2: a vote that needs a strict majority of at least min_agree candidates and a unique
+ * winning group (no other candidate with the same count more than tol away). Returns its index or -1. */
+static int vpcpu_vote_majority(const double (*Ms)[16], int n, double tol, int min_agree, int* agree)
+{
+    int cnt[32], best = -1, bc = 0;
+    if (agree) *agree = 0;
+    if (n < 1 || n > 32) return -1;
+    for (int i = 0; i < n; i++) {
+        cnt[i] = 0;
+        for (int j = 0; j < n; j++) if (i == j || vpcpu_mdist(Ms[i], Ms[j]) <= tol) cnt[i]++;
+        if (cnt[i] > bc) { bc = cnt[i]; best = i; }
+    }
+    if (agree) *agree = bc;
+    if (bc < min_agree || bc * 2 <= n) return -1;
+    for (int i = 0; i < n; i++)
+        if (cnt[i] == bc && vpcpu_mdist(Ms[best], Ms[i]) > tol) return -1;
+    return best;
+}
+/* RFOM_DLSS_CAM_MEDOID: when the vote fails (R1 run_r19z: 35-43% of frames in combat; the candidates
+ * spread 0.002-0.02 ndc apart), the candidate with the smallest median distance to the others. Taken
+ * only when that median `spread` is at most `rel` times its own distance from "no camera motion" (rel
+ * 1/3: nearer than identity, the old fallback, by 2x for every candidate within the spread) and at most
+ * max_spread ndc, with 3+ candidates. Returns its index or -1. */
+static int vpcpu_medoid(const double (*Ms)[16], int n, double max_spread, double rel, double* spread, double* motion)
+{
+    static const double I[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
+    double d[32][32];
+    int best = -1; double br = 1e30;
+    if (spread) *spread = 0.0;
+    if (motion) *motion = 0.0;
+    if (n < 3 || n > 32) return -1;
+    for (int i = 0; i < n; i++) for (int j = i; j < n; j++) d[i][j] = d[j][i] = i == j ? 0.0 : vpcpu_mdist(Ms[i], Ms[j]);
+    for (int i = 0; i < n; i++) {
+        double v[32]; int m = 0;
+        for (int j = 0; j < n; j++) if (j != i) v[m++] = d[i][j];
+        for (int a = 1; a < m; a++) { const double t = v[a]; int b = a - 1; while (b >= 0 && v[b] > t) { v[b + 1] = v[b]; b--; } v[b + 1] = t; }
+        const double med = v[(m - 1) / 2];   /* lower median of the n - 1 distances */
+        if (med < br) { br = med; best = i; }
+    }
+    const double mo = vpcpu_mdist(Ms[best], I);
+    if (spread) *spread = br;
+    if (motion) *motion = mo;
+    if (!(br <= max_spread) || !(mo < 1e8) || !(br <= rel * mo)) return -1;
+    return best;
+}
 /* Camera cut: the view changed so much that last frame's image is no help --
  * at least 7 of 9 screen points (depth 0.999) come from off screen / behind the
  * camera, or they moved more than `far_ndc` on average. */

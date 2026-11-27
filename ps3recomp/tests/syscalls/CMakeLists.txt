@@ -48,3 +48,8 @@ set_tests_properties(lock_line PROPERTIES
     LABELS "runtime;syscalls"
     TIMEOUT 30
 )
+
+# perf pass 9: runtime/platform/port_hires_sleep.h (header only)
+add_executable(test_hires_sleep test_hires_sleep.c)
+add_test(NAME hires_sleep COMMAND test_hires_sleep)
+set_tests_properties(hires_sleep PROPERTIES LABELS "runtime;platform" TIMEOUT 30)

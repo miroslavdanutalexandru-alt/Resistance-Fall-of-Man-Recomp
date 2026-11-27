@@ -27,7 +27,7 @@ if (Test-Path "$Repo\VERSION") { $version = (Get-Content "$Repo\VERSION" -TotalC
 
 # Paths (forward slashes, relative to the repo) that must never be shipped.
 $block = @(
-    '^(game|gamefiles|gamedata|recompiled[^/]*|build[^/]*|dist|logs|shadercache|rsxcap|scratch|cache|lle|fpval)/',
+    '^(game|gamefiles|gamedata|recompiled[^/]*|build[^/]*|dist|logs|shadercache|rsxcap|scratch|cache|tools_cache|lle|fpval)/',
     '^tools/(key_vault\.cpp|ffmpeg_bin/|dlss/|xess/|shaderscan\.exe(\.download)?$)',
     '^project/spu/[^/]+/',
     '(^|/)(EBOOT\.BIN|PARAM\.SFO|PS3_DISC\.SFB)$',
@@ -67,6 +67,9 @@ if (-not $Launcher) {
 }
 if (-not $Launcher -or -not (Test-Path $Launcher)) { throw "No Launcher.exe found. Build it first (build.bat), or pass -Launcher <path>." }
 Copy-Item $Launcher "$Stage\Launcher.exe" -Force
+# Setup.exe (the window with the progress bar) is what the installer opens after installing.
+if (-not (Test-Path "$Repo\Setup.exe")) { throw "No Setup.exe found. Build it first: tools\installer\setup_exe\build_setup.bat" }
+Copy-Item "$Repo\Setup.exe" "$Stage\Setup.exe" -Force
 foreach ($h in 'RFoMSwitch.exe') {
     $src = @("$Repo\build_dist\$h", "$Repo\build\$h") | Where-Object { Test-Path $_ } | Select-Object -First 1
     if ($src) { Copy-Item $src "$Stage\$h" -Force }

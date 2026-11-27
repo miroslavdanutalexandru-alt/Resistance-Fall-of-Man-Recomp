@@ -2501,8 +2501,52 @@ extern "C" void ps3_indirect_call_to(ppu_context* ctx, uint32_t target)
     ps3_indirect_call(ctx);
 }
 
+/* Fast path for the common case (perf round 8): no diagnostic switch set, the
+ * target is non-zero and registered, depth below the cap. Same steps as the
+ * full path below minus the per-call env/diagnostic checks; anything else
+ * (null/unknown target, recursion cap) falls through to the full path with the
+ * call state untouched. PPU_ICALL_FULL=1 always takes the full path. */
+static int icall_diag_on(void)
+{
+    static const char* const k[] = {
+        "PPU_ICALL_FULL", "PPU_CSCHECK", "PS3_ICALL_GATE", "BCTRL_RING", "PS3_BREADCRUMB",
+        "PPU_TOCWATCH", "PS3_CALLTRACE", "PS3_CALLTRACE_LR", "PS3_CALLTRACE_TO",
+        "PS3_CALLTRACE_FROM", "PS3_CALLTRACE_R5", "FLOW_FORCE_RTCFG", "SPURS_TRACE",
+        "PS3_PRX_CALLTRACE", "PPU_TOCFIX", "PPU_RETWATCH" };
+    for (unsigned i = 0; i < sizeof k / sizeof k[0]; i++) {
+        const char* e = getenv(k[i]);
+        if (e && (i != 0 || (*e && *e != '0'))) return 1;
+    }
+    return 0;
+}
+
 extern "C" void ps3_indirect_call(ppu_context* ctx)
 {
+    static int s_diag = -1;
+    if (s_diag < 0) s_diag = icall_diag_on();
+    if (!s_diag) {
+        const int had_target = g_icall_target_set;
+        const uint32_t addr = had_target ? g_icall_target : (uint32_t)ctx->ctr;
+        ppu_fn fn = addr ? ppu_lookup(addr) : (ppu_fn)0;
+        if (fn && g_dispatch_depth <= 4000) {
+            g_icall_target_set = 0;
+            g_active_ctx = ctx;
+            g_dispatch_depth++;
+            if (g_vcall_sp < 128) g_vcall_stk[g_vcall_sp] = addr;
+            g_vcall_sp++;
+            fn(ctx);
+            while (g_trampoline_fn) {
+                void (*tf)(void*) = g_trampoline_fn;
+                g_trampoline_fn = 0;
+                tf(ctx);
+            }
+            if (g_vcall_sp > 0) g_vcall_sp--;
+            g_dispatch_depth--;
+            return;
+        }
+        ps3_indirect_call_impl(ctx);
+        return;
+    }
     static int on = -1;
     if (on < 0) on = getenv("PPU_CSCHECK") ? 1 : 0;
     { static int hg = -1; if (hg < 0) hg = getenv("PS3_ICALL_GATE") ? 1 : 0;
@@ -3146,6 +3190,71 @@ extern "C" __attribute__((weak)) void ppu_gcm_pump(void);
  * in lv2_syscall() below. */
 #define PS3_SC_INFLIGHT_MAX 64
 extern "C" uint32_t g_sc_inflight[PS3_SC_INFLIGHT_MAX] = { 0 };
+/* Last lv2 syscall number per guest thread (kept after it returns): crash reports. */
+extern "C" uint32_t g_sc_last[PS3_SC_INFLIGHT_MAX] = { 0 };
+/* Hang reports (guest_threads): first argument (r3: the wait object / address)
+ * and entry time (GetTickCount64 ms) of the last syscall, per guest thread. */
+static uint32_t g_sc_arg[PS3_SC_INFLIGHT_MAX];
+static uint64_t g_sc_t0[PS3_SC_INFLIGHT_MAX];
+
+/* Crash reporter (port_crash.h guest_state): the calling host thread's guest
+ * PPU state. Runs on the faulting thread, maybe out of stack: loads only.
+ * Lifted code does not keep cia current, so the guest "pc" is the lifted
+ * function of the host pc (resolved by the reporter) plus lr / the last
+ * syscall callsite here. Returns 0 when this is not a guest thread. */
+extern "C" unsigned ppu_thread_prof_pc(unsigned tid);
+extern "C" int ppu_crash_guest_state(uint64_t* tid, uint32_t* lr, uint32_t* sp, uint32_t* sc_in,
+                                     uint32_t* sc_last, uint32_t* callsite)
+{
+    ppu_context* c = g_active_ctx;
+    if (!c) return 0;
+    const uint64_t t = c->thread_id;
+    *tid = t; *lr = (uint32_t)c->lr; *sp = (uint32_t)c->gpr[1];
+    *sc_in = t < PS3_SC_INFLIGHT_MAX ? g_sc_inflight[t] : 0;
+    *sc_last = t < PS3_SC_INFLIGHT_MAX ? g_sc_last[t] : 0;
+    *callsite = ppu_thread_prof_pc((unsigned)t);
+    return 1;
+}
+
+/* Crash reporter (port_crash.h guest_threads): one line per live guest thread
+ * -- the syscall it is blocked in with its first argument and for how long,
+ * or the last one and how long ago, plus the last syscall/HLE callsite. Runs
+ * on the reporter / watchdog thread while the game may still run: loads only,
+ * values may be a moment stale. */
+extern "C" int ppu_prof_snapshot(int idx, unsigned* tid, unsigned* cia, const char** name);
+extern "C" size_t ppu_crash_guest_threads(char* buf, size_t cap)
+{
+    if (!buf || cap < 2) return 0;
+    size_t n = 0;
+    buf[0] = 0;
+    const uint64_t now = GetTickCount64();
+    for (int i = 0; i < PS3_SC_INFLIGHT_MAX; i++) {
+        unsigned tid = 0, pc = 0; const char* nm = nullptr;
+        if (!ppu_prof_snapshot(i, &tid, &pc, &nm)) continue;
+        const uint32_t in = tid < PS3_SC_INFLIGHT_MAX ? g_sc_inflight[tid] : 0;
+        const uint32_t last = tid < PS3_SC_INFLIGHT_MAX ? g_sc_last[tid] : 0;
+        const uint32_t arg = tid < PS3_SC_INFLIGHT_MAX ? g_sc_arg[tid] : 0;
+        const uint64_t t0 = tid < PS3_SC_INFLIGHT_MAX ? g_sc_t0[tid] : 0;
+        const double ago = (t0 && now >= t0) ? (double)(now - t0) / 1000.0 : 0.0;
+        char line[256];
+        int k;
+        if (in)
+            k = snprintf(line, sizeof line, "tid %2u %-20.20s IN syscall %u (r3=0x%08X) for %.1f s, callsite 0x%08X\n",
+                         tid, nm ? nm : "?", in, arg, ago, pc);
+        else if (last)
+            k = snprintf(line, sizeof line, "tid %2u %-20.20s running; last syscall %u (r3=0x%08X) %.1f s ago, callsite 0x%08X\n",
+                         tid, nm ? nm : "?", last, arg, ago, pc);
+        else
+            k = snprintf(line, sizeof line, "tid %2u %-20.20s no syscall yet, callsite 0x%08X\n", tid, nm ? nm : "?", pc);
+        if (k <= 0) continue;
+        if ((size_t)k >= sizeof line) k = (int)sizeof line - 1;
+        if (n + (size_t)k + 1 > cap) break;
+        memcpy(buf + n, line, (size_t)k);
+        n += (size_t)k;
+        buf[n] = 0;
+    }
+    return n;
+}
 
 extern "C" void lv2_syscall(ppu_context* ctx)
 {
@@ -3190,7 +3299,8 @@ extern "C" void lv2_syscall(ppu_context* ctx)
                       } }
     } _sg{ ctx, num, PS3_FT_ON() ? ps3_ft_now() : 0, (uint32_t)ctx->lr };
     { unsigned t = (unsigned)ctx->thread_id;
-      if (t < PS3_SC_INFLIGHT_MAX) g_sc_inflight[t] = (uint32_t)num; }
+      if (t < PS3_SC_INFLIGHT_MAX) { g_sc_inflight[t] = (uint32_t)num; g_sc_last[t] = (uint32_t)num;
+                                     g_sc_arg[t] = (uint32_t)ctx->gpr[3]; g_sc_t0[t] = GetTickCount64(); } }
     /* Guest-PC breadcrumb for the sampling profiler: record the syscall
      * callsite (lr) in the runtime-side thread info. cia itself is the thread
      * entry OPD (load-bearing for the entry trampoline) -- do not touch it. */

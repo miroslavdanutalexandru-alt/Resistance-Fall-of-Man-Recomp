@@ -8,6 +8,7 @@
  * device output for gaps and discontinuities and that the tempo recovers.
  */
 #include "../audio_out.h"
+#include "../audio_adapt.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -212,6 +213,60 @@ int main()
         CHECK(j < 3 * CLEAN_STEP, "hitch: click %.4f", j);
         CHECK(g > 50 && g < 300, "hitch: gap %.1f ms", g);
         CHECK(r.recover_ms >= 0 && r.recover_ms < 3000, "hitch: tempo did not recover");
+    }
+
+    {   /* audio_adapt.h drift steer: device crystal +-300 ppm off the QPC clock, 10 ms device period jitter
+         * on the measured level. Converges on the drift, keeps the buffer at the target, small steps. */
+        const double drifts[] = { 300e-6, -300e-6, 0.0 };
+        for (double dr : drifts) {
+            AudioDrift d = {};
+            const double target = 100 * 48.0, lim = 0.03;
+            double level = target, fill_sum = 0, smax = 0; unsigned n = 0;
+            Rng rng{7};
+            for (double t = 0; t < 180.0; ) {
+                const double meas = level + (rng.next() - 0.5) * PERIOD;
+                const double s = audio_drift_step(&d, meas / target, lim);
+                if (fabs(s) > smax) smax = fabs(s);
+                const double dt = BLOCK / (double)RATE * (1.0 - s);
+                level += BLOCK - RATE * (1.0 + dr) * dt;
+                t += dt;
+                if (t > 120.0) { fill_sum += level / target; n++; }
+            }
+            const double ppm = audio_drift_ppm(&d), fill = fill_sum / n;
+            printf("drift %+5.0f ppm: estimated %+6.0f ppm, buffer avg %.3f of the target, max step %.2f%%\n",
+                   dr * 1e6, ppm, fill, smax * 100.0);
+            CHECK(fabs(ppm - dr * 1e6) < 100.0, "drift: estimate %.0f ppm for %.0f", ppm, dr * 1e6);
+            CHECK(fabs(fill - 1.0) < 0.03, "drift: buffer settled at %.3f of the target", fill);
+            CHECK(smax <= lim + 1e-12, "drift: step %.4f above the catch-up limit", smax);
+        }
+        AudioDrift d = {};   /* empty buffer: full catch-up speed, like the old bang-bang */
+        CHECK(fabs(audio_drift_step(&d, 0.0, 0.03) - 0.03) < 1e-9, "drift: empty buffer not at full catch-up");
+    }
+    {   /* audio_adapt.h adaptive target + audio_out_set_target */
+        AudioAdapt a; audio_adapt_init(&a, 150, 300);
+        CHECK(audio_adapt_window(&a, 0, 0.0) == 0, "adapt: clean window changed the target");
+        CHECK(audio_adapt_window(&a, 0, 1.0) == 0, "adapt: 1%% stretch raised the target");
+        CHECK(audio_adapt_window(&a, 1, 0.0) == 175, "adapt: underrun did not raise to 175");
+        CHECK(audio_adapt_window(&a, 0, 5.0) == 200, "adapt: stretching did not raise to 200");
+        for (int i = 0; i < 10; i++) audio_adapt_window(&a, 3, 0.0);
+        CHECK(a.cur_ms == 300 && audio_adapt_window(&a, 1, 0.0) == 0, "adapt: not capped at 300 (%u)", a.cur_ms);
+        unsigned lowered = 0;
+        for (int i = 0; i < AUDIO_ADAPT_DECAY_WINDOWS; i++) lowered = audio_adapt_window(&a, 0, 0.0);
+        CHECK(lowered == 275, "adapt: 5 clean minutes did not step down (%u)", lowered);
+        for (int i = 0; i < 20 * AUDIO_ADAPT_DECAY_WINDOWS; i++) audio_adapt_window(&a, 0, 0.0);
+        CHECK(a.cur_ms == 150, "adapt: did not return to the configured buffer (%u)", a.cur_ms);
+        AudioAdapt off; audio_adapt_init(&off, 150, 150);   /* PORT_AUDIO_ADAPTIVE=0 */
+        CHECK(audio_adapt_window(&off, 5, 50.0) == 0, "adapt: off but raised");
+
+        AudioOutConfig cfg; audio_out_default_config(&cfg, RATE, 150);
+        cfg.ring_frames = 2 * 300 * 48;
+        AudioOut* ao = audio_out_create(&cfg);
+        CHECK(audio_out_set_target(ao, 300 * 48) == 300 * 48 && audio_out_config(ao)->target_frames == 300 * 48,
+              "set_target: 300 ms not applied");
+        CHECK(audio_out_config(ao)->resume_frames == 75 * 48, "set_target: resume not a quarter of the target");
+        CHECK(audio_out_set_target(ao, 1000 * 48) == 300 * 48, "set_target: not clamped to half the ring");
+        audio_out_destroy(ao);
+        printf("adaptive target: 150 -> 175 -> 200 ... 300 cap, steps back after 5 clean minutes; set_target clamps to the ring\n");
     }
 
     printf(g_fail ? "FAILED (%d)\n" : "ALL PASSED\n", g_fail);

@@ -22,8 +22,7 @@ static ppu_context call(int fd, uint32_t size, uint32_t entries=0x100, uint32_t 
 int main(int argc, char** argv) {
     assert(argc==2); uint8_t memory[65536]={}; vm_base=memory;
     DIR* d=opendir(argv[1]); assert(d);
-    int fd=fd_alloc_dir(d); assert(fd>=3);
-    snprintf(g_dir_path[fd],sizeof g_dir_path[fd],"%s",argv[1]);
+    int fd=fd_alloc_dir(d,argv[1]); assert(fd>=3);
     assert(uint32_t(call(fd,312,0).gpr[3])==0x8001000Du);
     assert(uint32_t(call(fd,312,0x100,0).gpr[3])==0x8001000Du);
     assert(uint32_t(call(999,312).gpr[3])==0x8001002Au);
@@ -52,7 +51,7 @@ int main(int argc, char** argv) {
     }
     assert(names.count("payload") && names.count("folder") && names.count(".hidden"));
     assert(call(fd,312).gpr[3]==0 && read32(0x80)==0); // stable EOF
-    closedir(d); g_dirs[fd]=nullptr;
+    { ppu_context c={}; c.gpr[3]=fd; cellFsClosedir(&c); assert(c.gpr[3]==0); }
     assert(uint32_t(call(fd,312).gpr[3])==0x8001002Au);
     puts("PASS: PPU directory-entry ABI, batching, bounds, errors, and EOF");
 }

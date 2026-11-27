@@ -14,6 +14,7 @@
 #include <dxgi1_4.h>
 #include <cstdio>
 #include <cstdarg>
+#include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <mutex>
@@ -39,6 +40,7 @@ std::wstring g_dir;
 const sl::ViewportHandle g_vp(0u);
 std::mutex g_tok_mu;
 unsigned long long g_render_id;   // frame id of the RENDERSUBMIT_START marker (render thread)
+sl::ReflexMode g_reflex_mode = sl::ReflexMode::eLowLatency;
 
 PFun_slInit* p_slInit;
 PFun_slShutdown* p_slShutdown;
@@ -91,7 +93,39 @@ void SlLog(sl::LogType type, const char* msg)
     while (n && (msg[n - 1] == '\n' || msg[n - 1] == '\r')) n--;
     if (n > sizeof b - 1) n = sizeof b - 1;
     memcpy(b, msg, n); b[n] = 0;
-    Log("Streamline %s: %s", type == sl::LogType::eError ? "error" : "warning", b);
+    // Some messages repeat every frame (RSYNC "Inconsistency detected" when the NVIDIA profile forces VSync:
+    // ~3 per frame, tens of thousands per session). Compare them without the leading [time][streamline]
+    // [level][tid][elapsed] tags; log the first, then one line per 1000 repeats or 10 s with the count.
+    const char* key = b;
+    while (*key == '[') { const char* e = strchr(key, ']'); if (!e) break; key = e + 1; }
+    struct Rep { std::string key; unsigned long long last_ms; unsigned skipped, use; };
+    static Rep reps[16];
+    static unsigned use_clock;
+    static std::mutex mu;
+    unsigned skipped = 0;
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        const unsigned long long now = GetTickCount64();
+        Rep* r = nullptr;
+        Rep* lru = &reps[0];
+        for (Rep& x : reps) {
+            if (x.use && x.key == key) { r = &x; break; }
+            if (x.use < lru->use) lru = &x;
+        }
+        if (r) {
+            r->use = ++use_clock;
+            if (r->skipped + 1 < 1000 && now - r->last_ms < 10000) { r->skipped++; return; }
+            skipped = r->skipped;
+            r->skipped = 0;
+            r->last_ms = now;
+        } else {
+            lru->key = key; lru->last_ms = now; lru->skipped = 0; lru->use = ++use_clock;
+        }
+    }
+    if (skipped)
+        Log("Streamline %s: %s (%u identical messages not logged)", type == sl::LogType::eError ? "error" : "warning", b, skipped);
+    else
+        Log("Streamline %s: %s", type == sl::LogType::eError ? "error" : "warning", b);
 }
 
 sl::FrameToken* Token(unsigned long long id)
@@ -110,6 +144,37 @@ template <class T> bool GetFn(sl::Feature f, const char* name, T*& out)
     if (p_slGetFeatureFunction(f, name, p) != sl::Result::eOk || !p) { Log("missing Streamline function %s", name); return false; }
     out = reinterpret_cast<T*>(p);
     return true;
+}
+
+// NGX snippets (nvngx_dlssg.dll) carry only NVIDIA's ordinary Authenticode signature, not the secondary
+// Streamline signature sl::security::verifyEmbeddedSignature requires of the sl.* plugins (which rejected
+// every shipped nvngx_dlssg.dll). Check them the standard way: valid for the OS, signed by NVIDIA Corporation.
+bool SignedByNvidiaAuthenticode(const wchar_t* path)
+{
+    WINTRUST_FILE_INFO fi{};
+    fi.cbStruct = sizeof fi;
+    fi.pcwszFilePath = path;
+    WINTRUST_DATA wd{};
+    wd.cbStruct = sizeof wd;
+    wd.dwUIChoice = WTD_UI_NONE;
+    wd.fdwRevocationChecks = WTD_REVOKE_NONE;
+    wd.dwUnionChoice = WTD_CHOICE_FILE;
+    wd.pFile = &fi;
+    wd.dwStateAction = WTD_STATEACTION_VERIFY;
+    GUID act = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+    bool ok = WinVerifyTrust(nullptr, &act, &wd) == ERROR_SUCCESS;
+    if (ok) {
+        wchar_t org[128] = L"";
+        CRYPT_PROVIDER_DATA* pd = WTHelperProvDataFromStateData(wd.hWVTStateData);
+        CRYPT_PROVIDER_SGNR* sg = pd ? WTHelperGetProvSignerFromChain(pd, 0, FALSE, 0) : nullptr;
+        CRYPT_PROVIDER_CERT* pc = sg ? WTHelperGetProvCertFromChain(sg, 0) : nullptr;
+        if (pc && pc->pCert)
+            CertGetNameStringW(pc->pCert, CERT_NAME_ATTR_TYPE, 0, (void*)szOID_ORGANIZATION_NAME, org, 128);
+        ok = wcscmp(org, L"NVIDIA Corporation") == 0;
+    }
+    wd.dwStateAction = WTD_STATEACTION_CLOSE;
+    WinVerifyTrust(nullptr, &act, &wd);
+    return ok;
 }
 
 void SetIdentity(sl::float4x4& m)
@@ -135,7 +200,9 @@ __declspec(dllexport) int rfom_dlssg_init(ID3D12Device* dev, const wchar_t* dir,
     for (const wchar_t* f : kSigned) {
         const std::wstring p = g_dir + L"\\" + f;
         if (GetFileAttributesW(p.c_str()) == INVALID_FILE_ATTRIBUTES) { Log("%ls not found", f); return 0; }
-        if (!sl::security::verifyEmbeddedSignature(p.c_str())) { Log("%ls is not signed by NVIDIA -- refusing to load it", f); return 0; }
+        const bool ngx = wcsncmp(f, L"nvngx_", 6) == 0;
+        if (!(ngx ? SignedByNvidiaAuthenticode(p.c_str()) : sl::security::verifyEmbeddedSignature(p.c_str()))) {
+            Log("%ls is not signed by NVIDIA -- refusing to load it", f); return 0; }
     }
     g_mod = LoadLibraryW(interposer.c_str());
     if (!g_mod) { Log("cannot load sl.interposer.dll (error %lu)", GetLastError()); return 0; }
@@ -185,13 +252,16 @@ __declspec(dllexport) int rfom_dlssg_init(ID3D12Device* dev, const wchar_t* dir,
         !GetFn(sl::kFeaturePCL, "slPCLSetMarker", p_slPCLSetMarker))
         return 0;
     sl::ReflexOptions ro{};
-    ro.mode = reflex >= 2 ? sl::ReflexMode::eLowLatencyWithBoost : sl::ReflexMode::eLowLatency;
-    ro.frameLimitUs = 0;                 // never a frame limiter: RFOM_FPS caps the rendered frames
+    g_reflex_mode = reflex >= 2 ? sl::ReflexMode::eLowLatencyWithBoost : sl::ReflexMode::eLowLatency;
+    ro.mode = g_reflex_mode;
+    ro.frameLimitUs = 0;                 // no limit until rfom_dlssg_set_limit (the game's frame cap, rfom_reflex.cpp)
     ro.useMarkersToOptimize = true;
     r = p_slReflexSetOptions(ro);
     if (r != sl::Result::eOk) { Log("slReflexSetOptions failed: %s", ResStr(r)); return 0; }
     sl::DLSSGOptions o{};
     o.mode = sl::DLSSGMode::eOff;
+    // never free on off: re-allocation stutters. RFOM_DLSSG_INIT_RETAIN=0: old (flagless) init call.
+    { const char* e = getenv("RFOM_DLSSG_INIT_RETAIN"); if (!(e && *e == '0')) o.flags = sl::DLSSGFlags::eRetainResourcesWhenOff; }
     p_slDLSSGSetOptions(g_vp, o);
     return 1;
 }
@@ -248,6 +318,20 @@ __declspec(dllexport) void rfom_dlssg_sleep(unsigned long long id)
     if (t) p_slReflexSleep(*t);
 }
 
+// Game thread (rfom_reflex.cpp, before the sleep): Reflex's frame limit in microseconds per rendered frame
+// (before frame generation), 0 = no limit. Returns 1 when Streamline accepted it.
+__declspec(dllexport) int rfom_dlssg_set_limit(unsigned us)
+{
+    if (!g_init || !p_slReflexSetOptions) return 0;
+    sl::ReflexOptions ro{};
+    ro.mode = g_reflex_mode;
+    ro.frameLimitUs = us;
+    ro.useMarkersToOptimize = true;
+    const sl::Result r = p_slReflexSetOptions(ro);
+    if (r != sl::Result::eOk) { Log("slReflexSetOptions (frame limit %u us) failed: %s", us, ResStr(r)); return 0; }
+    return 1;
+}
+
 // F3 overlay: average latency over the driver's last frames (same arithmetic as rfom_reflex.cpp).
 __declspec(dllexport) int rfom_dlssg_latency(double* total_ms, double* render_ms, double* gpu_ms)
 {
@@ -275,6 +359,19 @@ __declspec(dllexport) int rfom_dlssg_latency(double* total_ms, double* render_ms
 // current -> previous, camera motion included). There are no camera matrices in a recompiled PS3 renderer:
 // the projection is a synthetic perspective one (DLSS-G uses the matrices only for its depth-based
 // disocclusion heuristics; the motion vectors carry the real motion).
+// Render thread, right before rfom_dlssg_tag: the frame's camera (rsx_fsr.inc cam_solve through rfom_fg_cam.h):
+// Streamline's row-vector clipToPrevClip / prevClipToClip and the real near / far / vertical fov. Used by the next
+// tag only; a frame without it gets the identity (camera never moves) and the placeholder projection.
+namespace { bool g_cam_set; float g_cam_c2p[16], g_cam_p2c[16], g_cam_n, g_cam_f, g_cam_fov; }
+__declspec(dllexport) void rfom_dlssg_camera(const float* c2p, const float* p2c, float n, float f, float fov)
+{
+    if (!c2p || !p2c) return;
+    memcpy(g_cam_c2p, c2p, sizeof g_cam_c2p);
+    memcpy(g_cam_p2c, p2c, sizeof g_cam_p2c);
+    g_cam_n = n; g_cam_f = f; g_cam_fov = fov;
+    g_cam_set = true;
+}
+
 __declspec(dllexport) int rfom_dlssg_tag(ID3D12GraphicsCommandList* cl, ID3D12Resource* depth, unsigned dstate,
                                          ID3D12Resource* mv, unsigned mstate, unsigned rw, unsigned rh,
                                          float jx, float jy, int reset)
@@ -282,7 +379,9 @@ __declspec(dllexport) int rfom_dlssg_tag(ID3D12GraphicsCommandList* cl, ID3D12Re
     if (!g_init || !cl || !depth || !mv || !rw || !rh) return 0;
     sl::FrameToken* t = Token(g_render_id);
     if (!t) return 0;
-    const float n = 0.1f, f = 1000.0f, fov = 1.0f, asp = (float)rw / (float)rh;
+    const bool cam = g_cam_set && g_cam_n > 0.0f && g_cam_f > g_cam_n && g_cam_fov > 0.0f && g_cam_fov < 3.1f;
+    g_cam_set = false;
+    const float n = cam ? g_cam_n : 0.1f, f = cam ? g_cam_f : 1000.0f, fov = cam ? g_cam_fov : 1.0f, asp = (float)rw / (float)rh;
     const float ys = 1.0f / tanf(fov * 0.5f), xs = ys / asp;
     sl::Constants c{};
     for (uint32_t r = 0; r < 4; r++) c.cameraViewToClip.setRow(r, sl::float4(0, 0, 0, 0));
@@ -300,6 +399,11 @@ __declspec(dllexport) int rfom_dlssg_tag(ID3D12GraphicsCommandList* cl, ID3D12Re
     SetIdentity(c.clipToLensClip);
     SetIdentity(c.clipToPrevClip);
     SetIdentity(c.prevClipToClip);
+    if (cam)
+        for (uint32_t r = 0; r < 4; r++) {
+            c.clipToPrevClip.setRow(r, sl::float4(g_cam_c2p[r * 4], g_cam_c2p[r * 4 + 1], g_cam_c2p[r * 4 + 2], g_cam_c2p[r * 4 + 3]));
+            c.prevClipToClip.setRow(r, sl::float4(g_cam_p2c[r * 4], g_cam_p2c[r * 4 + 1], g_cam_p2c[r * 4 + 2], g_cam_p2c[r * 4 + 3]));
+        }
     c.jitterOffset = sl::float2(jx, jy);
     c.mvecScale = sl::float2(1.0f, 1.0f);
     c.cameraPinholeOffset = sl::float2(0.0f, 0.0f);
@@ -355,6 +459,22 @@ __declspec(dllexport) int rfom_dlssg_present_tags(ID3D12GraphicsCommandList* cl,
     return p_slSetTagForFrame(*t, g_vp, tags, n, reinterpret_cast<sl::CommandBuffer*>(cl)) == sl::Result::eOk;
 }
 
+// Frames without valid depth / motion vectors (video cutscenes, loading screens, menus without a 3D scene):
+// the DLSS-G guide asks for all tags to be set to null pointers rather than left at an older frame's.
+__declspec(dllexport) int rfom_dlssg_null_tags(ID3D12GraphicsCommandList* cl)
+{
+    if (!g_init || !cl) return 0;
+    sl::FrameToken* t = Token(g_render_id);
+    if (!t) return 0;
+    const sl::ResourceTag tags[4] = {
+        sl::ResourceTag(nullptr, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent),
+        sl::ResourceTag(nullptr, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilPresent),
+        sl::ResourceTag(nullptr, sl::kBufferTypeHUDLessColor, sl::ResourceLifecycle::eValidUntilPresent),
+        sl::ResourceTag(nullptr, sl::kBufferTypeUIColorAndAlpha, sl::ResourceLifecycle::eValidUntilPresent),
+    };
+    return p_slSetTagForFrame(*t, g_vp, tags, 4, reinterpret_cast<sl::CommandBuffer*>(cl)) == sl::Result::eOk;
+}
+
 // on: 0 off (resources kept), else frames to generate per rendered frame (1 = 2x, 2 = 3x, 3 = 4x).
 __declspec(dllexport) int rfom_dlssg_set_options(int gen, int ui_recomp, unsigned scw, unsigned sch, unsigned scfmt)
 {
@@ -362,9 +482,22 @@ __declspec(dllexport) int rfom_dlssg_set_options(int gen, int ui_recomp, unsigne
     sl::DLSSGOptions o{};
     o.mode = gen > 0 ? sl::DLSSGMode::eOn : sl::DLSSGMode::eOff;
     o.numFramesToGenerate = gen > 0 ? (uint32_t)gen : 1u;
-    // full-screen menu detection: DLSS-G stops generating over full-screen menus drawn on top of the scene
-    // (the pause menu); menus without a 3D scene never get here (no DLSS inputs -> off)
-    o.flags = sl::DLSSGFlags::eRetainResourcesWhenOff | sl::DLSSGFlags::eEnableFullscreenMenuDetection;
+    // RFOM_DLSSG_MENU_DETECT (default auto: off while the HUD split keeps the UI out (ui_recomp), on otherwise --
+    // HDR or RFOM_FG_HUDSPLIT=0; 0 / 1 force it): DLSS-G's own full-screen menu detection. R1 r1_1448 / r1_1510:
+    // every 105-175 ms gameplay hitch (in off/on pairs ~1 s apart) is the render thread sleeping inside Streamline
+    // with a "setFlipConfig FC feedback" warning on the same frame, while the port never toggled generation --
+    // the detector switching generation off and on in combat. The pause menu is UI, which the HUD split should
+    // keep out of generated frames; menus without a 3D scene get no DLSS inputs (generation off).
+    static int forced = -2, last = -1;
+    if (forced == -2) { const char* e = getenv("RFOM_DLSSG_MENU_DETECT"); forced = e && *e == '1' ? 1 : e && *e == '0' ? 0 : -1; }
+    const int menu = forced >= 0 ? forced : !ui_recomp;
+    if (menu != last) {
+        last = menu;
+        Log("full-screen menu detection %s (%s)", menu ? "on" : "off",
+            forced >= 0 ? "forced by RFOM_DLSSG_MENU_DETECT" : menu ? "auto: HUD split not active" : "auto: HUD split keeps the UI out");
+    }
+    o.flags = sl::DLSSGFlags::eRetainResourcesWhenOff;
+    if (menu) o.flags = o.flags | sl::DLSSGFlags::eEnableFullscreenMenuDetection;
     o.numBackBuffers = 2;
     o.colorWidth = scw;
     o.colorHeight = sch;

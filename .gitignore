@@ -22,6 +22,7 @@
 /logs/
 /rsxcap/
 /Launcher.exe
+/HDUIPack.exe
 /settings.bat
 /settings.ini
 *.obj
@@ -57,10 +58,36 @@ __pycache__/
 # per-user online settings written by the launcher's Multiplayer page
 /net_hosts.txt
 /online.txt
-
-# local multiplayer research notes
-/docs/MULTIPLAYER-PLAN.md
+/online_id.txt
 
 # Setup.exe is attached to the GitHub release, not committed
 /Setup.exe
+# build tools Setup put into this folder (portable mode) and the list of what it installed
+/tools_cache/
 /scratch/RSXFIFOCommands*.pdf
+# HD UI pack (HDUIPack.exe, built from project\hd_ui_pack.cpp): texture dumps and the upscaler/models downloaded on the user's PC
+/texdump/
+/tools/upscaler/
+# PGO: pgo\<rN>.profdata is committed (build.bat uses it); training output and build stamps stay local
+/pgo/raw/
+/pgo/run_*/
+/pgo/*.profraw
+/pgo/*.sha256
+# PGO raw profiles anywhere (training runs write *.profraw next to the exe)
+*.profraw
+/pgo/raw*/
+# superseded developer PGO helper (scripts\pgo_*.ps1 + tools\pgo_train.bat replace it)
+/build_pgo.bat
+# per-save backups, crash-report staging, QA / replay run output: user data, never committed
+/saves_backup/
+/crash_report_work/
+/tools/qa/runs/
+/tools/replay/
+# logs and fall-detection dumps outside /logs/ (nothing tracked is a .log)
+*.log
+fall_*.bin
+# installer leftovers in a dev checkout (Inno Setup's uninstaller, the RFoMSwitch.exe it installs; build_installer.ps1 takes
+# RFoMSwitch.exe from build_dist\ or build\): never shipped from the root
+/unins*.dat
+/unins*.exe
+/RFoMSwitch.exe

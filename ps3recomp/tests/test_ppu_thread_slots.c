@@ -5,6 +5,12 @@
 #include "../runtime/syscalls/sys_ppu_thread.c"
 #include <assert.h>
 #include <time.h>
+#if defined(_MSC_VER)   /* MSVC / clang-cl CRT has no nanosleep */
+static int nanosleep(const struct timespec* ts, struct timespec* rem)
+{
+    (void)rem; Sleep((DWORD)(ts->tv_sec * 1000 + (ts->tv_nsec + 999999) / 1000000)); return 0;
+}
+#endif
 
 uint8_t* vm_base;
 uint32_t ppu_vm_size = 0x10000;
@@ -12,8 +18,19 @@ uint32_t ppu_vm_size = 0x10000;
 void ppu_resv_register(ppu_context* c) { (void)c; }
 int ps3_intr_is_handler(unsigned long long tid) { (void)tid; return 0; }
 int ps3_intr_wait(unsigned long long tid) { (void)tid; return 0; }
+uint32_t vm_read32(uint64_t a) { (void)a; return 0; }   /* game-specific diagnostics in the file read guest memory */
+uint32_t g_ppu_main_stack_top;
 
-static void guest_entry(ppu_context* ctx) { ctx->gpr[3] = 0; }   /* the thread body returns at once */
+static volatile int g_entry_exits;   /* 1: the body ends in sys_ppu_thread_exit, as games' threads do */
+static void guest_entry(ppu_context* ctx)   /* the thread body returns at once, or exits after a moment */
+{
+    ctx->gpr[3] = 0;
+    if (g_entry_exits) {
+        struct timespec ts = { 0, 200000 }; nanosleep(&ts, NULL);   /* let the joiner get into its wait first */
+        ctx->gpr[3] = 0x1234;
+        sys_ppu_thread_exit(ctx);
+    }
+}
 
 static int g_fails;
 #define EXPECT_EQ(got, want) do { long long g_ = (got), w_ = (want); if (g_ != w_) { g_fails++; \
@@ -99,9 +116,43 @@ int main(void)
         EXPECT_EQ(sys_ppu_thread_join(&ctx), 0);
         EXPECT_EQ(create(1, NULL), 0);
     }
+    settle();
+    for (int i = 1; i < PPU_THREAD_MAX; i++) {
+        ppu_context ctx; memset(&ctx, 0, sizeof(ctx));
+        ctx.gpr[3] = (uint64_t)i + 1;
+        EXPECT_EQ(sys_ppu_thread_join(&ctx), 0);
+    }
+    EXPECT_EQ(used_slots(), 0);
+
+    /* 5. R1 #17: a joinable thread that ends in sys_ppu_thread_exit while its joiner is already waiting. The joiner
+     *    wakes and frees the slot; the thread proc epilogue (reached by the unwind) then marked it FINISHED again, so
+     *    the slot was lost for good -- several per movie in Resistance until creates failed with EAGAIN. Every slot
+     *    must come back, and the exit status must reach the joiner. */
+    g_entry_exits = 1;
+    {
+        int lost_at = -1;
+        for (int i = 0; i < 4 * PPU_THREAD_MAX && lost_at < 0; i++) {
+            uint64_t tid = 0;
+            int64_t rc = create(1, &tid);
+            if (rc != 0) { lost_at = i; EXPECT_EQ(rc, 0); break; }
+            ppu_context ctx; memset(&ctx, 0, sizeof(ctx));
+            ctx.gpr[3] = tid;
+            ctx.gpr[4] = 0x200;    /* exit status out */
+            EXPECT_EQ(sys_ppu_thread_join(&ctx), 0);
+            uint64_t be; memcpy(&be, vm_base + 0x200, 8);
+            EXPECT_EQ(__builtin_bswap64(be), 0x1234);
+        }
+        settle();
+        for (int i = 0; i < 1000 && used_slots(); i++) { struct timespec ts = { 0, 1000000 }; nanosleep(&ts, NULL); }
+        if (used_slots()) fprintf(stderr, "  exit-before-epilogue: %d slot(s) lost (create failed at #%d)\n",
+                                  used_slots(), lost_at + 1);
+        EXPECT_EQ(used_slots(), 0);
+    }
+    g_entry_exits = 0;
 
     free(vm_base);
     if (g_fails) { fprintf(stderr, "%d check(s) failed\n", g_fails); return 1; }
-    puts("PASS: non-joinable PPU threads free their slot when they end; joinable ones keep it until joined");
+    puts("PASS: non-joinable PPU threads free their slot when they end; joinable ones keep it until joined, "
+         "also when they end in sys_ppu_thread_exit");
     return 0;
 }

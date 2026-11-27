@@ -36,8 +36,10 @@ namespace Gdiplus { using std::min; using std::max; }
 #include <shlobj.h>
 #include <tlhelp32.h>
 #include <knownfolders.h>
+#include <intrin.h>
 #include "rfom_autoconfig.h"
 #include "rfom_achievements.h"
+#include "port_ini_migrate.h"
 
 #ifdef _MSC_VER
 #pragma comment(lib, "gdiplus.lib")
@@ -65,7 +67,7 @@ struct Setting {
 
 enum { S_DISPLAY, S_WINDOW, S_FPS, S_VSYNC, S_RES, S_FSR, S_UPSCALE, S_ANISO, S_FILTER, S_SHARPEN,
        S_MONITOR, S_FOCUS, S_MENUFPS, S_QUIT, S_SAVES, S_PADGLYPHS,
-       S_ASPECT, S_PRESENT, S_OVERLAY, S_MODS, S_TEXPACK,
+       S_ASPECT, S_PRESENT, S_DSYNC, S_OVERLAY, S_MODS, S_TEXPACK,
        S_SENSY, S_ADS, S_AIMHOLD, S_DEADZONE, S_CURVE,
        S_PADBACKEND, S_GYRO, S_GYROSENS, S_GYROINVY, S_GYROSPACE, S_GYROCAL, S_LIGHTBAR, S_NSWAP, S_COUNT };
 static const int S_INPUT_FIRST = S_SENSY;   // the Controls page's options (reset with the controls)
@@ -78,13 +80,14 @@ static std::vector<Setting> g_set = {
       "The size of the game window in Windowed mode. Not used in Borderless fullscreen.",
       { {"1280 x 720", "1280x720"}, {"1600 x 900", "1600x900"}, {"1920 x 1080", "1920x1080"},
         {"2560 x 1440", "2560x1440"}, {"3840 x 2160", "3840x2160"} }, 2 },
-    { "fps", "Frame rate limit",
+    { "fps", "Frame rate",
       "The game runs at the same speed at any limit (each frame advances game time by the real time it "
       "took). 60 is the most tested; 120 and above are smooth but some scripted moments are less tested. "
-      "The PS3 ran at 30.",
-      { {"30  (PS3 original)", "30"}, {"55  (even on 165 Hz)", "55"}, {"60", "60"},
+      "The PS3 ran at 30. 40 suits a 40 Hz handheld mode (Steam Deck) or a 120 Hz screen; 45 a 90 Hz one. "
+      "Unlimited still stops at 240.",
+      { {"30  (PS3 original)", "30"}, {"40  (handheld 40 Hz)", "40"}, {"45", "45"}, {"55  (even on 165 Hz)", "55"}, {"60", "60"},
         {"72", "72"}, {"82  (even on 165 Hz)", "82"}, {"90", "90"}, {"120", "120"},
-        {"144", "144"}, {"165", "165"}, {"Just under refresh  (G-Sync / FreeSync)", "vrr"}, {"Unlimited", "0"} }, 2 },
+        {"144", "144"}, {"165", "165"}, {"Just under refresh  (G-Sync / FreeSync)", "vrr"}, {"Unlimited  (240)", "0"} }, 4 },
     { "vsync", "VSync",
       "Off is smoothest with a FreeSync / G-Sync monitor. 'Every 3rd refresh' gives an even 55 fps on a 165 Hz screen.",
       { {"Off", "0"}, {"Every refresh", "1"}, {"Every 2nd refresh", "2"}, {"Every 3rd refresh", "3"} }, 0 },
@@ -104,7 +107,7 @@ static std::vector<Setting> g_set = {
       "render resolution. Faster, slightly softer. Native = no upscaling (DLAA / FSR / XeSS native AA). "
       "XeSS picks its matching preset (Ultra Quality at 67%, Balanced at 50%, ...). "
       "The menus and HUD always stay at full resolution.",
-      { {"Native  (anti-aliasing only)", "1"}, {"Quality  (67%)", "0.667"}, {"Balanced  (58%)", "0.58"},
+      { {"Native  (DLAA / anti-aliasing only)", "1"}, {"Quality  (67%)", "0.667"}, {"Balanced  (58%)", "0.58"},
         {"Performance  (50%)", "0.5"}, {"Ultra Performance  (33%)", "0.333"} }, 0 },
     { "aniso", "Texture filtering",
       "Keeps floors and walls sharp when seen at an angle. 16x costs almost nothing on a modern GPU.",
@@ -112,8 +115,9 @@ static std::vector<Setting> g_set = {
         {"Anisotropic 8x", "8"}, {"Anisotropic 16x", "16"} }, 4 },
     { "filter", "Scaling",
       "How the image is resized to fit your screen when the sizes differ. Smooth suits most people; "
-      "Sharp pixels gives a crisp, blocky look.",
-      { {"Smooth", "linear"}, {"Sharp pixels", "point"} }, 0 },
+      "Sharp pixels gives a crisp, blocky look. AMD FSR 1 upscales with edge-aware filtering (sharper edges "
+      "than Smooth when the window is larger than the picture; Sharpening still applies on top).",
+      { {"Smooth", "linear"}, {"Sharp pixels", "point"}, {"AMD FSR 1", "fsr"} }, 0 },
     { "sharpen", "Sharpening",
       "Counteracts the softness of scaling and anti-aliasing. Off when the render resolution matches your "
       "screen and anti-aliasing is off.",
@@ -122,7 +126,7 @@ static std::vector<Setting> g_set = {
       "The screen the game opens on (borderless fullscreen fills that screen). Monitors are numbered in "
       "Windows' order with the main display first.",
       { {"Main display", "0"}, {"Monitor 2", "2"}, {"Monitor 3", "3"}, {"Monitor 4", "4"} }, 0 },
-    { "focus", "In the background",
+    { "background", "In the background",
       "What happens when you Alt+Tab away or click another window. Pausing also frees the CPU and GPU for "
       "the other program; the game picks up exactly where it was.",
       { {"Pause and mute", "pause"}, {"Mute only", "mute"}, {"Keep running", "run"} }, 0 },
@@ -134,16 +138,18 @@ static std::vector<Setting> g_set = {
       "F10, holding Esc for 1 second, or holding Start / Menu for 1.5 seconds asks \"Quit to desktop?\" "
       "(Enter / A = yes, Esc / B = no). The game waits for a save in progress before it closes.",
       { {"On", "1"}, {"Off  (Alt+F4 only)", "0"} }, 0 },
-    { "saves", "Save location",
+    { "savedir", "Save location",
       "Saved Games keeps your progress outside the port's folder ("
       "%USERPROFILE%\\Saved Games\\Resistance Fall of Man), so updating or reinstalling the port can't touch it. "
       "Saves already in the game folder are copied there on the next start.",
       { {"Saved Games folder", "savedgames"}, {"Game folder  (portable)", "portable"} }, 0 },
     { "padglyphs", "Controller button prompts",
       "Which button names the game shows while you play with a controller. Auto follows the controller in use "
-      "(PlayStation symbols for a DualShock / DualSense, Xbox buttons otherwise). Keyboard and mouse always show your keys. "
+      "(PlayStation symbols for a DualShock / DualSense, Nintendo letters for a Switch controller, Xbox buttons otherwise). "
+      "Keyboard and mouse always show your keys. "
+      "Keyboard keys shows your key bindings even while you use a controller. "
       "Also in the in-game PC menu (F10).",
-      { {"Auto", ""}, {"Xbox", "xbox"}, {"PlayStation", "ps"} }, 0 },
+      { {"Auto", ""}, {"Keyboard keys", "keys"}, {"Xbox", "xbox"}, {"PlayStation", "ps"}, {"Nintendo  (Switch)", "nintendo"} }, 0 },
     { "aspect", "Aspect ratio",
       "Auto fills an ultrawide (21:9, 32:9) or 16:10 window: the 3D view gets wider (Hor+, the vertical view is "
       "kept) instead of black bars. Movies and 2D screens stay 16:9. The HUD is stretched with the view. "
@@ -154,6 +160,12 @@ static std::vector<Setting> g_set = {
       "With VSync off: 'Allowed' presents immediately (lowest latency; with G-Sync / FreeSync the screen follows "
       "the frame rate). 'Never' drops late frames instead of tearing.",
       { {"Allowed  (lowest latency, VRR)", "tearing"}, {"Never", "notear"} }, 0 },
+    { "dsync", "Display sync",
+      "How frames are paced for your screen. Auto measures at start whether G-Sync / FreeSync really follows the "
+      "game; if not (VRR off, or not working in a borderless window), it paces for the fixed refresh rate: every frame "
+      "stays on screen equally long (e.g. 55 fps at 165 Hz, or 41 -> 82 fps with frame generation; movies with VSync). "
+      "Fixed refresh always does that; VRR never does (the old behaviour). The log says \"VRR effective: yes/no\".",
+      { {"Auto", "auto"}, {"VRR  (G-Sync / FreeSync)", "vrr"}, {"Fixed refresh", "fixed"} }, 0 },
     { "overlay", "Performance overlay",
       "F3 shows the frame rate, frame time, draws per frame and the CPU time per draw in a corner of the game.",
       { {"Off  (F3 shows it)", ""}, {"On at start  (F3 hides it)", "1"}, {"Disabled  (F3 does nothing)", "0"} }, 0 },
@@ -166,10 +178,10 @@ static std::vector<Setting> g_set = {
       "gives them, same size as the original). Dump: writes every texture the game uses to the texdump folder "
       "once, to make a pack from. Dumping slows loading.",
       { {"Off", "0"}, {"Load mods\\textures", "load"}, {"Dump to texdump", "dump"} }, 0 },
-    { "sensy", "Vertical sensitivity",
+    { "msensy", "Vertical sensitivity",
       "Up/down mouse speed relative to left/right.",
       { {"50%", "0.5"}, {"75%", "0.75"}, {"Same as horizontal", "1"}, {"125%", "1.25"}, {"150%", "1.5"}, {"200%", "2"} }, 2 },
-    { "ads", "Zoomed sensitivity",
+    { "adssens", "Zoomed sensitivity",
       "Extra mouse speed multiplier while zoomed or scoped (on top of the automatic zoom matching).",
       { {"50%", "0.5"}, {"75%", "0.75"}, {"Same", "1"}, {"125%", "1.25"}, {"150%", "1.5"} }, 2 },
     { "aimhold", "Zoom",
@@ -226,6 +238,7 @@ static void detect_hardware()
     rfac::detect(g_hwinfo);
     g_rec = rfac::recommend(g_hwinfo);
 }
+static void deck_defaults(bool preset);    // after launcher_dist.inc
 // the recommended value of a setting, or nullptr when it has none
 static const char* rec_value(int si)
 {
@@ -254,20 +267,31 @@ static void load_settings()
     g_fov = FOV_DEF;
     FILE* f = fopen(path_of("settings.ini").c_str(), "r");
     if (!f) { g_first_run = true; return; }
+    std::vector<std::string> lines;
     char line[256];
-    while (fgets(line, sizeof line, f)) {
+    while (fgets(line, sizeof line, f)) { line[strcspn(line, "\r\n")] = 0; lines.push_back(line); }
+    fclose(f);
+    // renamed keys (port_ini_migrate.h): copied to the new name and written back; the old line stays as a fallback
+    if (port_ini_migrate_lines(lines) > 0)
+        if (FILE* w = fopen(path_of("settings.ini").c_str(), "w")) {
+            for (auto& l : lines) fprintf(w, "%s\n", l.c_str());
+            fclose(w);
+        }
+    for (auto& l : lines) {
+        snprintf(line, sizeof line, "%s", l.c_str());
         char* eq = strchr(line, '=');
         if (!eq) continue;
         *eq = 0;
         char* v = eq + 1;
-        v[strcspn(v, "\r\n")] = 0;
+        if (!strcmp(line, "precompile")) {   // old values: R2_PRELOAD_BOOT -1 / RSX_PSO_PRECOMPILE 1 = On, empty = Off
+            v = (char*)(*v && strcmp(v, "0") ? "1" : "0");
+        }
         if (!strcmp(line, "fov")) { int x = atoi(v); if (x >= FOV_MIN && x <= FOV_MAX) g_fov = x; }
         for (auto& s : g_set)
             if (!strcmp(s.key, line))
                 for (size_t i = 0; i < s.choices.size(); i++)
                     if (!strcmp(s.choices[i].value, v)) s.sel = (int)i;
     }
-    fclose(f);
 }
 static const char* val(int i) { return g_set[i].choices[g_set[i].sel].value; }
 
@@ -303,6 +327,7 @@ static bool save_settings()
     fprintf(f, "set \"RFOM_PAD_GLYPHS=%s\"\n", val(S_PADGLYPHS));
     fprintf(f, "set \"RFOM_ASPECT=%s\"\n", val(S_ASPECT));
     fprintf(f, "set \"RFOM_PRESENT=%s\"\n", val(S_PRESENT));
+    fprintf(f, "set \"RFOM_DISPLAY_SYNC=%s\"\n", val(S_DSYNC));
     fprintf(f, "set \"RFOM_OVERLAY=%s\"\n", val(S_OVERLAY));
     fprintf(f, "set \"RFOM_MODS=%s\"\n", val(S_MODS));
     fprintf(f, "set \"PAD_MOUSE_SENS_Y=%s\"\n", val(S_SENSY));
@@ -369,7 +394,7 @@ static const int NSHOW = 2;
 static std::string g_bind[NACT][NSLOT];
 static double g_msens = 1.0; static int g_minv = 0, g_mdirect = 1;
 static std::string g_mrelease = "F8";
-static double g_mdeg = 0.05, g_mdz = 0.28, g_msmooth = 0.03;
+static double g_mdeg = 0.05, g_mdz = 0.28, g_msmooth = 0.03, g_mtank = 1.0;
 static const char* g_padint_opts[][2] = {
     {"NONE","Same as Melee  (as on PS3)"},{"SQUARE","Square"},{"CIRCLE","Circle"},{"CROSS","Cross"},
     {"TRIANGLE","Triangle"},{"L1","L1"},{"R1","R1"},{"L2","L2"},{"R2","R2"},{"L3","L3  (left stick click)"},
@@ -413,7 +438,7 @@ static void ctl_defaults()
 {
     for (auto& r : g_bind) for (auto& k : r) k.clear();
     for (auto& d : g_default_binds) { int a = act_of(d[1]); if (a >= 0) bind_add(a, d[0]); }
-    g_msens = 1.0; g_minv = 0; g_mdirect = 1; g_mrelease = "F8"; g_mdeg = 0.05; g_mdz = 0.28; g_msmooth = 0.03;
+    g_msens = 1.0; g_minv = 0; g_mdirect = 1; g_mrelease = "F8"; g_mdeg = 0.05; g_mdz = 0.28; g_msmooth = 0.03; g_mtank = 1.0;
     g_padint = 0;
 }
 static void ctl_load()
@@ -435,6 +460,7 @@ static void ctl_load()
         if (!_stricmp(k, "mouse_degrees_per_count")) { g_mdeg = atof(v); continue; }
         if (!_stricmp(k, "mouse_deadzone")) { g_mdz = atof(v); continue; }
         if (!_stricmp(k, "mouse_smoothing")) { g_msmooth = atof(v); continue; }
+        if (!_stricmp(k, "mouse_tank_sensitivity")) { g_mtank = atof(v); continue; }
         if (!_stricmp(k, "pad_interact")) {
             g_padint = 0;
             for (int i = 0; i < NPADINT; i++) if (!_stricmp(v, g_padint_opts[i][0])) g_padint = i;
@@ -481,6 +507,7 @@ static bool ctl_save()
     fprintf(f, "mouse_degrees_per_count = %.3f   # direct look speed (x mouse_sensitivity, x the game's Look Sensitivity)\n", g_mdeg);
     fprintf(f, "mouse_deadzone = %.2f      # stick emulation only\n", g_mdz);
     fprintf(f, "mouse_smoothing = %.2f     # stick emulation only, seconds\n", g_msmooth);
+    fprintf(f, "mouse_tank_sensitivity = %.2f   # tank turret mouse speed (x direct look speed), 0.05-10\n", g_mtank);
     fprintf(f, "mouse_release_key = %s     # free / recapture the mouse cursor\n", g_mrelease.c_str());
     fprintf(f, "\n# Controller\n");
     fprintf(f, "pad_interact = %s     # button that uses things (the game's Action button then only melees); NONE = as on PS3\n",
@@ -646,7 +673,7 @@ static int g_drag = 0;                   // slider being dragged
 // toggles
 enum { TG_INVERT = 1 };
 // buttons
-enum { BT_RESET_CTL = 1, BT_RESET_GFX, BT_FOLDER, BT_LOGS, BT_WEB, BT_CONTROLS_TXT, BT_AUTO, BT_SAVES, BT_SHOTS, BT_REBUILD_SHADERS, BT_REPORT, BT_RESET_ALL };
+enum { BT_RESET_CTL = 1, BT_RESET_GFX, BT_FOLDER, BT_LOGS, BT_WEB, BT_CONTROLS_TXT, BT_AUTO, BT_SAVES, BT_SHOTS, BT_REBUILD_SHADERS, BT_REPORT, BT_RESET_ALL, BT_DECK };
 // key capture
 static int g_cap_a = -1, g_cap_k = -1;   // action/slot being captured (-2 = mouse release key)
 static std::wstring g_toast; static DWORD g_toast_until = 0;
@@ -666,7 +693,14 @@ static struct {
     int exit_code = 0;
     DWORD t0 = 0;
     RectF skip_btn;
+    int kind = 0;                         // SCAN_SHADERS / SCAN_HDUI / SCAN_HDUI_REMOVE (no Cancel)
+    std::string summary;                  // guarded; HD UI: the helper's "@summary" line
+    unsigned eta = 0;                     // guarded; HD UI: seconds left ("@eta"), 0 = not known yet
 } g_scan;
+enum { SCAN_SHADERS, SCAN_HDUI, SCAN_HDUI_REMOVE };
+static void hdui_start();
+static void hdui_remove();
+static bool hdui_have_pack();
 
 static int dd_count(int kind, int idx)
 {
@@ -753,7 +787,12 @@ static void layout_recommend_panel(float x, float& y, float w)
     b.help = "Sets resolution, anti-aliasing / upscaling, filtering and frame rate for this PC (also the first-run "
              "defaults). RTX 4070 / 5070 class: the scene at 1080p, DLSS Performance to 4K (scaled to your screen). "
              "Controls are not changed.";
-    deco(D_LABEL_DIM, RectF(x + SF(266), y, w - SF(266), SF(36)),
+    Widget& bd = add(W_BUTTON, RectF(x + SF(262), y, SF(190), SF(36)), BT_DECK);
+    bd.title = "Preset: Steam Deck";
+    bd.help = "Battery-friendly handheld settings: PS3 resolution with FSR 3.1 anti-aliasing, 40 fps (set the Deck's "
+              "screen to 40 Hz), 30 fps menus, a 1280 x 800 window, 150% UI and Xbox button prompts. Also the "
+              "defaults when the launcher runs on a Steam Deck. Controls are not changed.";
+    deco(D_LABEL_DIM, RectF(x + SF(468), y, w - SF(468), SF(36)),
          differs_from_recommended() ? "Your settings differ from the recommendation." : "Using the recommended settings.");
     y = top + SF(150) + SF(22);
 }
@@ -856,8 +895,8 @@ static void layout()
             y += SF(26);
             Widget& rb = add(W_BUTTON, RectF(x, y, SF(230), SF(38)), BT_REBUILD_SHADERS);
             rb.title = "Rebuild shader cache";
-            rb.help = "Deletes the compiled shaders (shadercache\\*.dxbc that have their .hlsl source, and the GPU / driver "
-                      "record) but keeps the list of pipelines the game has used and the shader sources. The next start "
+            rb.help = "Deletes the compiled shaders (shadercache\\*.dxbc that have their .hlsl source, the pipeline library "
+                      "pso_library_*.bin and the GPU / driver records) but keeps the list of pipelines the game has used and the shader sources. The next start "
                       "compiles everything again (before play with Compile shaders before playing on). Use it after "
                       "graphics glitches that look shader related. Asks first.";
             y += SF(38);
@@ -1308,10 +1347,28 @@ static void paint(HDC hdc)
             RectF pr((cw - pw) / 2, (ch - ph) / 2, pw, ph);
             fill_rr(g, pr, SF(10), C_PANEL); stroke_rr(g, pr, SF(10), C_BORDER, SF(1));
             const float ix = pr.X + SF(24), iw = pr.Width - SF(48);
-            text(g, L"Preparing shaders from your game files", f_h2, C_TEXT, RectF(ix, pr.Y + SF(18), iw, SF(28)));
+            const bool hd = g_scan.kind == SCAN_HDUI, rm = g_scan.kind == SCAN_HDUI_REMOVE;
+            text(g, rm ? L"Removing the HD UI pack" : hd ? L"Creating the HD UI pack" : L"Preparing shaders from your game files",
+                 f_h2, C_TEXT, RectF(ix, pr.Y + SF(18), iw, SF(28)));
             std::string sub = !ran ? std::string("Checking the shader cache...")
                             : t ? phase + "  " + std::to_string(std::min(d, t)) + " / " + std::to_string(t)
                                 : (phase.empty() ? std::string("scan") : phase) + "...";
+            if (hd) {
+                unsigned eta;
+                AcquireSRWLockShared(&g_scan_lock); eta = g_scan.eta; ReleaseSRWLockShared(&g_scan_lock);
+                sub = phase == "upscale" && t ? "Upscaling  " + std::to_string(std::min(d, t)) + " / " + std::to_string(t)
+                    : phase == "download" ? std::string("Downloading the AI model (first time only)...")
+                    : phase == "gpu" ? std::string("Checking the graphics card...")
+                    : phase == "check" ? std::string("Testing the AI upscaler...")
+                    : std::string("Reading the menu / HUD textures from your game files...");
+                if (phase == "upscale" && eta && d < t) {
+                    char b[64];
+                    if (eta >= 3600) snprintf(b, sizeof b, "   about %u h %02u min left", eta / 3600, eta / 60 % 60);
+                    else snprintf(b, sizeof b, "   about %u min left", std::max(1u, (eta + 59) / 60));
+                    sub += b;
+                }
+            }
+            if (rm) sub = "Removing...";
             text(g, W(sub), f_body, C_DIM, RectF(ix, pr.Y + SF(52), iw, SF(22)));
             RectF br(ix, pr.Y + SF(84), iw, SF(8));
             fill_rr(g, br, SF(4), C_CTL);
@@ -1321,12 +1378,19 @@ static void paint(HDC hdc)
                 const float l = std::max(br.X, br.X + pos), r = std::min(br.X + br.Width, br.X + pos + seg);
                 if (r > l) fill_rr(g, RectF(l, br.Y, r - l, br.Height), SF(4), C_ACCENT);
             }
-            text(g, L"Once per install and after Rebuild shader cache: the shaders in your game files are added to the "
-                    L"shader cache, so Compile shaders before playing covers the whole game. The game starts when done.",
+            text(g, rm ? L"mods\\hd_ui is deleted; the game goes back to its own menu / HUD textures. "
+                         L"This cannot be cancelled and takes a moment with a large pack."
+                  : hd ? L"The menu and HUD textures are upscaled 2-4x by an AI model on the graphics card (the CPU if that fails) into mods\\hd_ui. "
+                         L"Cancel keeps what is done; Create HD UI pack again continues from there."
+                       : L"Once per install and after Rebuild shader cache: the shaders in your game files are added to the "
+                         L"shader cache, so Compile shaders before playing covers the whole game. The game starts when done.",
                  f_small, C_FAINT, RectF(ix, pr.Y + SF(102), iw, SF(40)), AL_L, false, true);
-            g_scan.skip_btn = RectF(pr.X + pr.Width - SF(24) - SF(150), pr.Y + ph - SF(50), SF(150), SF(34));
-            fill_rr(g, g_scan.skip_btn, SF(7), C_CTL); stroke_rr(g, g_scan.skip_btn, SF(7), C_BORDER, SF(1));
-            text(g, L"Skip for now", f_btn, C_TEXT, g_scan.skip_btn, AL_C);
+            if (rm) g_scan.skip_btn = RectF();
+            else {
+                g_scan.skip_btn = RectF(pr.X + pr.Width - SF(24) - SF(150), pr.Y + ph - SF(50), SF(150), SF(34));
+                fill_rr(g, g_scan.skip_btn, SF(7), C_CTL); stroke_rr(g, g_scan.skip_btn, SF(7), C_BORDER, SF(1));
+                text(g, hd ? L"Cancel" : L"Skip for now", f_btn, C_TEXT, g_scan.skip_btn, AL_C);
+            }
         } else g_scan.skip_btn = RectF();
     }
 
@@ -1405,6 +1469,39 @@ static void apply_recommended()
     }
     save_settings();
 }
+// Steam Deck (rfac::detect_platform: SteamDeck=1, the APU name or the Jupiter / Galileo board): the 40 fps and
+// 1280 x 800 choices, and defaults of 1280 x 800, a 150% UI for the 7-inch screen and Xbox button prompts (Steam
+// Input's controller). The "Preset: Steam Deck" button applies those plus the Deck recommendation (PS3 resolution,
+// FSR 3.1 AA), 40 fps (the Deck's 40 Hz mode) and 30 fps menus to save battery, on any PC.
+static void deck_defaults(bool preset)
+{
+    if (!g_hwinfo.deck && !preset) return;
+    dist_add_choice("fps", "30", "40  (Steam Deck at 40 Hz)", "40");
+    dist_add_choice("window", "1280x720", "1280 x 800  (Steam Deck)", "1280x800");
+    auto def_of = [&](const char* key, const char* v) {
+        Setting* s = dist_setting(key);
+        if (!s) return;
+        for (size_t i = 0; i < s->choices.size(); i++)
+            if (!strcmp(s->choices[i].value, v)) { if (!preset) s->def = (int)i; else s->sel = (int)i; }
+    };
+    def_of("window", "1280x800");
+    def_of("uiscale", "150");
+    def_of("padglyphs", "xbox");
+    if (preset) { def_of("fps", "40"); def_of("menufps", "30"); }
+}
+static void deck_preset()
+{
+    rfac::Hardware h = g_hwinfo;
+    h.deck = true; h.integrated = true;
+    const rfac::Settings keep = g_rec;
+    g_rec = rfac::recommend(h);
+    apply_recommended();
+    char st[200]; rfac::describe(g_rec, st, sizeof st);
+    g_rec = keep;
+    deck_defaults(true);
+    save_settings();
+    toast(std::string("Steam Deck preset: ") + st + ", 40 fps, 1280 x 800, UI 150%, 30 fps menus");
+}
 static void restore_graphics()
 {
     for (int si = 0; si < S_INPUT_FIRST; si++) g_set[si].sel = g_set[si].def;
@@ -1428,13 +1525,83 @@ static std::string saves_folder(bool* exists)
     return *exists ? sd : root;
 }
 
+// The game is started through a hidden cmd (run.bat), so Windows would not let its window take the foreground and it
+// ran in the background until alt-tab (scratch\alt_tab_stutter.md). The launcher holds the foreground when Play is
+// pressed, so it may pass that right on. RSX_CLAIM_FOREGROUND=0 (in the environment, run.bat or settings.bat) skips
+// it, which is the old behaviour. ASFW_ANY, not a PID: the process started here is the hidden cmd, the game is its
+// child and does not exist yet, and a grant to one PID is not inherited. Windows drops the grant at the next input.
+static bool claim_foreground_off()
+{
+    char e[8] = "";
+    if (GetEnvironmentVariableA("RSX_CLAIM_FOREGROUND", e, sizeof e) && e[0] == '0') return true;
+    bool off = false;
+    for (const char* name : { "run.bat", "settings.bat" }) {   // later files win, as in run.bat (settings.bat is called last)
+        FILE* f = fopen(path_of(name).c_str(), "r");
+        if (!f) continue;
+        char line[512];
+        while (fgets(line, sizeof line, f)) {
+            const char* s = line;
+            while (*s == ' ' || *s == '\t') s++;
+            if (_strnicmp(s, "set", 3) || (s[3] != ' ' && s[3] != '\t')) continue;
+            s += 4;
+            while (*s == ' ' || *s == '\t' || *s == '"') s++;
+            if (!_strnicmp(s, "RSX_CLAIM_FOREGROUND=", 21)) off = s[21] == '0';
+        }
+        fclose(f);
+    }
+    return off;
+}
+static void allow_game_foreground()
+{
+    if (!claim_foreground_off()) AllowSetForegroundWindow(ASFW_ANY);
+}
+
+// CPU pass: x86-64-v3 (AVX2/FMA/BMI2/MOVBE/LZCNT/F16C) with OS AVX state
+// support -- what the shipped build needs. Without it run.bat starts
+// build_baseline\ResistanceFoM.exe when that build exists (build_cpu.bat baseline).
+static bool cpu_is_x86_64_v3()
+{
+    int r[4];
+    __cpuid(r, 0); if (r[0] < 7) return false;
+    __cpuid(r, 1);
+    const unsigned c1 = (unsigned)r[2];
+    if (!(c1 >> 27 & 1) || !(c1 >> 28 & 1) || !(c1 >> 12 & 1) || !(c1 >> 22 & 1) || !(c1 >> 29 & 1)) return false;
+    if ((_xgetbv(0) & 6) != 6) return false;
+    __cpuidex(r, 7, 0);
+    if (!((unsigned)r[1] >> 5 & 1) || !((unsigned)r[1] >> 8 & 1) || !((unsigned)r[1] >> 3 & 1)) return false;
+    __cpuid(r, 0x80000001);
+    return ((unsigned)r[2] >> 5 & 1) != 0;
+}
+
+// What run.bat needs to start the game, checked before it is started hidden (its own messages would never be seen).
+// "" = all there, else the message for the player.
+static std::string game_files_missing()
+{
+    auto exists = [](const std::string& p) { return GetFileAttributesA(p.c_str()) != INVALID_FILE_ATTRIBUTES; };
+    char dir[MAX_PATH] = "";
+    const DWORD n = GetEnvironmentVariableA("RFOM_BUILD_DIR", dir, sizeof dir);   // as in run.bat; default build
+    std::string exe = "build\\ResistanceFoM.exe";
+    if (n > 0 && n < sizeof dir) exe = std::string(dir) + "\\ResistanceFoM.exe";
+    const bool abs = exe.size() > 1 && ((exe[1] == ':') || (exe[0] == '\\' && exe[1] == '\\'));
+    if (!exists(abs ? exe : path_of(exe.c_str())))
+        return "The game is not built yet (" + exe + " is missing). Run Setup.bat first.";
+    if (!exists(path_of("game\\EBOOT.elf")))
+        return "The game program game\\EBOOT.elf is missing. Run Setup.bat again to decrypt it from your copy.";
+    return "";
+}
+
 static void play_launch()
 {
     lx_auto_backup();
-    if (GetFileAttributesA(path_of("build\\ResistanceFoM.exe").c_str()) == INVALID_FILE_ATTRIBUTES) {
-        MessageBoxA(g_hw, "The game is not built yet. Run Setup.bat first.", "Launcher", MB_ICONERROR);
+    SetEnvironmentVariableA("PORT_CPU_V3", cpu_is_x86_64_v3() ? "1" : "0");   // read by run.bat
+    SetEnvironmentVariableA("PORT_NOPAUSE", "1");   // run.bat is hidden: never wait for a key
+    // run.bat runs hidden, so its own missing-file messages would never be seen
+    const std::string missing = game_files_missing();
+    if (!missing.empty()) {
+        MessageBoxA(g_hw, missing.c_str(), "Launcher", MB_ICONERROR);
         return;
     }
+    allow_game_foreground();
     if ((INT_PTR)ShellExecuteA(g_hw, "open", path_of("run.bat").c_str(), NULL, g_dir, SW_HIDE) <= 32) {
         MessageBoxA(g_hw, "Could not start run.bat. Is the game built? (Run Setup.bat first.)", "Launcher", MB_ICONERROR);
         return;
@@ -1464,6 +1631,8 @@ static void scan_line(const std::string& l, FILE* log)
     AcquireSRWLockExclusive(&g_scan_lock);
     if (prog) { changed = g_scan.phase != ph; g_scan.phase = ph; g_scan.done = d; g_scan.total = t; }
     else if (!strncmp(l.c_str(), "@error ", 7)) g_scan.error = l.substr(7);
+    else if (!strncmp(l.c_str(), "@summary ", 9)) g_scan.summary = l.substr(9);
+    else if (!strncmp(l.c_str(), "@eta ", 5)) g_scan.eta = (unsigned)strtoul(l.c_str() + 5, NULL, 10);
     else if (!strncmp(l.c_str(), "shaderscan: ", 12)) g_scan.error = l.substr(12);
     ReleaseSRWLockExclusive(&g_scan_lock);
     if (log && (!prog || changed || d == t)) { fprintf(log, "%s\n", l.c_str()); fflush(log); }
@@ -1535,6 +1704,7 @@ static DWORD WINAPI scan_thread(LPVOID)
 }
 static void scan_cancel()
 {
+    if (g_scan.kind == SCAN_HDUI_REMOVE) return;   // never ended: after its rename the pack is gone, the rest is deleting
     AcquireSRWLockExclusive(&g_scan_lock);
     g_scan.cancel = true;
     if (g_scan.proc) TerminateProcess(g_scan.proc, 1);
@@ -1545,8 +1715,168 @@ static void scan_finish()
     if (g_scan.thread) { WaitForSingleObject(g_scan.thread, INFINITE); CloseHandle(g_scan.thread); g_scan.thread = NULL; }
     KillTimer(g_hw, 2);
     g_scan.active = false;
+    if (g_scan.kind == SCAN_HDUI_REMOVE) {
+        const bool ok = g_scan.exit_code == 0 && !hdui_have_pack();
+        for (auto& s : g_set)
+            if (!strcmp(s.key, "hdui")) s.sel = 0;
+        save_settings();
+        if (g_scan.quit) { DestroyWindow(g_hw); return; }
+        InvalidateRect(g_hw, NULL, FALSE);
+        if (ok) toast("HD UI pack removed; HD UI pack is off.");
+        else MessageBoxA(g_hw, ("mods\\hd_ui could not be removed:\n\n" +
+                                (g_scan.error.empty() ? std::string("unknown error (exit ") + std::to_string(g_scan.exit_code) + "; is the game running?)"
+                                                      : g_scan.error) +
+                                "\n\nHD UI pack is off. Details: logs\\hd_ui_remove.log.").c_str(),
+                         "HD UI pack", MB_OK | MB_ICONWARNING);
+        return;
+    }
     if (g_scan.quit) { DestroyWindow(g_hw); return; }
+    if (g_scan.kind == SCAN_HDUI) {
+        InvalidateRect(g_hw, NULL, FALSE);
+        if (g_scan.cancel) {
+            toast(hdui_have_pack() ? "Cancelled: the HD UI pack keeps what was done (Create HD UI pack continues it)."
+                                   : "Cancelled.");
+            return;
+        }
+        if (g_scan.exit_code == 0) {
+            for (auto& s : g_set)
+                if (!strcmp(s.key, "hdui"))
+                    for (size_t i = 0; i < s.choices.size(); i++) if (!strcmp(s.choices[i].value, "1")) s.sel = (int)i;
+            save_settings();
+            MessageBoxA(g_hw, ((g_scan.summary.empty() ? std::string("The HD UI pack is ready.") : g_scan.summary) +
+                               "\n\nHD UI pack is now on (Advanced > HD UI pack). Your own copy: don't share mods\\hd_ui.").c_str(),
+                        "HD UI pack", MB_OK | MB_ICONINFORMATION);
+        } else {
+            MessageBoxA(g_hw, ("The HD UI pack could not be made:\n\n" +
+                               (g_scan.error.empty() ? std::string("unknown error (exit ") + std::to_string(g_scan.exit_code) + ")"
+                                                     : g_scan.error) +
+                               "\n\nDetails: logs\\hd_ui_pack.log. The game is unchanged.").c_str(),
+                        "HD UI pack", MB_OK | MB_ICONWARNING);
+        }
+        return;
+    }
     play_launch();    // the game starts also when the scan failed or was skipped (logs\shaderscan.log has the details)
+}
+
+// ---- HD UI pack (Saves & tools > Create HD UI pack): HDUIPack.exe (project\hd_ui_pack.cpp + hd_ui_game_r1.h) reads
+// the menu / HUD textures from the game's archive, upscales them with Real-ESRGAN on the graphics card, the CPU if that fails (tools\hdui_upscaler,
+// SHA-256 checked) and writes mods\hd_ui, which the renderer loads with RSX_HD_UI=1. Same progress panel as the shader scan.
+static std::string hdui_exe() { return path_of("HDUIPack.exe"); }
+static bool hdui_have_pack()
+{
+    return GetFileAttributesA(path_of("mods\\hd_ui\\pack.tsv").c_str()) != INVALID_FILE_ATTRIBUTES;
+}
+// "HDUIPack.exe --status" (reads two small files, starts nothing on the GPU): where the next run upscales: "gpu" (the
+// graphics card; what it does not make, on the CPU) or "cpu" (an earlier run failed on the graphics card:
+// tools\upscaler\gpu_fault.txt) ("" = could not ask); note: why.
+static std::string hdui_gpu_status(std::string& note)
+{
+    note.clear();
+    std::string cl = "\"" + hdui_exe() + "\" --status", out;
+    SECURITY_ATTRIBUTES sa = { sizeof sa, NULL, TRUE };
+    HANDLE rd = NULL, wr = NULL;
+    if (!CreatePipe(&rd, &wr, &sa, 1 << 16)) return "";
+    SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+    STARTUPINFOA si = {}; si.cb = sizeof si;
+    si.dwFlags = STARTF_USESTDHANDLES; si.hStdOutput = si.hStdError = wr;
+    PROCESS_INFORMATION pi = {};
+    const BOOL ok = CreateProcessA(NULL, &cl[0], NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, g_dir, &si, &pi);
+    CloseHandle(wr);
+    if (ok) {
+        if (WaitForSingleObject(pi.hProcess, 5000) == WAIT_TIMEOUT) TerminateProcess(pi.hProcess, 1);
+        char buf[4096]; DWORD n = 0;
+        while (out.size() < 65536 && ReadFile(rd, buf, sizeof buf, &n, NULL) && n) out.append(buf, n);
+        CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+    }
+    CloseHandle(rd);
+    const size_t at = out.find("@gpu ");
+    if (at == std::string::npos) return "";
+    std::string l = out.substr(at + 5, out.find_first_of("\r\n", at) - at - 5);
+    const size_t sp = l.find(' ');
+    if (sp != std::string::npos) note = l.substr(sp + 1);
+    return l.substr(0, sp);
+}
+static DWORD WINAPI hdui_thread(LPVOID)
+{
+    CreateDirectoryA(path_of("logs").c_str(), NULL);
+    FILE* log = fopen(path_of("logs\\hd_ui_pack.log").c_str(), "w");
+    AcquireSRWLockExclusive(&g_scan_lock); g_scan.ran = true; g_scan.phase = "read"; ReleaseSRWLockExclusive(&g_scan_lock);
+    PostMessageA(g_hw, WM_SCAN_PROGRESS, 0, 0);
+    g_scan.exit_code = scan_exec("\"" + hdui_exe() + "\"", INFINITE, log);
+    // Cancel ended it (and with it the upscaler) on purpose: its "upscaler running" marker must not read as a PC that
+    // froze while upscaling once the PC restarts
+    if (g_scan.cancel) DeleteFileA(path_of("tools\\upscaler\\upscaler_running.txt").c_str());
+    if (log) fclose(log);
+    PostMessageA(g_hw, WM_SCAN_DONE, 0, 0);
+    return 0;
+}
+// The shared start of the progress panel's worker (shader scan, HD UI pack create / remove): nothing of an earlier
+// run (a Cancel, its summary or error) carries over.
+static void scan_begin(int kind, LPTHREAD_START_ROUTINE fn)
+{
+    g_scan.kind = kind;
+    AcquireSRWLockExclusive(&g_scan_lock);
+    g_scan.cancel = g_scan.ran = g_scan.quit = false;
+    g_scan.phase.clear(); g_scan.error.clear(); g_scan.summary.clear(); g_scan.done = g_scan.total = g_scan.eta = 0;
+    ReleaseSRWLockExclusive(&g_scan_lock);
+    g_scan.exit_code = 0;
+    g_scan.t0 = GetTickCount();
+    g_scan.active = true;
+    g_scan.thread = CreateThread(NULL, 0, fn, NULL, 0, NULL);
+    if (g_scan.thread) { SetTimer(g_hw, 2, 100, NULL); InvalidateRect(g_hw, NULL, FALSE); return; }
+    g_scan.active = false;
+}
+static bool shc_game_running();
+static void hdui_start()
+{
+    if (g_scan.active) return;
+    if (GetFileAttributesA(hdui_exe().c_str()) == INVALID_FILE_ATTRIBUTES) {
+        MessageBoxA(g_hw, "HDUIPack.exe is missing next to the launcher (build.bat makes it).", "HD UI pack", MB_OK | MB_ICONWARNING);
+        return;
+    }
+    // the upscaler keeps the CPU busy: never next to the game
+    if (shc_game_running()) {
+        MessageBoxA(g_hw, "The game is running. Close it first, then create the HD UI pack: the AI upscaler keeps the "
+                          "graphics card and CPU busy.", "HD UI pack", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    std::string note;
+    const std::string mode = hdui_gpu_status(note);
+    std::string msg = hdui_have_pack()
+        ? "Update the HD UI pack?\n\nOnly textures that are not in mods\\hd_ui yet are made."
+        : "Create the HD UI pack?\n\nThe menu and HUD textures in your game files are upscaled 2-4x by an AI model "
+          "(Real-ESRGAN; its 45 MB download the first time) on the graphics card, usually in a few minutes, and needs several GB of disk "
+          "(mods\\hd_ui). You can cancel at any time and continue later.";
+    msg += mode == "cpu"
+        ? "\n\nIt runs on the CPU (about 30 minutes on a 6-core CPU), at low priority: the PC stays usable, only slower."
+        : "\n\nIf the graphics card fails (a driver error or reset), the AI upscaler is stopped at once and the rest is made "
+          "on the CPU (slower); later runs then use the CPU.";
+    if (!note.empty()) msg += "\n\nNote: " + note;
+    if (MessageBoxA(g_hw, msg.c_str(), "HD UI pack", MB_OKCANCEL | (mode == "cpu" && !note.empty() ? MB_ICONWARNING : MB_ICONINFORMATION)) != IDOK) return;
+    save_settings();
+    scan_begin(SCAN_HDUI, hdui_thread);
+}
+// Remove runs on the worker too (a multi-GB pack takes a while to delete) and has no Cancel: HDUIPack --remove first
+// renames mods\hd_ui away, so ending it later would only leave files behind.
+static DWORD WINAPI hdui_remove_thread(LPVOID)
+{
+    CreateDirectoryA(path_of("logs").c_str(), NULL);
+    FILE* log = fopen(path_of("logs\\hd_ui_remove.log").c_str(), "w");
+    AcquireSRWLockExclusive(&g_scan_lock); g_scan.ran = true; g_scan.phase = "remove"; ReleaseSRWLockExclusive(&g_scan_lock);
+    PostMessageA(g_hw, WM_SCAN_PROGRESS, 0, 0);
+    if (GetFileAttributesA(hdui_exe().c_str()) != INVALID_FILE_ATTRIBUTES)
+        g_scan.exit_code = scan_exec("\"" + hdui_exe() + "\" --remove", INFINITE, log);
+    else { lx_delete_tree(path_of("mods\\hd_ui")); g_scan.exit_code = 0; }
+    if (log) fclose(log);
+    PostMessageA(g_hw, WM_SCAN_DONE, 0, 0);
+    return 0;
+}
+static void hdui_remove()
+{
+    if (g_scan.active) return;
+    if (MessageBoxA(g_hw, "Remove the HD UI pack (mods\\hd_ui)?\n\nThe game goes back to its own menu / HUD textures. "
+                          "Making it again takes the full time.", "HD UI pack", MB_YESNO | MB_ICONQUESTION) != IDYES) return;
+    scan_begin(SCAN_HDUI_REMOVE, hdui_remove_thread);
 }
 
 static void play()
@@ -1555,18 +1885,13 @@ static void play()
     save_settings(); ctl_save();          // first: --check compares the stamp with settings.bat (RSX_RES_SCALE ...)
     if (!g_scan.checked && !shaderscan_exe().empty()) {
         g_scan.checked = true;
-        g_scan.cancel = g_scan.ran = g_scan.quit = false;
-        g_scan.phase.clear(); g_scan.error.clear(); g_scan.done = g_scan.total = 0;
-        g_scan.t0 = GetTickCount();
-        g_scan.active = true;
-        g_scan.thread = CreateThread(NULL, 0, scan_thread, NULL, 0, NULL);
-        if (g_scan.thread) { SetTimer(g_hw, 2, 100, NULL); InvalidateRect(g_hw, NULL, FALSE); return; }
-        g_scan.active = false;
+        scan_begin(SCAN_SHADERS, scan_thread);
+        if (g_scan.active) return;
     }
     play_launch();
 }
 
-// "Rebuild shader cache": deletes the compiled shaders, keeps what tells the game which ones to build
+// "Rebuild shader cache": deletes the compiled shaders and pipelines, keeps what tells the game which ones to build
 // (pso_manifest_*.bin, *.hlsl). In shadercache\ and run.bat's backup of it (%LOCALAPPDATA%\ResistancePort\shadercache,
 // copied back into a game folder where files are missing).
 static bool shc_game_running()
@@ -1592,7 +1917,8 @@ static void rebuild_shader_cache()
                     "a minute).\n\n"
                     "Deleted from shadercache\\ and its backup in %LOCALAPPDATA%\\ResistancePort\\shadercache:\n"
                     "  *.dxbc (compiled shaders) that have a matching .hlsl source\n"
-                    "  pso_gpu_stamp.txt (the GPU / driver they were built for)\n"
+                    "  pso_library_*.bin (the compiled pipelines)\n"
+                    "  pso_gpu_stamp*.txt (the GPU / driver they were built for)\n"
                     "  shaderscan.stamp (with shaderscan.exe installed, the game files are scanned for shaders again)\n"
                     "Kept: pso_manifest_*.bin and *.hlsl.",
                     "Rebuild shader cache", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) return;
@@ -1616,8 +1942,15 @@ static void rebuild_shader_cache()
             } while (FindNextFileA(h, &fd));
             FindClose(h);
         }
-        const std::string st = r + "\\pso_gpu_stamp.txt";
-        if (GetFileAttributesA(st.c_str()) != INVALID_FILE_ATTRIBUTES) del(st, nullptr);
+        // pipeline library (rsx_pso_cache.c, + its .tmp) and the GPU / driver stamps (one shared or one per program)
+        for (const char* pat : { "\\pso_library_*.bin", "\\pso_library_*.bin.tmp", "\\pso_gpu_stamp*.txt" }) {
+            HANDLE hl = FindFirstFileA((r + pat).c_str(), &fd);
+            if (hl == INVALID_HANDLE_VALUE) continue;
+            do {
+                if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) del(r + "\\" + fd.cFileName, &fd);
+            } while (FindNextFileA(hl, &fd));
+            FindClose(hl);
+        }
         const std::string ss = r + "\\shaderscan.stamp";      // offline shader scan runs again on the next Play
         if (GetFileAttributesA(ss.c_str()) != INVALID_FILE_ATTRIBUTES) del(ss, nullptr);
     }
@@ -1659,6 +1992,8 @@ static void click(int i, float x, float y)
                 for (auto& s : g_set) s.sel = s.def;   // includes the extras and the update check
                 restore_graphics();                    // FOV + this PC's recommendation, saves
                 toast("Everything reset to defaults (graphics: the recommendation for this PC)."); }
+        } else if (w.id == BT_DECK) {
+            deck_preset();
         } else if (w.id == BT_AUTO) {
             apply_recommended();
             char st[200]; rfac::describe(g_rec, st, sizeof st);
@@ -1725,6 +2060,16 @@ static LRESULT CALLBACK wndproc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
         case WM_MOUSEMOVE: case WM_RBUTTONDOWN: case WM_MBUTTONDOWN: case WM_XBUTTONDOWN: case WM_LBUTTONUP:
         case WM_MOUSEWHEEL: case WM_CHAR: return 0;
         case WM_CLOSE: g_scan.quit = true; scan_cancel(); return 0;
+        case WM_QUERYENDSESSION: return TRUE;
+        case WM_ENDSESSION:
+            // Windows signs out / shuts down / restarts cleanly: the HD UI pack run is ended now, and its marker
+            // (tools\upscaler\upscaler_running.txt) removed, so the next run does not take this for a crash
+            if (wp && g_scan.kind == SCAN_HDUI) {
+                scan_cancel();
+                if (g_scan.thread) WaitForSingleObject(g_scan.thread, 5000);
+                DeleteFileA(path_of("tools\\upscaler\\upscaler_running.txt").c_str());
+            }
+            return 0;
         default: break;
         }
     }
@@ -1830,6 +2175,32 @@ static void dark_titlebar(HWND hw)
     DwmSetWindowAttribute(hw, 35, &cap, sizeof cap);              // DWMWA_CAPTION_COLOR (Windows 11)
 }
 
+// "Launcher.exe --play" (RecompLauncher, recomplauncher.json): no window. Rewrites settings.bat from settings.ini (the
+// RecompLauncher may have changed it), runs the shader scan, starts run.bat hidden and waits until the game has closed.
+// Exit codes: 0 = played, 3 = not built yet or game\EBOOT.elf missing (run Setup), 4 = run.bat could not start.
+static int play_headless()
+{
+    load_settings();
+    save_settings();
+    if (!game_files_missing().empty()) return 3;
+    if (!shaderscan_exe().empty()) scan_thread(NULL);
+    lx_auto_backup();
+    SetEnvironmentVariableA("PORT_CPU_V3", cpu_is_x86_64_v3() ? "1" : "0");   // read by run.bat
+    SetEnvironmentVariableA("PORT_NOPAUSE", "1");   // run.bat is hidden: never wait for a key
+    SHELLEXECUTEINFOA se = { sizeof se };
+    se.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC;
+    se.lpVerb = "open";
+    const std::string bat = path_of("run.bat");
+    se.lpFile = bat.c_str();
+    se.lpDirectory = g_dir;
+    se.nShow = SW_HIDE;
+    allow_game_foreground();
+    if (!ShellExecuteExA(&se) || !se.hProcess) return 4;
+    WaitForSingleObject(se.hProcess, INFINITE);   // run.bat waits for the game, then backs up the shader cache
+    CloseHandle(se.hProcess);
+    return 0;
+}
+
 int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmd, int show)
 {
     // per-monitor DPI awareness, so text is sharp at 125% / 150% scaling
@@ -1845,8 +2216,11 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmd, int show)
     lx_register();                          // launcher_extra_r1.inc: the extras' settings (after "updates")
     // test hook: "Launcher.exe --resave" reads settings.ini and writes settings.ini and settings.bat again (no window)
     if (cmd && strstr(cmd, "--resave")) { load_settings(); return save_settings() ? 0 : 1; }
-    load_settings();
+    if (cmd && strstr(cmd, "--play")) return play_headless();
     detect_hardware();
+    deck_defaults(false);                   // Steam Deck: its choices and defaults before settings.ini is read
+    load_settings();
+    lx_import_recover();                    // launcher_extra_r1.inc: finish an RPCS3 import a crash cut short
     if (g_first_run) apply_recommended();   // first start: this PC's recommended settings
     ctl_load();
 

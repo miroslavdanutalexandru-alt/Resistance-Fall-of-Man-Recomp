@@ -2,6 +2,11 @@ cmake_minimum_required(VERSION 3.20)
 if(NOT DEFINED PORT_NAME)
     set(PORT_NAME ResistanceFoM)
 endif()
+# CMake's compiler checks build in Debug by default, which links the debug CRT (msvcrtd.lib). The portable MSVC
+# libraries (Setup -PortableTools, xwin) have only the release CRT, so configure failed there.
+if(NOT DEFINED CMAKE_TRY_COMPILE_CONFIGURATION)
+    set(CMAKE_TRY_COMPILE_CONFIGURATION Release)
+endif()
 project(${PORT_NAME}
     VERSION 0.1.0
     LANGUAGES C CXX
@@ -68,6 +73,31 @@ if(NOT RECOMP_SOURCES)
 endif()
 list(LENGTH RECOMP_SOURCES RECOMP_SOURCE_COUNT)
 message(STATUS "Lifted sources:  ${RECOMP_SOURCE_COUNT} file(s)")
+
+# ---------------------------------------------------------------------------
+# Resistance port: CPU target (build_cpu.bat; README "CPU build options")
+# ---------------------------------------------------------------------------
+#   PORT_ARCH=AVX2      (build_cpu.bat) x86-64-v3 everywhere: the runtime and the
+#                       hand-written code with -march=x86-64-v3 as well (the lifted
+#                       PPU/SPU code already is: RFOM_PPU_V3/RFOM_SPU_AVX2). FMA
+#                       contraction stays off (-ffp-contract=off) in all of it.
+#   PORT_ARCH=mixed     (default, also "") AVX2 lifted code, x86-64 + SSE4.1 runtime and
+#                       hand-written code (build.bat)
+#   PORT_ARCH=baseline  no AVX anywhere (x86-64 + SSE4.1, lifted code too) for older CPUs;
+#                       forces RFOM_PPU_V3=OFF and RFOM_SPU_AVX2=OFF
+#                       (build_cpu.bat baseline -> build_baseline\, run.bat picks it
+#                       when the launcher finds no AVX2)
+set(PORT_ARCH "" CACHE STRING "CPU target: mixed (default when empty) | AVX2 (x86-64-v3) | baseline")
+if(PORT_ARCH STREQUAL "")
+    set(PORT_ARCH mixed)
+endif()
+if(NOT PORT_ARCH MATCHES "^(AVX2|mixed|baseline)$")
+    message(FATAL_ERROR "PORT_ARCH must be AVX2, mixed or baseline (got '${PORT_ARCH}')")
+endif()
+if(PORT_ARCH STREQUAL "baseline")
+    set(RFOM_PPU_V3 OFF)
+    set(RFOM_SPU_AVX2 OFF)
+endif()
 
 # ---------------------------------------------------------------------------
 # ps3recomp runtime library
@@ -178,10 +208,13 @@ endif()
 add_executable(${PROJECT_NAME}
     main.cpp
     stubs.cpp
+    port_hitchcatch.cpp   # PORT_HITCHCATCH=<ms>: key-thread stacks on frame hitches (off by default)
     rfom_mods.cpp     # RFOM_MODS: mods folder (file overrides)
     rfom_pcfeat.cpp   # F3 performance overlay, toasts
     rfom_trophies.cpp # trophy unlock toasts / Saved Games record (sceNpTrophy hook)
+    rfom_cheats.cpp   # optional single-player cheats (God mode, infinite ammo / grenades)
     rfom_pcextra.cpp  # PC extras: More PC Options, photo mode, movie skip, benchmark, Discord
+    rfom_menurows.cpp # R1_MENU_ROWS: Options > PC SETTINGS (pause menu) / PC rows in the game's Audio / Video options (Lua chunk swaps)
     rfom_pctext.cpp   # RFOM_PC_TEXT: console wording -> PC wording
     rfom_reflex.cpp   # RFOM_REFLEX: NVIDIA Reflex via NVAPI (tools/nvapi)
     ${PS3RECOMP_SCAFFOLD}
@@ -236,6 +269,14 @@ if(SPU_SOURCES)
     else()
         set(_spu_defs SPU_USE_DISPATCH_MT)
     endif()
+    # Resistance port: SPU_XF_RZ_TRUST drops the +-FLT_MAX output clamp of every
+    # lifted float op (an identity under RZ, which the runtime then forces in
+    # spu_thread_fp_init; 240M-op equivalence test in spu_native_1115.md).
+    option(RFOM_SPU_XF_RZ_TRUST "Lifted SPU float ops: rely on RZ for saturation" ON)
+    if(RFOM_SPU_FAST AND RFOM_SPU_XF_RZ_TRUST)
+        list(APPEND _spu_defs SPU_XF_RZ_TRUST)
+        target_compile_definitions(ps3recomp_runtime PRIVATE SPU_XF_RZ_TRUST)
+    endif()
     set_source_files_properties(${SPU_SOURCES} PROPERTIES
         INCLUDE_DIRECTORIES "${PS3RECOMP_DIR}/runtime/spu"
         COMPILE_DEFINITIONS "${_spu_defs}")
@@ -243,14 +284,16 @@ if(SPU_SOURCES)
         # Resistance port: the SPU helpers have SSE4.1/AVX2 paths (pshufb shufb,
         # vector float ops) that the default x86-64 baseline compiled out --
         # shufb alone was ~20% of the SPU job thread as a byte loop.
-        # -DRFOM_SPU_AVX2=OFF builds the old baseline.
+        # -DRFOM_SPU_AVX2=OFF builds the SSE4.1 baseline (the runtime needs SSE4.1 anyway).
         option(RFOM_SPU_AVX2 "Build lifted SPU code with AVX2" OFF)
         if(RFOM_SPU_AVX2 AND MSVC)
-            set_source_files_properties(${SPU_SOURCES} PROPERTIES COMPILE_OPTIONS "-O2;/arch:AVX2;/GS-")
+            set_source_files_properties(${SPU_SOURCES} PROPERTIES COMPILE_OPTIONS "-O2;/arch:AVX2;/GS-;/clang:-ffp-contract=off")
         elseif(RFOM_SPU_AVX2)
-            set_source_files_properties(${SPU_SOURCES} PROPERTIES COMPILE_OPTIONS "-O2;-mavx2")
+            set_source_files_properties(${SPU_SOURCES} PROPERTIES COMPILE_OPTIONS "-O2;-mavx2;-ffp-contract=off")
+        elseif(MSVC)
+            set_source_files_properties(${SPU_SOURCES} PROPERTIES COMPILE_OPTIONS "-O2;/clang:-msse4.1;/clang:-ffp-contract=off")
         else()
-            set_source_files_properties(${SPU_SOURCES} PROPERTIES COMPILE_OPTIONS "-O2")
+            set_source_files_properties(${SPU_SOURCES} PROPERTIES COMPILE_OPTIONS "-O2;-msse4.1;-ffp-contract=off")
         endif()
     endif()
 endif()
@@ -301,8 +344,14 @@ endif()
 # Compiler-specific flags
 # ---------------------------------------------------------------------------
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    # clang-cl reads -Wall as /Wall (= -Weverything): hundreds of MB of warnings
+    # in the build log and console. /W3 is its usual level.
+    if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+        target_compile_options(${PROJECT_NAME} PRIVATE /W3)
+    else()
+        target_compile_options(${PROJECT_NAME} PRIVATE -Wall -Wextra -Wno-unused-parameter)
+    endif()
     target_compile_options(${PROJECT_NAME} PRIVATE
-        -Wall -Wextra -Wno-unused-parameter
         -fno-strict-aliasing
         # The lift spells PPC arithmetic as signed C arithmetic, which must wrap;
         # without this, clang exploits overflow UB (e.g. folds "x*x < 0" to false).
@@ -351,10 +400,19 @@ if(MSVC AND RFOM_PPU_V3)
         COMPILE_OPTIONS "/w;/bigobj;/clang:-O2;/clang:-march=x86-64-v3;/clang:-ffp-contract=off;/clang:-fno-math-errno")
 elseif(MSVC)
     set_source_files_properties(${RECOMP_SOURCES} PROPERTIES
-        COMPILE_OPTIONS "/w;/bigobj;/clang:-O2")
+        COMPILE_OPTIONS "/w;/bigobj;/clang:-O2;/clang:-msse4.1;/clang:-ffp-contract=off")
 else()
     set_source_files_properties(${RECOMP_SOURCES} PROPERTIES
         COMPILE_OPTIONS "-w;-ffp-contract=off")
+endif()
+# The lifted TUs declare `extern "C" PPU_THREAD_LOCAL void (*g_trampoline_fn)(void*)` (and other TLS
+# externs) without a visible initialiser, so clang-cl puts an on-demand TLS-init guard (__tls_guard +
+# __dyn_tls_on_demand_init) on every access: ~11.5k per TU in ppu_recomp_001, about two per guest call.
+# Every PPU TLS variable is POD and constant-initialised (__declspec(thread) cannot have dynamic init),
+# so the guard never does anything. -DPORT_PPU_TLS_NOGUARD=OFF restores it. Changing it rebuilds all PPU TUs.
+option(PORT_PPU_TLS_NOGUARD "Lifted PPU code: /Zc:tlsGuards- (no on-demand TLS init guards)" ON)
+if(MSVC AND PORT_PPU_TLS_NOGUARD)
+    set_property(SOURCE ${RECOMP_SOURCES} APPEND PROPERTY COMPILE_OPTIONS "/Zc:tlsGuards-")
 endif()
 
 # ---------------------------------------------------------------------------
@@ -408,6 +466,40 @@ option(PORT_LTO_PPU "ThinLTO for the lifted PPU code too" OFF)
 set(PORT_PGO "off" CACHE STRING "Profile-guided optimisation: off | gen | use")
 set(PORT_PGO_PROFILE "" CACHE FILEPATH "Merged .profdata for PORT_PGO=use")
 option(PORT_PGO_PPU "PGO for the lifted PPU code too" OFF)
+# Short spellings (scratch/lto_pgo.md), all default OFF/empty = the default build:
+#   PORT_THINLTO=ON          = PORT_LTO=ON + PORT_LTO_PPU=ON (runtime and all lifted code),
+#                              plus /Gw. PORT_THINLTO_SCOPE=nopu leaves the lifted PPU code
+#                              out; =hot puts only the PPU files named in PORT_LTO_PPU_ONLY in.
+#   PORT_LTO_JOBS=N          lld-link ThinLTO backend threads (default: all without the PPU
+#                              code, else the RAM-based PPU job pool size: each backend of a
+#                              lifted PPU module needs as much RAM as its compile).
+#   PORT_LTO_CACHE=OFF       no /lldltocache (default ON: <build>/lto_cache).
+#   PORT_LINK_ICF=ON         /OPT:SAFEICF as well as /OPT:REF.
+#   PORT_PGO_GEN=ON          = PORT_PGO=gen;  PORT_PGO_USE=<.profdata> = PORT_PGO=use.
+option(PORT_THINLTO "ThinLTO for the runtime and the lifted code (PORT_THINLTO_SCOPE)" OFF)
+set(PORT_THINLTO_SCOPE "all" CACHE STRING "PORT_THINLTO scope: all | nopu | hot")
+set(PORT_LTO_PPU_ONLY "" CACHE STRING "PPU LTO only for these ppu_recomp_NNN names (PORT_THINLTO_SCOPE=hot)")
+set(PORT_LTO_JOBS "" CACHE STRING "lld-link ThinLTO backend threads (empty: automatic)")
+option(PORT_LTO_CACHE "ThinLTO incremental cache (/lldltocache)" ON)
+option(PORT_LINK_ICF "Link with /OPT:SAFEICF too" OFF)
+option(PORT_PGO_GEN "Instrumented PGO build (= PORT_PGO=gen)" OFF)
+set(PORT_PGO_USE "" CACHE FILEPATH "Merged .profdata: PGO-optimised build (= PORT_PGO=use)")
+if(PORT_THINLTO)
+    set(PORT_LTO ON)
+    if(PORT_THINLTO_SCOPE STREQUAL "all" OR PORT_THINLTO_SCOPE STREQUAL "hot")
+        set(PORT_LTO_PPU ON)
+    elseif(NOT PORT_THINLTO_SCOPE STREQUAL "nopu")
+        message(FATAL_ERROR "PORT_THINLTO_SCOPE must be all, nopu or hot (got '${PORT_THINLTO_SCOPE}')")
+    endif()
+endif()
+if(PORT_PGO_GEN AND PORT_PGO_USE)
+    message(FATAL_ERROR "PORT_PGO_GEN and PORT_PGO_USE are exclusive")
+elseif(PORT_PGO_GEN)
+    set(PORT_PGO gen)
+elseif(PORT_PGO_USE)
+    set(PORT_PGO use)
+    set(PORT_PGO_PROFILE "${PORT_PGO_USE}")
+endif()
 if(MSVC AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     # Hand-written sources of the exe = everything but the lifted PPU/SPU code.
     get_target_property(_all_srcs ${PROJECT_NAME} SOURCES)
@@ -442,19 +534,80 @@ if(MSVC AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
         target_compile_options(ps3recomp_runtime PRIVATE $<$<COMPILE_LANGUAGE:C>:/Zc:tlsGuards->)
         target_compile_options(${PROJECT_NAME} PRIVATE $<$<COMPILE_LANGUAGE:C>:/Zc:tlsGuards->)
     endif()
+    # /GS- drops the stack-cookie checks (2300+ sites in the runtime, the D3D12 renderer included);
+    # /Gw puts globals in their own COMDATs for /OPT:REF. No floating-point or behaviour change.
+    option(PORT_GS_OFF "/GS- and /Gw for the runtime and the hand-written code" ON)
+    if(PORT_GS_OFF)
+        target_compile_options(ps3recomp_runtime PRIVATE /GS- /Gw)
+        set_property(SOURCE ${_hand_srcs} APPEND PROPERTY COMPILE_OPTIONS "/GS-;/Gw")
+    endif()
+    if(PORT_ARCH STREQUAL "AVX2")
+        # x86-64-v3 = what the lifted PPU code and port_cpucheck.h use. Contraction stays
+        # off: the runtime's float paths were validated without FMA, and a fused a*b+c
+        # rounds differently from the PS3's separate multiply and add.
+        target_compile_options(ps3recomp_runtime PRIVATE /clang:-march=x86-64-v3 /clang:-ffp-contract=off)
+        set_property(SOURCE ${_hand_srcs} APPEND PROPERTY COMPILE_OPTIONS "/clang:-march=x86-64-v3;/clang:-ffp-contract=off")
+        message(STATUS "CPU target:      AVX2 / x86-64-v3 (runtime + hand-written + lifted)")
+    elseif(PORT_ARCH STREQUAL "mixed")
+        message(STATUS "CPU target:      mixed (AVX2 lifted code, x86-64 + SSE4.1 runtime and hand-written code)")
+    elseif(PORT_ARCH STREQUAL "baseline")
+        message(STATUS "CPU target:      baseline x86-64 + SSE4.1 (no AVX; RFOM_PPU_V3/RFOM_SPU_AVX2 off)")
+    endif()
     set(_ppu_srcs ${RECOMP_SOURCES})
     list(FILTER _ppu_srcs INCLUDE REGEX "ppu_recomp_[0-9]+\\.cpp$")
     set(_opt_srcs ${_hand_srcs} ${SPU_SOURCES})
     if(PORT_LTO)
         set(_lto_srcs ${_opt_srcs})
+        # The other generated units (HLE NID table, function table) are plain objects otherwise; lld-link
+        # reports their strong ppu_hle_register_all as a duplicate of ppu_hle.cpp's weak bitcode one.
+        set(_recomp_misc ${RECOMP_SOURCES})
+        list(FILTER _recomp_misc EXCLUDE REGEX "ppu_recomp_[0-9]+\\.cpp$")
+        list(APPEND _lto_srcs ${_recomp_misc})
+        set(_lto_ppu "")
         if(PORT_LTO_PPU)
-            list(APPEND _lto_srcs ${_ppu_srcs})
+            set(_lto_ppu ${_ppu_srcs})
+            if(PORT_THINLTO AND PORT_THINLTO_SCOPE STREQUAL "hot")
+                set(_lto_ppu "")
+                foreach(s IN LISTS _ppu_srcs)
+                    get_filename_component(_n "${s}" NAME_WE)
+                    if(_n IN_LIST PORT_LTO_PPU_ONLY)
+                        list(APPEND _lto_ppu "${s}")
+                    endif()
+                endforeach()
+            endif()
+            list(APPEND _lto_srcs ${_lto_ppu})
         endif()
+        list(LENGTH _lto_ppu _lto_nppu)
         target_compile_options(ps3recomp_runtime PRIVATE -flto=thin)
         set_property(SOURCE ${_lto_srcs} APPEND PROPERTY COMPILE_OPTIONS "-flto=thin")
-        target_link_options(${PROJECT_NAME} PRIVATE /opt:lldltojobs=all
-            "/lldltocache:${CMAKE_BINARY_DIR}/lto_cache" /INCREMENTAL:NO)
-        message(STATUS "LTO:             ThinLTO (runtime, hand-written, SPU; lifted PPU: ${PORT_LTO_PPU})")
+        if(PORT_THINLTO)
+            # Per-variable COMDATs so /OPT:REF can drop dead data in the non-LTO objects too.
+            target_compile_options(${PROJECT_NAME} PRIVATE /Gw)
+            target_compile_options(ps3recomp_runtime PRIVATE /Gw)
+        endif()
+        # lld-link runs the ThinLTO backends; a backend of a lifted PPU module
+        # needs about as much RAM as compiling it, so with PPU modules in LTO
+        # the thread count defaults to the RAM-based PPU job pool size.
+        if(NOT "${PORT_LTO_JOBS}" STREQUAL "")
+            set(_lto_jobs "${PORT_LTO_JOBS}")
+        elseif(_lto_nppu GREATER 0)
+            cmake_host_system_information(RESULT _ram_mb QUERY TOTAL_PHYSICAL_MEMORY)
+            math(EXPR _lto_jobs "(${_ram_mb} / 1024 - 6) / 8")
+            if(_lto_jobs LESS 1)
+                set(_lto_jobs 1)
+            endif()
+        else()
+            set(_lto_jobs all)
+        endif()
+        target_link_options(${PROJECT_NAME} PRIVATE /opt:lldltojobs=${_lto_jobs} /INCREMENTAL:NO)
+        # The cache lets a relink after a small change re-optimise only the modules that changed.
+        if(PORT_LTO_CACHE)
+            target_link_options(${PROJECT_NAME} PRIVATE "/lldltocache:${CMAKE_BINARY_DIR}/lto_cache")
+        endif()
+        message(STATUS "LTO:             ThinLTO (runtime, hand-written, SPU; lifted PPU files: ${_lto_nppu}; backend jobs: ${_lto_jobs})")
+    endif()
+    if(PORT_LINK_ICF)
+        target_link_options(${PROJECT_NAME} PRIVATE /OPT:SAFEICF)
     endif()
     if(PORT_PGO STREQUAL "gen" OR PORT_PGO STREQUAL "use")
         set(_pgo_srcs ${_opt_srcs})
@@ -483,7 +636,48 @@ if(MSVC AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
         endif()
         target_compile_options(ps3recomp_runtime PRIVATE ${_pgo_flag})
         set_property(SOURCE ${_pgo_srcs} APPEND PROPERTY COMPILE_OPTIONS "${_pgo_flag}")
+        if(PORT_PGO STREQUAL "use")
+            # The profile is an input of every PGO object: a re-merged .profdata must recompile them
+            # (Ninja does not track it otherwise). The runtime's sources live in another directory scope.
+            set_property(SOURCE ${_pgo_srcs} APPEND PROPERTY OBJECT_DEPENDS "${PORT_PGO_PROFILE}")
+            get_target_property(_rt_srcs ps3recomp_runtime SOURCES)
+            get_target_property(_rt_dir ps3recomp_runtime SOURCE_DIR)
+            set(_rt_abs "")
+            foreach(s IN LISTS _rt_srcs)
+                if(s MATCHES "\\.(c|cc|cpp|cxx)$" AND NOT s MATCHES "^\\$<")
+                    if(NOT IS_ABSOLUTE "${s}")
+                        set(s "${_rt_dir}/${s}")
+                    endif()
+                    list(APPEND _rt_abs "${s}")
+                endif()
+            endforeach()
+            set_property(SOURCE ${_rt_abs} TARGET_DIRECTORY ps3recomp_runtime APPEND PROPERTY OBJECT_DEPENDS "${PORT_PGO_PROFILE}")
+        endif()
     endif()
+endif()
+
+# Resistance port: an AVX2 build (anything but PORT_ARCH=baseline) needs x86-64-v3;
+# port_cpucheck.h (included by main.cpp) then refuses older CPUs with a clear message
+# instead of an illegal-instruction crash.
+option(PORT_CPU_CHECK "Startup check for the CPU features the build needs: AVX2, or SSE4.1 for PORT_ARCH=baseline (port_cpucheck.h)" ON)
+if(PORT_CPU_CHECK AND (RFOM_PPU_V3 OR RFOM_SPU_AVX2 OR PORT_ARCH STREQUAL "AVX2"))
+    target_compile_definitions(${PROJECT_NAME} PRIVATE PORT_REQUIRE_X86_64_V3=1)
+elseif(PORT_CPU_CHECK)
+    # baseline: the runtime and the lifted code are built with -msse4.1
+    target_compile_definitions(${PROJECT_NAME} PRIVATE PORT_REQUIRE_SSE41=1)
+endif()
+# PORT_OPT_EXTRA=ON (default OFF): /Gw (per-variable COMDATs so /OPT:REF can
+# drop dead data) for everything, /GS- (no stack cookies) for the lifted PPU
+# code. Only ~44 of the functions in a lifted PPU TU carry a cookie and the
+# runtime is already /O2 (= /Oi /Ot /Gy) + /Ob2, so the expected gain is small;
+# no floating-point semantics change. Build time unchanged. ThinLTO is the
+# separate PORT_LTO switch (much longer links, see above).
+option(PORT_OPT_EXTRA "Extra codegen flags: /Gw everywhere, /GS- for lifted PPU code" OFF)
+if(PORT_OPT_EXTRA AND MSVC)
+    target_compile_options(${PROJECT_NAME} PRIVATE /Gw)
+    target_compile_options(ps3recomp_runtime PRIVATE /Gw)
+    set_property(SOURCE ${RECOMP_SOURCES} APPEND PROPERTY COMPILE_OPTIONS "/GS-")
+    message(STATUS "Extra opt:       /Gw, lifted PPU /GS-")
 endif()
 
 # ---------------------------------------------------------------------------

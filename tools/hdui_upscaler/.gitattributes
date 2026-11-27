@@ -1,0 +1,2 @@
+# HDUIPack.exe checks the SHA-256 of bin\ and models\ (models\*.param is text): never convert line endings
+* -text

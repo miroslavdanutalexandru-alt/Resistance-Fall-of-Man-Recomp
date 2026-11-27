@@ -57,6 +57,10 @@ static void trophy_adopt_gamedata_root(void)
 /* Set by the port (project/rfom_trophies.cpp): called after each unlock with the
  * context's unlock flags; returns a platinum trophy id to award now, or -1. */
 int (*volatile g_trophy_unlock_hook)(const char* comm_id, int trophy_id, const u8* unlocked, u32 count) = 0;
+/* Set by the port (project/rfom_cheats.cpp) once a cheat has been on in this session: unlock
+ * calls then succeed for the game but record nothing, so the trophy can still be earned
+ * later without cheats. Cleared only by restarting the game. */
+volatile int g_trophy_unlocks_blocked = 0;
 
 /* Per-context data */
 typedef struct {
@@ -505,6 +509,17 @@ s32 sceNpTrophyUnlockTrophy(SceNpTrophyContext context,
 
     if (s_contexts[context].unlocked[trophyId])
         return SCE_NP_TROPHY_ERROR_ALREADY_UNLOCKED;
+
+    if (g_trophy_unlocks_blocked) {
+        static u8 told[256];
+        if ((u32)trophyId >= sizeof(told) || !told[trophyId]) {
+            if ((u32)trophyId < sizeof(told)) told[trophyId] = 1;
+            printf("[sceNpTrophy] trophy #%d not unlocked: cheats were used this session\n", trophyId);
+        }
+        if (platinumId)
+            vm_write32((u32)(uintptr_t)platinumId, (u32)SCE_NP_TROPHY_INVALID_TROPHY_ID);
+        return CELL_OK;
+    }
 
     /* Unlock the trophy */
     s_contexts[context].unlocked[trophyId] = 1;

@@ -38,12 +38,13 @@ LEFT       = RS_LEFT    # Look left
 RIGHT      = RS_RIGHT   # Look right
 
 # Mouse
-mouse_sensitivity = 2.00
+mouse_sensitivity = 2.05
 mouse_invert_y = 0
 mouse_look = direct        # direct: the mouse turns the camera 1:1 on foot; stick: old stick emulation
 mouse_degrees_per_count = 0.050   # direct look speed (x mouse_sensitivity, x the game's Look Sensitivity)
 mouse_deadzone = 0.28      # stick emulation only
 mouse_smoothing = 0.03     # stick emulation only, seconds
+mouse_tank_sensitivity = 1.00   # tank turret mouse speed (x direct look speed), 0.05-10
 mouse_release_key = F8     # free / recapture the mouse cursor
 
 # Controller

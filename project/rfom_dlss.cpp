@@ -9,9 +9,13 @@
 #include <cstdio>
 #include <cstdarg>
 #include <string>
+#include <vector>
 
 #include <nvsdk_ngx.h>
 #include <nvsdk_ngx_helpers.h>
+
+#include "../ps3recomp/libs/video/port_dlss_quality.h"
+#pragma comment(lib, "version.lib")   // GetFileVersionInfoW: the nvngx_dlss.dll version log
 
 typedef void (*RfomDlssLog)(const char* msg);
 
@@ -37,6 +41,58 @@ void Log(const char* fmt, ...) {
 bool Ok(const char* what, NVSDK_NGX_Result r) {
     if (NVSDK_NGX_FAILED(r)) { Log("%s failed: 0x%08x", what, (unsigned)r); return false; }
     return true;
+}
+
+// The nvngx_dlss.dll NGX actually loaded (an NVIDIA App / driver override can replace the one next to the game)
+// and its file version. false: not found / no version resource.
+bool DlssDllVersion(unsigned v[4], std::wstring& path) {
+    wchar_t buf[MAX_PATH] = {};
+    HMODULE m = GetModuleHandleW(L"nvngx_dlss.dll");
+    if (m && GetModuleFileNameW(m, buf, MAX_PATH)) path = buf;
+    else path = g_dir + L"\\nvngx_dlss.dll";
+    DWORD hnd = 0;
+    const DWORD n = GetFileVersionInfoSizeW(path.c_str(), &hnd);
+    if (!n) return false;
+    std::vector<char> data(n);
+    VS_FIXEDFILEINFO* fi = nullptr;
+    UINT len = 0;
+    if (!GetFileVersionInfoW(path.c_str(), 0, n, data.data()) ||
+        !VerQueryValueW(data.data(), L"\\", reinterpret_cast<void**>(&fi), &len) || !fi || len < sizeof(*fi))
+        return false;
+    v[0] = HIWORD(fi->dwFileVersionMS); v[1] = LOWORD(fi->dwFileVersionMS);
+    v[2] = HIWORD(fi->dwFileVersionLS); v[3] = LOWORD(fi->dwFileVersionLS);
+    return true;
+}
+
+// Preset / DLL logging (always on, log only). NGX has no "current preset" query, so this logs the requested
+// preset and the DLL version, and warns once when that DLL does not honour it (pdq_preset_check).
+void LogDllAndPreset(unsigned preset, const char* mode) {
+    static bool dll_logged;
+    static bool warned;
+    unsigned v[4] = {};
+    std::wstring path;
+    const bool have = DlssDllVersion(v, path);
+    if (!dll_logged) {
+        dll_logged = true;
+        char p8[MAX_PATH * 3] = {};
+        WideCharToMultiByte(CP_UTF8, 0, path.c_str(), -1, p8, sizeof p8, nullptr, nullptr);
+        if (have) Log("nvngx_dlss.dll %u.%u.%u.%u (%s)", v[0], v[1], v[2], v[3], p8);
+        else Log("nvngx_dlss.dll version unknown (%s)", p8);
+        unsigned opt = 0, dev = 0;
+        if (g_params && NVSDK_NGX_SUCCEED(NVSDK_NGX_Parameter_GetUI(g_params, NVSDK_NGX_Parameter_OptLevel, &opt))) {
+            NVSDK_NGX_Parameter_GetUI(g_params, NVSDK_NGX_Parameter_IsDevSnippetBranch, &dev);
+            Log("DLSS snippet opt level %u%s", opt, dev ? " (dev branch)" : "");
+        }
+    }
+    const int pc = have ? pdq_preset_check(v[0], v[1], preset) : PDQ_PRESET_OK;
+    Log("DLSS preset requested for %s: %s%c (NGX has no applied-preset query; %s)", mode, preset ? "" : "default", preset ? pdq_preset_letter(preset) : ' ',
+        pc == PDQ_PRESET_OK ? "this DLL supports it" : pc == PDQ_PRESET_DEPRECATED ? "deprecated in this DLL" :
+        pc == PDQ_PRESET_REMOVED ? "removed in this DLL: NVIDIA's default is used" : "this DLL predates it: NVIDIA's default is used");
+    if ((preset == 5 || preset == 6) && pc != PDQ_PRESET_OK && !warned) {
+        warned = true;
+        Log("WARNING: preset %c was requested but nvngx_dlss.dll %u.%u %s; check the NVIDIA overlay (DLSS indicator) for the preset in use",
+            pdq_preset_letter(preset), v[0], v[1], pc == PDQ_PRESET_DEPRECATED ? "deprecates it (DLSS 4 DLLs may ignore or remap E/F)" : "ignores it");
+    }
 }
 } // namespace
 
@@ -105,6 +161,7 @@ __declspec(dllexport) int rfom_dlss_create(ID3D12GraphicsCommandList* cl, unsign
     }
     g_w = w; g_h = h;
     Log("DLSS feature %ux%u -> %ux%u (%s), preset %u", w, h, ow, oh, (unsigned)q < 6 ? qn[q] : "?", preset);
+    LogDllAndPreset(preset, (unsigned)q < 6 ? qn[q] : "?");
     return 1;
 }
 

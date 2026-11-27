@@ -563,6 +563,84 @@ static void test_decode_compressed_is_verbatim(void)
     CHECK_EQ(dst[16], 0xA5);          /* padding untouched */
 }
 
+/* Unaligned DXT (the 174x14 / 3x23 HUD pieces, issues #19/#21/#23) is
+ * decompressed to RGBA8 at its exact size for hosts that can't create it. */
+static void bc1_block(u8* b, u16 c0, u16 c1, u32 idx)
+{
+    b[0] = (u8)c0; b[1] = (u8)(c0 >> 8); b[2] = (u8)c1; b[3] = (u8)(c1 >> 8);
+    b[4] = (u8)idx; b[5] = (u8)(idx >> 8); b[6] = (u8)(idx >> 16); b[7] = (u8)(idx >> 24);
+}
+static void test_bc_to_rgba8(void)
+{
+    rsx_tex_layout L;
+    /* BC1 6x5 = 2x2 blocks; only texels inside 6x5 are written. */
+    rsx_texture_layout(FMT_DXT1 | FMT_LN, 6, 5, &L);
+    CHECK_EQ(L.row_bytes, 16);
+    CHECK_EQ(L.rows, 2);
+    u8 src[32];
+    bc1_block(src + 0,  0xF800, 0x001F, 0x00000000u);            /* 4-colour: all c0 = red */
+    bc1_block(src + 8,  0x001F, 0xF800, 0xFFFFFFFFu);            /* c0 < c1, index 3: transparent black */
+    bc1_block(src + 16, 0xF800, 0x001F, 0x00000002u);            /* texel 0 = (2*red + blue)/3 */
+    bc1_block(src + 24, 0x07E0, 0x07E0, 0x00000002u);            /* c0 == c1: 3-colour, index 2 = average */
+    const u32 dp = 6 * 4 + 8;
+    u8 dst[8 * dp];
+    memset(dst, 0xA5, sizeof dst);
+    CHECK_EQ(rsx_texture_bc_to_rgba8(dst, dp, src, 6, 5, &L), 1);
+    CHECK_EQ(dst[0], 255); CHECK_EQ(dst[1], 0); CHECK_EQ(dst[2], 0); CHECK_EQ(dst[3], 255);
+    CHECK_EQ(dst[3 * dp + 12 + 3], 255);                         /* (3,3) still red, opaque */
+    CHECK_EQ(dst[4 * 4 + 3], 0); CHECK_EQ(dst[4 * 4 + 0], 0);    /* (4,0) punch-through */
+    CHECK_EQ(dst[4 * dp + 0], 170); CHECK_EQ(dst[4 * dp + 2], 85); /* (0,4) 2/3 red + 1/3 blue */
+    CHECK_EQ(dst[4 * dp + 16 + 1], 255); CHECK_EQ(dst[4 * dp + 16 + 3], 255);   /* (4,4) green */
+    CHECK_EQ(dst[24], 0xA5);                                     /* x = 6 never written */
+    CHECK_EQ(dst[5 * dp], 0xA5);                                 /* y = 5 never written */
+
+    /* BC2: explicit 4-bit alpha; colour block always 4-colour even if c0 <= c1. */
+    rsx_texture_layout(FMT_DXT23 | FMT_LN, 3, 2, &L);
+    u8 b2[16];
+    memset(b2, 0, 8);
+    b2[0] = 0x0F;                                                /* texel 0 alpha 15, texel 1 alpha 0 */
+    b2[1] = 0x08;                                                /* texel 2 alpha 8 */
+    bc1_block(b2 + 8, 0x001F, 0xF800, 0x0000003Cu);              /* texel 1 = index 3, texel 2 = index 3 */
+    u8 d2[2 * 12];
+    memset(d2, 0xA5, sizeof d2);
+    CHECK_EQ(rsx_texture_bc_to_rgba8(d2, 12, b2, 3, 2, &L), 1);
+    CHECK_EQ(d2[3], 255); CHECK_EQ(d2[7], 0); CHECK_EQ(d2[11], 136);
+    CHECK_EQ(d2[4], 170); CHECK_EQ(d2[6], 85);                   /* (0+2*255)/3 red, (2*255)/3 blue: not black */
+
+    /* BC3: interpolated alpha, 8-value and 6-value modes. */
+    rsx_texture_layout(FMT_DXT45 | FMT_LN, 4, 4, &L);
+    u8 b3[16];
+    memset(b3, 0, sizeof b3);
+    b3[0] = 255; b3[1] = 0;
+    b3[2] = (u8)(0u | (1u << 3) | (2u << 6));                    /* texels 0,1,2 = idx 0,1,2 */
+    b3[3] = (u8)(2u >> 2);
+    bc1_block(b3 + 8, 0xFFFF, 0xFFFF, 0);
+    u8 d3[4 * 16];
+    CHECK_EQ(rsx_texture_bc_to_rgba8(d3, 16, b3, 4, 4, &L), 1);
+    CHECK_EQ(d3[3], 255); CHECK_EQ(d3[7], 0); CHECK_EQ(d3[11], 219);
+    b3[0] = 0; b3[1] = 255;                                      /* a0 <= a1: idx 6 = 0, idx 7 = 255 */
+    b3[2] = (u8)(6u | (7u << 3) | (1u << 6)); b3[3] = 0;          /* texel 2 = idx 1 */
+    CHECK_EQ(rsx_texture_bc_to_rgba8(d3, 16, b3, 4, 4, &L), 1);
+    CHECK_EQ(d3[3], 0); CHECK_EQ(d3[7], 255); CHECK_EQ(d3[11], 255);
+
+    /* A linear image's TEXTURE_CONTROL3 pitch steps the block rows. */
+    rsx_texture_layout_pitched(FMT_DXT1 | FMT_LN, 3, 6, 64, &L);
+    CHECK_EQ(L.row_bytes, 64);
+    u8 sp[2 * 64];
+    memset(sp, 0, sizeof sp);
+    bc1_block(sp, 0xF800, 0, 0);
+    bc1_block(sp + 64, 0x001F, 0, 0);
+    u8 dpd[6 * 12];
+    CHECK_EQ(rsx_texture_bc_to_rgba8(dpd, 12, sp, 3, 6, &L), 1);
+    CHECK_EQ(dpd[0], 255); CHECK_EQ(dpd[4 * 12 + 2], 255); CHECK_EQ(dpd[4 * 12 + 0], 0);
+
+    /* Not compressed, or a destination row too narrow: nothing written. */
+    rsx_texture_layout(FMT_A8R8G8B8 | FMT_LN, 4, 4, &L);
+    CHECK_EQ(rsx_texture_bc_to_rgba8(d3, 16, b3, 4, 4, &L), 0);
+    rsx_texture_layout(FMT_DXT1 | FMT_LN, 6, 5, &L);
+    CHECK_EQ(rsx_texture_bc_to_rgba8(dst, 20, src, 6, 5, &L), 0);
+}
+
 /* Nothing should be written through a null or zero-sized request. */
 static void test_decode_rejects_nonsense(void)
 {
@@ -799,6 +877,7 @@ int main(void)
     test_decode_swizzled();
     test_decode_g8b8_swizzled();
     test_decode_compressed_is_verbatim();
+    test_bc_to_rgba8();
     test_decode_rejects_nonsense();
     test_remap_identity();
     test_remap_identity_packs_to_d3d_default();

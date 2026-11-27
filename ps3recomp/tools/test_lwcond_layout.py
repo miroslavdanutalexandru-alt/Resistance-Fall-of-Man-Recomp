@@ -50,7 +50,16 @@ static uint32_t s_asked = 0xFFFFFFFFu;
 static HANDLE lwm_sem(uint32_t lwmutex) { s_asked = lwmutex; return nullptr; }
 static void ReleaseSemaphore(HANDLE, long, void*) {}
 static void Sleep(unsigned) {}
+static void port_sleep_1ms() {}
 static unsigned WaitForSingleObject(HANDLE, unsigned) { return 0; }
+/* The lwcond wake (PS3_LWCOND_WAKE) helpers the wait uses. */
+typedef long LONG;
+typedef void VOID;
+typedef unsigned long DWORD;
+static volatile LONG* lwc_seq(uint32_t) { static LONG s; return &s; }
+static int lwc_wake_on(void) { return 0; }
+static DWORD lwc_wait_ms(uint64_t) { return 1; }
+static int WaitOnAddress(volatile VOID*, void*, size_t, DWORD) { return 1; }
 %s
 %s
 int main() {

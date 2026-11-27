@@ -21,6 +21,7 @@
 #include <string.h>
 #include "../../runtime/memory/vm.h"    /* VM_HLE_INJECT_BASE */
 #include "ps3emu/log_first.h"
+#include "rsx_featcov.h"     /* RSX feature coverage tracer ([featcov] lines in run.log) */
 /* Resistance port: getenv() is called on hot paths (per draw / per method);
  * the UCRT version takes a lock and scans the environment every time, which
  * profiled at ~20% of the render thread. Cached by call-site string pointer. */
@@ -72,6 +73,9 @@ void rsx_state_init(rsx_state* state)
     state->scissor_h = 4096;
 
     /* Default depth */
+    state->aa_control = 0xFFFF0000u;
+    state->point_size = 1.0f;
+
     state->depth_func = 1; /* LESS */
     state->depth_mask = 1;
 
@@ -95,6 +99,16 @@ void rsx_state_init(rsx_state* state)
     state->back_stencil_write_mask = 0xFF;
     state->back_stencil_op_fail = state->back_stencil_op_zfail = state->back_stencil_op_zpass = 0x1E00;
 
+    /* Feature-gap state: RSX reset values (RPCS3 rsx_methods.cpp init) */
+    state->logic_op = 0x1503u;              /* COPY */
+    state->depth_bounds_min = 0.0f; state->depth_bounds_max = 1.0f;
+    state->zminmax_control = 1u;            /* depth clip on, clamp off */
+    state->front_polygon_mode = state->back_polygon_mode = 0x1B02u;   /* FILL */
+    state->fog_mode = 0x2601u;              /* LINEAR */
+    state->render_enable = 0x01000000u;     /* mode 1: always render */
+    state->shade_model = 0x1D01u;           /* SMOOTH */
+    state->line_width = 1.0f;
+    state->dither_enable = 1u;
     /* Default alpha test */
     state->alpha_func = 0x0207; /* ALWAYS */
     state->alpha_ref = 0;
@@ -397,10 +411,29 @@ int rsx_tconst_fast_ok(void)
                      !getenv("RSX_TRACE") && !getenv("GCM_TCONST_SLOW");
     return ok;
 }
+/* featcov: decode the FP ucode a SHADER_PROGRAM value points at, once per
+ * (address, leading ucode bytes); the R1 FP decompiler is not hooked (its
+ * tests build it standalone). */
+static void rsx_featcov_fp_seen(u32 data)
+{
+    static u32 last = 0xFFFFFFFFu;
+    if (data == last) return;
+    last = data;
+    extern u32 cellGcmResolveLocated(int local, u32 offset);
+    const u32 ea = cellGcmResolveLocated((data & 3u) == 1u, data & ~3u);
+    if (!ea || !vm_base) return;
+    const u8* p = vm_base + ea;
+    u32 h = data;
+    for (int i = 0; i < 32; i++) h = (h ^ p[i]) * 16777619u;
+    if (rsx_featcov_fp_program(h)) rsx_featcov_fp_ucode(RSX_FC_PORT_R1, p, 16u * 256u);
+}
+
 void rsx_tconst_block(rsx_state* state, u32 method, const u8* be, u32 count)
 {
     u32 reg = (method - NV4097_SET_TRANSFORM_CONSTANT) / 4;
     const u32 load = state->transform_constant_load;
+    rsx_featcov_method(RSX_FC_PORT_R1, method, 0);
+    state->prim_break += (u32)state->in_begin_end;
     u32 lo = state->vertex_constants_lo, hi = state->vertex_constants_hi;
     int dirty = state->vertex_constants_dirty;
     for (u32 i = 0; i < count; i++, reg++, be += 4) {
@@ -422,7 +455,10 @@ void rsx_tconst_block(rsx_state* state, u32 method, const u8* be, u32 count)
 void rsx_tprog_block(rsx_state* state, const u8* be, u32 count)
 {
     u32 w = state->vp_ucode_write, n = 0;
+    rsx_featcov_method(RSX_FC_PORT_R1, NV4097_SET_TRANSFORM_PROGRAM, 0);
     for (; n < count && w + 4 <= sizeof(state->vp_ucode); n++, w += 4, be += 4) {
+        if ((w & 15u) == 4u)
+            rsx_featcov_vp_d1(RSX_FC_PORT_R1, (u32)be[0] << 24 | (u32)be[1] << 16 | (u32)be[2] << 8 | be[3]);
         state->vp_ucode[w + 0] = be[3];
         state->vp_ucode[w + 1] = be[2];
         state->vp_ucode[w + 2] = be[1];
@@ -535,8 +571,52 @@ static int rsx_mcls_enabled(void)
     return on;
 }
 
+/* Feature-gap batch: registers the D3D12 backend now consumes (see
+ * rsx_ext_state.h "ext2"). 1 = handled. */
+static int rsx_ext2_method(rsx_state* s, u32 method, u32 data)
+{
+    switch (method) {
+    case 0x031C: s->blend_color = data; return 1;
+    case 0x037C: s->blend_color2 = data; return 1;
+    case 0x036C: s->blend_enable_mrt = data; s->blend_enable_mrt_set = 1; return 1;
+    case 0x0370: s->color_mask_mrt = data; s->color_mask_mrt_set = 1; return 1;
+    case 0x0374: s->logic_op_enable = data ? 1u : 0u; return 1;
+    case 0x0378: s->logic_op = data; return 1;
+    case 0x0380: s->depth_bounds_enable = data ? 1u : 0u; return 1;
+    case 0x0384: memcpy(&s->depth_bounds_min, &data, 4); return 1;
+    case 0x0388: memcpy(&s->depth_bounds_max, &data, 4); return 1;
+    case 0x0394: memcpy(&s->clip_min, &data, 4); return 1;
+    case 0x0398: memcpy(&s->clip_max, &data, 4); return 1;
+    case 0x1D78: s->zminmax_control = data; return 1;
+    case 0x1828: s->front_polygon_mode = data; return 1;
+    case 0x182C: s->back_polygon_mode = data; return 1;
+    case 0x08CC: s->fog_mode = data; return 1;
+    case 0x08D0: memcpy(&s->fog_params[0], &data, 4); return 1;
+    case 0x08D4: memcpy(&s->fog_params[1], &data, 4); return 1;
+    case 0x142C: s->two_side_light = data ? 1u : 0u; return 1;
+    /* Conditional rendering: ZPASS reports always read "visible" here
+     * (cellGcmSys GET_REPORT), so no draw is ever skipped; stored only. */
+    case 0x1E98: s->render_enable = data; return 1;
+    case 0x0368: s->shade_model = data; return 1;
+    case 0x03B8: s->line_width = (float)(data & 0x1FFu) / 8.0f; return 1;
+    case 0x03BC: s->line_smooth = data ? 1u : 0u; return 1;
+    case 0x1838: s->poly_smooth = data ? 1u : 0u; return 1;
+    case 0x147C: s->poly_stipple = data ? 1u : 0u; return 1;
+    case 0x0300: s->dither_enable = data ? 1u : 0u; return 1;
+    case 0x02B8: s->window_offset = data; return 1;
+    case 0x0238: s->cylindrical_wrap = data; return 1;
+    case 0x1EE4: s->point_params_enable = data ? 1u : 0u; return 1;
+    case 0x1D00: s->color_key = data; return 1;
+    default: break;
+    }
+    if (method >= 0x0B40 && method < 0x0B40 + 10 * 4) { s->tex_coord_control[(method - 0x0B40) >> 2] = data; return 1; }
+    if (method >= 0x1480 && method < 0x1480 + 32 * 4) return 1;   /* POLYGON_STIPPLE_PATTERN: no D3D12 stipple */
+    return 0;
+}
+
 int rsx_process_method(rsx_state* state, u32 method, u32 data)
 {
+    rsx_featcov_method(RSX_FC_PORT_R1, method, data);
     static int s_mdbg = -1;
     if (s_mdbg < 0) s_mdbg = (getenv("METHOD_SEEN") || getenv("RSX_TRACE")) ? 1 : 0;
     if (s_mdbg) {
@@ -565,8 +645,8 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         case MC_VTEX:    return process_vertex_texture_method(state, method, data);
         case MC_VATTR:   return process_vertex_attrib_method(state, method, data);
         case MC_FREQ:    state->frequency_divider_op = data; return 0;
-        case MC_VDBOFF:  state->vertex_data_base_offset = data; return 0;
-        case MC_VDBIDX:  state->vertex_data_base_index  = data; return 0;
+        case MC_VDBOFF:  state->vertex_data_base_offset = data; state->prim_break += (u32)state->in_begin_end; return 0;
+        case MC_VDBIDX:  state->vertex_data_base_index  = data; state->prim_break += (u32)state->in_begin_end; return 0;
         case MC_VPORT:   goto L_vport;
         case MC_VIEW:    goto L_view;
         case MC_CMASK:   goto L_cmask;
@@ -601,8 +681,13 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
      * mesh that relies on them (Fall of Man shares one vertex pool across a
      * level and selects each mesh by base offset) fetched from the start of
      * the pool: the world drew as giant stretched triangles. */
-    if (method == 0x00001738) { state->vertex_data_base_offset = data; return 0; }
-    if (method == 0x0000173C) { state->vertex_data_base_index  = data; return 0; }
+    if (method == 0x00001738) { state->vertex_data_base_offset = data; state->prim_break += (u32)state->in_begin_end; return 0; }
+    if (method == 0x0000173C) { state->vertex_data_base_index  = data; state->prim_break += (u32)state->in_begin_end; return 0; }
+    if (method == 0x00001D7C) { state->aa_control = data; return 0; }
+    if (method == 0x00001478) { state->clip_plane_control = data; return 0; }
+    if (method == 0x00001EE0) { memcpy(&state->point_size, &data, 4); return 0; }
+    if (method == 0x00001EE8) { state->point_sprite_control = data; return 0; }
+    if (rsx_ext2_method(state, method, data)) return 0;
 
     /* NV4097_SET_CONTEXT_DMA_SEMAPHORE (0x01A4) picks where the semaphore
      * offset points. CELL_GCM_CONTEXT_DMA_MEMORY_HOST_BUFFER (0xFEED0001) is
@@ -910,6 +995,7 @@ L_shader:
         state->shader_program = data;
         state->fragment_program_addr = data & ~0x3u;
         state->shader_dirty = 1;
+        rsx_featcov_fp_seen(data);
         return 0;
     }
     if (method == NV4097_SET_TRANSFORM_PROGRAM_LOAD) {
@@ -936,6 +1022,7 @@ L_tprog:
         method <  NV4097_SET_TRANSFORM_PROGRAM + 32 * 4) {
         u32 w = state->vp_ucode_write;
         if (w + 4 <= sizeof(state->vp_ucode)) {
+            if ((w & 15u) == 4u) rsx_featcov_vp_d1(RSX_FC_PORT_R1, data);
             /* data is host-endian already; store as little-endian bytes. */
             state->vp_ucode[w+0] = (u8)(data);
             state->vp_ucode[w+1] = (u8)(data >> 8);
@@ -1060,6 +1147,7 @@ L_tcload:
         { static int _n=0, _e=-1; if (_e < 0) _e = getenv("LOAD_DBG") ? 1 : 0; if (_e && PS3_LOG_FIRST(_n, 200))
             fprintf(stderr, "[LOAD] transform_constant_load = %u\n", data); }
         state->transform_constant_load = data;
+        state->prim_break += (u32)state->in_begin_end;
         return 0;
     }
 
@@ -1091,6 +1179,7 @@ L_tconst:
         method <  NV4097_SET_TRANSFORM_CONSTANT + NV4097_SET_TRANSFORM_CONSTANT_DWORDS * 4) {
         u32 reg_offset = (method - NV4097_SET_TRANSFORM_CONSTANT) / 4;
         u32 slot = state->transform_constant_load + (reg_offset >> 2);
+        state->prim_break += (u32)state->in_begin_end;
         u32 lane = reg_offset & 3;
         if (slot < RSX_MAX_VERTEX_CONSTANTS) {
             float f;

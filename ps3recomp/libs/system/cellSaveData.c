@@ -841,6 +841,8 @@ static void read_param_sfo(const char* save_path, CellSaveDataSystemFileParam* p
     }
 }
 
+#include "savedata_backup.h" /* PC port: per-slot save backups (PORT_SAVE_BACKUP) */
+
 /* Saves in progress, for a clean quit (project/rfom_pcport.inc waits for 0
  * before ending the process, so a save is never cut off half-written). */
 volatile long g_ps3_savedata_busy = 0;
@@ -858,6 +860,12 @@ static s32 savedata_execute(const char* dirName, int is_save,
 #ifdef _WIN32
     InterlockedIncrement(&g_ps3_savedata_busy);
 #endif
+    if (is_save && dirName) {
+        /* PC port: copy the slot to saves_backup\<slot>\<stamp> before it is overwritten */
+        char bk_path[1024];
+        build_save_path(bk_path, sizeof(bk_path), dirName);
+        sdbk_before_save(bk_path, dirName, s_save_root);
+    }
     const s32 r = savedata_execute_impl(dirName, is_save, setBuf, funcStat, funcFile, userdata);
 #ifdef _WIN32
     InterlockedDecrement(&g_ps3_savedata_busy);

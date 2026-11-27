@@ -40,6 +40,9 @@ extern "C" {
  * Returns 0 on success, -1 on failure. */
 int rsx_d3d12_backend_init(u32 width, u32 height, const char* title);
 
+/* Per-monitor v2 DPI awareness (RSX_DPI_AWARE=0 skips it). Call before any window exists; idempotent. */
+void rsx_d3d12_dpi_init(void);
+
 /* Shut down the D3D12 backend and release all resources. */
 void rsx_d3d12_backend_shutdown(void);
 

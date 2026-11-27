@@ -14,7 +14,10 @@
  * RELEASE and a two-method ACQUIRE+RELEASE each leave get past the whole
  * command, and get does not move with the methods after it. With
  * GCM_GET_EQ_PUT=1 (argument "eq-put") the RELEASE publishes nothing and get
- * is put at the end of the pass, as before.
+ * is put at the end of the pass, as before. The NV4097 back-end RELEASE
+ * (0x1D6C offset + 0x1D70 value + 0x1D74 texture-read value in one packet)
+ * as the last command before put, the shape
+ * of the Resistance 3 frame-fence hang, also has get past it when it runs.
  *
  * gcc -std=gnu17 -I include -I libs/video
  *   libs/video/tests/test_gcm_get_on_release.c -ffunction-sections
@@ -43,7 +46,15 @@ void (*g_spu_put_hook)(uint32_t ea, uint32_t size);
 void ppu_dump_bctrl_ring(uint32_t n, const char* why) { (void)n; (void)why; }
 void ppu_dump_guest_stack(ppu_context* c, const char* why) { (void)c; (void)why; }
 void rsx_state_init(rsx_state* state) { (void)state; }
-int  rsx_process_method(rsx_state* state, u32 method, u32 data) { (void)state; (void)method; (void)data; return 0; }
+/* The back-end RELEASE (0x1D70) is the label write of rsx_commands.c: record get there. */
+static u32 seen_be_get, seen_be_n, seen_tr_get;
+int  rsx_process_method(rsx_state* state, u32 method, u32 data)
+{
+    (void)state; (void)data;
+    if (method == 0x1D70u) { seen_be_get = vm_read32(GCM_CONTROL_GUEST_ADDR + 4); seen_be_n++; }
+    if (method == 0x1D74u) seen_tr_get = vm_read32(GCM_CONTROL_GUEST_ADDR + 4);
+    return 0;
+}
 int  rsx_draw_engine_enabled(void) { return 0; }
 void rsx_draw_engine_method(u32 method, u32 arg) { (void)method; (void)arg; }
 void rsx_draw_engine_note_flip(u32 buffer_id) { (void)buffer_id; }
@@ -134,6 +145,9 @@ int main(int argc, char** argv)
     const u32 end_rel2 = io;
     io = put_probe(io, 2);
     io = put_probe(io, 3);
+    const u32 be_rel[3] = { 0x20u, 0x30000000u, 0x30000000u };
+    const u32 be_hdr = io;
+    io = put_cmd(io, 0, 0x1D6Cu, 3, be_rel);
     const u32 put = io;
 
     s_fifo_getoff = 0;
@@ -149,8 +163,10 @@ int main(int argc, char** argv)
         check(seen_get[1] == end_rel1, "get is past the RELEASE when its label is seen");
         check(seen_get[2] == end_rel2, "get is past the whole ACQUIRE+RELEASE command");
         check(seen_get[3] == end_rel2, "get does not move with the methods after it");
+        check(seen_be_n == 1 && seen_be_get == be_hdr + 12, "get is past a back-end RELEASE, not past the packet's later words, when it runs");
+        check(seen_tr_get == put, "get is past the trailing texture-read RELEASE (at put) when it runs");
     } else {
-        check(seen_get[1] == 0 && seen_get[2] == 0 && seen_get[3] == 0,
+        check(seen_get[1] == 0 && seen_get[2] == 0 && seen_get[3] == 0 && seen_be_get == 0 && seen_tr_get == 0,
               "GCM_GET_EQ_PUT: a RELEASE publishes nothing mid-pass");
     }
     check(vm_read32(ctrl + 4) == put, "after the pass, get is put");

@@ -101,6 +101,7 @@ static u32 s_f3_dw, s_f3_dh, s_f3_mw, s_f3_mh, s_f3_hdr, s_f3_ctx_fail;
 static u64 s_f3_fid;                         /* frame ID of the last configured present */
 static int s_f3_streak, s_f3_on, s_f3_prev_split, s_f3_dbgflags;
 static u32 s_f3_presents, s_f3_gen_n;
+static int f3_is_on(void) { return s_f3_on; }   /* rsx_dlssg_ghost.inc stats */
 static ID3D12DescriptorHeap *s_f3_srv_heap, *s_f3_rtv_heap;   /* presenter thread only */
 static UINT s_f3_srv_inc, s_f3_rtv_inc, s_f3_slot;
 #define F3_RING 16u
@@ -373,7 +374,7 @@ static void f3_prepare(ID3D12GraphicsCommandList* cl, ID3D12Resource* z, D3D12_R
     pd.motionVectorScale.x = (float)rw; pd.motionVectorScale.y = (float)rh;
     pd.frameTimeDelta = dt;
     pd.reset = reset != 0;
-    pd.cameraNear = 0.1f; pd.cameraFar = 1000.0f; pd.cameraFovAngleVertical = 1.0f; pd.viewSpaceToMetersFactor = 1.0f;
+    fsr_camera(&pd.cameraNear, &pd.cameraFar, &pd.cameraFovAngleVertical); pd.viewSpaceToMetersFactor = 1.0f;
     pd.depth = fsr_res(z, DXGI_FORMAT_R32_FLOAT, w, h, FFX_API_RESOURCE_USAGE_READ_ONLY, FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
     pd.motionVectors = fsr_res(mv, DXGI_FORMAT_R16G16_FLOAT, w, h, FFX_API_RESOURCE_USAGE_READ_ONLY, FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
     const ffxReturnCode_t rc = p_f3Dispatch(&s_f3_ctx, &pd.header);
@@ -411,12 +412,18 @@ static void f3_present(const D3D12_VIEWPORT* vp, int split, int* vs)
     const u64 fid = ++s_f3_fid;
     const u32 i = (u32)(fid % F3_RING);
     const int ui_on = fg_ui_on();
-    const int want = s_fgh.tagged && s_f3_ctx && s_app_active && !IsIconic(s_d3d.hwnd) && (!ui_on || split);
+    const int want = s_fgh.tagged && !s_fg_movie && s_f3_ctx && s_app_active && !IsIconic(s_d3d.hwnd) && (!ui_on || split);
     s_f3_streak = want ? s_f3_streak + 1 : 0;
     const int on = s_f3_streak >= 2;
     const int sp = on && split && f3_heaps();
     if (!s_fgh.tagged) s_f3_ring[i].reset = 1;
     if (sp != s_f3_prev_split || (on && !s_f3_on)) s_f3_ring[i].reset = 1;
+    if (s_fgd_on) {   /* RFOM_FG_DIAG */
+        s_fgdf.on = (u8)on; s_fgdf.n = (u8)(on ? 2 : 1);
+        s_fgdf.reset |= (u8)((!s_fgh.tagged ? FGD_R_UNTAG : 0) | (sp != s_f3_prev_split ? FGD_R_SPLIT : 0) | (on && !s_f3_on ? FGD_R_RESUME : 0));
+        if (!on) s_fgdf.off |= (u8)((!s_fgh.tagged ? FGD_W_INPUTS : 0) | (!s_f3_ctx ? FGD_W_NOCTX : 0) | (!s_app_active ? FGD_W_BG : 0) |
+                                    (IsIconic(s_d3d.hwnd) ? FGD_W_MIN : 0) | (ui_on && !split ? FGD_W_HUD : 0) | (want ? FGD_W_WARM : 0));
+    }
     s_f3_ring[i].split = sp; s_f3_ring[i].hsc = sp ? s_fg_hsc : NULL; s_f3_ring[i].w = s_sc_w; s_f3_ring[i].h = s_sc_h;
     s_f3_prev_split = sp;
     if (on != s_f3_on) {
@@ -441,7 +448,7 @@ static void f3_present(const D3D12_VIEWPORT* vp, int split, int* vs)
     f3_configure(on, 1, &r);
     s_f3_ring[(u32)((fid + 1u) % F3_RING)].reset = 0;   /* f3_prepare sets it for the next frame */
     if (on) s_f3_gen_n++;
-    if ((++s_f3_presents % 6000u) == 0u)
+    if ((++s_f3_presents % 6000u) == 0u && port_stats_log())
         fprintf(stderr, "[FSR3-FG] %u of the last 6000 presents had a generated frame; HUD split %u of %u frames%c",
                 s_f3_gen_n, s_fg_hud_ok, s_fg_hud_ok + s_fg_hud_fb, 10), s_f3_gen_n = 0;
 }

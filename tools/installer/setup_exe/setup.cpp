@@ -43,6 +43,7 @@
 #include <cstdarg>
 #include <cwchar>
 #include <cwctype>
+#include <share.h>
 
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
@@ -227,7 +228,7 @@ static bool NeedsRpcs3() { return Exists(P(L"tools\\fetch_rpcs3.ps1")); }
 
 // ---------------------------------------------------------------- options
 struct Options {
-    bool dryRun = false, uninstall = false, help = false;
+    bool dryRun = false, uninstall = false, help = false, prepare = false;
     wstring game, parseLog;
     double ramGB = 0, freeGB = 0, ppuGB = 0;
     int cores = 0, reduce = -1;
@@ -237,6 +238,11 @@ struct Options {
 static HWND g_hwnd = nullptr;
 static bool g_console = false;
 static HANDLE g_out = nullptr;
+// --prepare (RecompLauncher): no window; "progress <0..1> <text>" lines on stdout; exit code 0 = ready
+static bool g_prepare = false;
+static int g_prepProg = 0;  // 0..1000
+static int g_result = 1;
+static wstring g_prepStep, g_prepLast;
 static FILE* g_log = nullptr;
 static std::mutex g_logMx;
 
@@ -264,7 +270,7 @@ static void OpenLog(const wchar_t* name) {
         wstring old = path.substr(0, path.size() - 4) + L".old.log";
         MoveFileExW(path.c_str(), old.c_str(), MOVEFILE_REPLACE_EXISTING);
     }
-    _wfopen_s(&g_log, path.c_str(), L"ab");
+    g_log = _wfsopen(path.c_str(), L"ab", _SH_DENYNO);  // shared: the log can be read while Setup runs
 }
 static void LogRaw(const wstring& s) {
     if (!g_log) return;
@@ -276,7 +282,7 @@ static void LogRaw(const wstring& s) {
     fflush(g_log);
 }
 
-enum { WM_APP_UI = WM_APP + 1, WM_APP_DONE, WM_APP_TOOLS };
+enum { WM_APP_UI = WM_APP + 1, WM_APP_DONE, WM_APP_TOOLS, WM_APP_PREFILL };
 struct UiState {
     std::mutex mx;
     std::deque<wstring> lines;
@@ -285,6 +291,13 @@ struct UiState {
     bool dirty = false;
 } g_ui;
 static void Kick() { if (g_hwnd) PostMessageW(g_hwnd, WM_APP_UI, 0, 0); }
+static void PrepProgress(const wstring& text) {
+    wstring t = text;
+    for (auto& ch : t) if (ch == L'\r' || ch == L'\n') ch = L' ';
+    if (t == g_prepLast) return;
+    g_prepLast = t;
+    ConsoleWrite(Fmt(L"progress %d.%03d ", g_prepProg / 1000, g_prepProg % 1000) + t + L"\r\n");
+}
 
 // a line for the log box (or the console) and logs\setup.log
 static void Say(const wstring& s) {
@@ -295,12 +308,18 @@ static void Say(const wstring& s) {
 }
 static void SetStep(const wstring& s) {
     LogRaw(L"[step] " + s);
+    if (g_prepare) { g_prepStep = s; PrepProgress(s); return; }
     if (g_console) { ConsoleWrite(L"== " + s + L"\r\n"); return; }
     { std::lock_guard<std::mutex> lk(g_ui.mx); g_ui.step = s; g_ui.dirty = true; }
     Kick();
 }
 static wstring g_lastDetail;
 static void SetDetail(const wstring& s, int progress = -1) {
+    if (g_prepare) {
+        if (progress >= 0) g_prepProg = std::min(1000, std::max(0, progress));
+        PrepProgress(s.empty() ? g_prepStep : s);
+        return;
+    }
     if (g_console) {
         if (!s.empty() && s != g_lastDetail) ConsoleWrite(L"   " + s + L"\r\n");
         g_lastDetail = s;
@@ -397,6 +416,9 @@ struct Tool { wstring key, status, version, path, label, id; };
 static std::vector<Tool> g_tools;
 static std::mutex g_toolsMx;
 static bool g_toolsChecked = false;
+// the player's answer to the build-tools question in this run, passed on to setup.ps1 (which never installs tools
+// unattended without it): 0 = not asked (nothing was missing), 1 = system-wide, 2 = portable (3 = portable + Microsoft's licence)
+static int g_toolConsent = 0;
 
 static bool CheckTools() {
     wstring out = P(L"logs\\prereqs_check.txt");
@@ -445,8 +467,8 @@ static wstring ToolsText() {
     s += L"\r\n";
     wstring dummy;
     bool any = !MissingIds(&dummy).empty();
-    if (any) s += w && w->status == L"ok" ? L"Missing tools are installed with winget (one administrator prompt)."
-                                         : L"winget is not available: Setup downloads the official installers directly (one administrator prompt).";
+    if (any) s += w && w->status == L"ok" ? L"Setup explains the missing tools and asks first: system-wide with winget (one administrator prompt) or portable in this folder."
+                                         : L"Setup explains the missing tools and asks first: the official installers (no winget; one administrator prompt) or portable in this folder.";
     else s += L"All build tools are installed.";
     if (NeedsRpcs3() && v && v->status != L"ok") s += L"\r\nNo Vulkan driver found (vulkan-1.dll): install your GPU's latest driver before playing.";
     return s;
@@ -533,6 +555,54 @@ static bool InstallTools(const Lines& ids, wstring& err, wstring& todo) {
         return false;
     }
     if (reboot) Say(L"The tool installer asks for a restart. If the build cannot find the tools, restart the PC and click Resume.");
+    return true;
+}
+static wstring IdList(const Lines& ids) {
+    wstring s;
+    for (auto& i : ids) s += (s.empty() ? L"" : L",") + i;
+    return s;
+}
+static bool NeedsMsvc(const Lines& ids) {
+    for (auto& i : ids) if (i == L"Microsoft.VisualStudio.2022.BuildTools" || i == L"VSModify") return true;
+    return false;
+}
+// what the missing tools are for, where they come from and their size (prereqs.ps1 -Explain: the same text as setup.ps1)
+static wstring ExplainTools(const Lines& ids, bool portable) {
+    wstring out = P(L"logs\\prereqs_explain.txt");
+    DeleteFileW(out.c_str());
+    Run(PsFile(P(L"tools\\installer\\prereqs.ps1")) + L" -Explain -Ids " + Arg(IdList(ids)) + (portable ? L" -Portable" : L"") + L" -Out " + Arg(out),
+        [](const wstring& l) { LogRaw(L"  explain: " + l); });
+    wstring s;
+    for (auto& l : ReadLines(out)) s += l + L"\r\n";
+    if (s.empty()) for (auto& i : ids) s += L"  \x2022 " + i + L"\r\n";
+    return s;
+}
+// EXPERIMENTAL: the tools go into tools_cache\ (portable zips; the MSVC libraries + Windows SDK via xwin), not elevated
+static bool InstallPortable(const Lines& ids, bool msLicense, wstring& err, wstring& todo) {
+    wstring result = P(L"logs\\prereqs_result.txt");
+    DeleteFileW(result.c_str());
+    wstring cmd = PsFile(P(L"tools\\installer\\prereqs.ps1")) + L" -Portable -Ids " + Arg(IdList(ids)) + (msLicense ? L" -AcceptMicrosoftLicense" : L"") +
+                  L" -Log " + Arg(P(L"logs\\portable_tools.log")) + L" -Out " + Arg(result);
+    Say(L"Portable build tools (experimental): " + cmd);
+    int rc = Run(cmd, [](const wstring& l) {
+        wstring t = Trim(l);
+        if (t.empty()) return;
+        Say(L"   " + t);
+        if (Contains(t, L"== ")) SetDetail(L"Downloading " + t.substr(t.find(L"== ") + 3) + L" ...");
+    });
+    wstring failed;
+    Lines res = ReadLines(result);
+    for (auto& l : res) {
+        Lines f = Split(l, L'|');
+        if (f.size() >= 2 && f[1] == L"fail") failed += L"  \x2022 " + f[0] + (f.size() >= 4 && !f[3].empty() ? L": " + f[3] : L"") + L"\r\n";
+    }
+    if (rc != 0 || res.empty() || res.back() != L"done") failed += L"  (it stopped early; see logs\\portable_tools.log)\r\n";
+    if (!failed.empty()) {
+        err = L"Some portable build tools could not be set up:\r\n" + failed;
+        todo = L"Check the internet connection and click Resume (finished tools are kept). If it keeps failing, click Resume and answer Yes "
+               L"to install the tools system-wide instead. Details: logs\\portable_tools.log.";
+        return false;
+    }
     return true;
 }
 
@@ -633,7 +703,13 @@ static void ApplyJobs(const Jobs& j) {
 }
 
 // ---------------------------------------------------------------- build progress and errors
-struct BuildLog { wstring rel, what; int lo, hi; LONGLONG off = 0; std::string pend; };
+// Windows PowerShell's Tee-Object writes UTF-16LE with a BOM; everything else is UTF-8
+static bool IsUtf16Bom(const std::string& s) { return s.size() >= 2 && (unsigned char)s[0] == 0xFF && (unsigned char)s[1] == 0xFE; }
+static wstring DecodeLog(const std::string& s) {
+    if (IsUtf16Bom(s)) return wstring((const wchar_t*)(s.data() + 2), (s.size() - 2) / 2);
+    return Widen(s, CP_UTF8);
+}
+struct BuildLog { wstring rel, what; int lo, hi; LONGLONG off = 0; std::string pend; int enc = -1; /* -1 unknown, 0 UTF-8, 1 UTF-16LE */ };
 static std::vector<BuildLog> BuildLogs() {
     if (TwoPrograms()) return {{L"logs\\build.log", L"Building the front end", 30, 50}, {L"logs\\build_game.log", L"Building the game", 50, 98}};
     if (NeedsRpcs3()) return {{L"logs\\build_rpcs3.log", L"Building the RPCS3 renderer", 30, 42}, {L"logs\\build.log", L"Building the game", 42, 98}};
@@ -681,8 +757,10 @@ static wstring RecentBuildLogText(const FILETIME& since) {
         if (!GetFileAttributesExW(P(b.rel).c_str(), GetFileExInfoStandard, &fa) || CompareFileTime(&fa.ftLastWriteTime, &since) < 0) continue;
         std::string s;
         if (!ReadBytes(P(b.rel), s)) continue;
+        bool u16 = IsUtf16Bom(s);
         if (s.size() > 512 * 1024) s.erase(0, s.size() - 512 * 1024);
-        all += Widen(s, CP_UTF8) + L"\n";
+        if (u16) { if (s.size() & 1) s.erase(0, 1); all += wstring((const wchar_t*)s.data(), s.size() / 2) + L"\n"; }
+        else all += Widen(s, CP_UTF8) + L"\n";
     }
     return all;
 }
@@ -790,9 +868,64 @@ static bool DeleteTree(const wstring& p) {
 }
 static const wchar_t* kKeep = L"Kept: your saves (gamedata\\), settings (settings.ini, settings.bat, controls.txt, mouselook.cfg, "
                               L"%USERPROFILE%\\Saved Games\\...), screenshots and logs\\.";
+// what Setup installed or changed on this PC (tools_cache\\installed_by_setup.txt; tools that were already there are never listed)
+static Lines SetupToolLines() {
+    Lines r;
+    for (auto& l : ReadLines(P(L"tools_cache\\installed_by_setup.txt"))) if (!l.empty() && l[0] != L'#') r.push_back(l);
+    return r;
+}
+// earlier choices kept in the manifest (buildtools.ps1): the portable build tools (a "portable|" line), and Microsoft's licence
+// for the portable MSVC libraries ("#accepted|microsoft-msvc-license", or the libraries themselves: "portable|vs")
+static bool PortableChosenBefore(bool* msAccepted = nullptr) {
+    bool portable = false, ms = false;
+    for (auto& l : ReadLines(P(L"tools_cache\\installed_by_setup.txt"))) {
+        if (l.rfind(L"portable|", 0) == 0) portable = true;
+        if (l == L"portable|vs" || l == L"#accepted|microsoft-msvc-license") ms = true;
+    }
+    if (msAccepted) *msAccepted = ms;
+    return portable;
+}
+static wstring SetupToolText(const Lines& lines) {
+    wstring s;
+    for (auto& l : lines) {
+        Lines f = Split(l, L'|');
+        wstring k = f.empty() ? L"" : f[0], v = f.size() > 1 ? f[1] : L"";
+        s += L"  \x2022 " + (k == L"winget" ? v + L" (installed with winget)" : k == L"direct" ? v + L" (official installer)" :
+                            k == L"pip" && f.size() > 2 ? L"Python package " + f[2] : k == L"gitconfig" && f.size() > 2 ? L"Git setting safe.directory " + f[2] :
+                            k == L"portable" ? L"portable " + v + L" in tools_cache\\" : l) + L"\r\n";
+    }
+    return s;
+}
+// prereqs.ps1 -Uninstall; elevated (one UAC prompt) when Setup installed tools for all users. Returns the lines left.
+static Lines RemoveSetupTools() {
+    Lines lines = SetupToolLines();
+    bool admin = false;
+    for (auto& l : lines) if (StartsWith(l, L"winget|") || StartsWith(l, L"direct|")) admin = true;
+    wstring logp = P(L"logs\\prereqs_uninstall.log"), out = P(L"logs\\prereqs_uninstall_result.txt");
+    wstring args = L"-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File " + Arg(P(L"tools\\installer\\prereqs.ps1")) +
+                   L" -Uninstall -Log " + Arg(logp) + L" -Out " + Arg(out);
+    LogRaw(L"Uninstall: removing the build tools Setup installed: " + args);
+    if (admin) {
+        SHELLEXECUTEINFOW se{sizeof se};
+        se.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC;
+        se.hwnd = g_hwnd;
+        se.lpVerb = L"runas";
+        wstring ps = PowerShell();
+        se.lpFile = ps.c_str();
+        se.lpParameters = args.c_str();
+        se.lpDirectory = g_port.c_str();
+        se.nShow = SW_HIDE;
+        if (ShellExecuteExW(&se) && se.hProcess) { WaitForSingleObject(se.hProcess, INFINITE); CloseHandle(se.hProcess); }
+        else LogRaw(Fmt(L"Uninstall: the administrator prompt was declined or failed (error %lu)", GetLastError()));
+    } else {
+        Run(Arg(PowerShell()) + L" " + args, [](const wstring& l) { LogRaw(L"  prereqs: " + l); });
+    }
+    return SetupToolLines();
+}
 static int Uninstall() {
     auto items = UninstallList();
     bool gf = IsDir(P(L"gamefiles"));
+    Lines tools = SetupToolLines();
     ULONGLONG total = 0;
     wstring list;
     for (auto& i : items) {
@@ -803,13 +936,33 @@ static int Uninstall() {
     if (g_opt.dryRun) {
         ConsoleWrite(L"Uninstall (dry run): would delete " + GB((double)total) + L":\r\n" + list);
         if (gf) ConsoleWrite(L"  and would ask before deleting your game copy " + P(L"gamefiles") + L" (default: keep it)\r\n");
+        if (!tools.empty()) {
+            ConsoleWrite(L"  and would ask before removing the build tools Setup installed (default: keep them):\r\n" + SetupToolText(tools) + L"  its dry run:\r\n");
+            Run(PsFile(P(L"tools\\installer\\prereqs.ps1")) + L" -Uninstall -DryRun", [](const wstring& l) { ConsoleWrite(L"     " + l + L"\r\n"); });
+        }
         ConsoleWrite(wstring(kKeep) + L"\r\n");
         return 0;
     }
-    if (items.empty() && !gf) { Ask(L"There is nothing to remove.", MB_OK | MB_ICONINFORMATION); return 0; }
-    if (Ask(L"Remove the build of " + g_prof.name + L" (" + GB((double)total) + L") and its shortcuts?\r\n\r\n" + kKeep +
-            L"\r\n\r\nThe port's own files stay, so you can run Setup.exe again later.", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES)
-        return 1;
+    if (items.empty() && !gf && tools.empty()) { Ask(L"There is nothing to remove.", MB_OK | MB_ICONINFORMATION); return 0; }
+    bool delBuild = (!items.empty() || gf) &&
+                    Ask(L"Remove the build of " + g_prof.name + L" (" + GB((double)total) + L") and its shortcuts?\r\n\r\n" + kKeep +
+                            L"\r\n\r\nThe port's own files stay, so you can run Setup.exe again later.", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES;
+    bool delTools = !tools.empty() &&
+                    Ask(L"Also remove the build tools Setup installed on this PC?\r\n\r\n" + SetupToolText(tools) +
+                            L"\r\nTools that were on this PC before Setup are not listed and stay. Rebuilding or updating the port needs these "
+                            L"tools again (Setup installs them again then).", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES;
+    if (!delBuild && !delTools) return 1;
+    Lines toolsLeft;
+    if (delTools) toolsLeft = RemoveSetupTools();
+    if (!delBuild) {
+        if (!toolsLeft.empty()) {
+            Ask(L"These could not be removed (remove them in Windows Settings > Apps, or run Setup.exe --uninstall again; details: logs\\prereqs_uninstall.log):\r\n" +
+                    SetupToolText(toolsLeft), MB_OK | MB_ICONWARNING);
+            return 1;
+        }
+        Ask(L"Done: the build tools Setup installed are removed.", MB_OK | MB_ICONINFORMATION);
+        return 0;
+    }
     bool delGame = gf && Ask(L"Also delete your game copy in " + P(L"gamefiles") + L" (" + GB((double)TreeSize(P(L"gamefiles"))) +
                                  L")?\r\n\r\nYou need it again to rebuild the port. Your original ISO or folder is not touched.",
                              MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES;
@@ -819,6 +972,8 @@ static int Uninstall() {
         LogRaw(L"Uninstall: deleting " + i.path);
         if (!DeleteTree(i.path)) failed += L"  " + i.path + L"\r\n";
     }
+    if (!toolsLeft.empty())
+        failed += L"  build tools Setup installed (remove them in Windows Settings > Apps; details: logs\\prereqs_uninstall.log):\r\n" + SetupToolText(toolsLeft);
     if (!failed.empty()) {
         Ask(L"Some files could not be deleted (is the game or the launcher still running?):\r\n" + failed, MB_OK | MB_ICONWARNING);
         return 1;
@@ -839,9 +994,23 @@ static wstring Hint(const wstring& msg) {
         return L"Check the internet connection (and any proxy or firewall), then click Resume.";
     if (Contains(l, L"space") || Contains(l, L"disk"))
         return L"Free up disk space (see docs\\INSTALL.md, \"Disk space\"), then click Resume.";
-    if (Contains(l, L"build failed") || Contains(l, L"configure failed"))
-        return L"Antivirus programs sometimes block the compiler: add the port folder to the antivirus exclusions "
-               L"(docs\\INSTALL.md, \"Antivirus\"), then click Resume. The build continues where it stopped.";
+    if (Contains(l, L"build failed") || Contains(l, L"configure failed")) {
+        // only blame the antivirus when the build logs show a blocked or locked file; a plain compile
+        // error (e.g. a missing header) is a port bug the user can't fix with exclusions
+        bool blocked = false;
+        for (const wchar_t* f : {L"logs\\build.log", L"logs\\build_game.log", L"logs\\build_rpcs3.log"}) {
+            std::string b;
+            if (!ReadBytes(P(f), b)) continue;
+            for (char& ch : b) ch = (char)tolower((unsigned char)ch);
+            for (const char* k : {"access is denied", "permission denied", "lnk1104", "virus", "being used by another process"})
+                if (b.find(k) != std::string::npos) blocked = true;
+        }
+        if (blocked)
+            return L"Antivirus programs sometimes block the compiler: add the port folder to the antivirus exclusions "
+                   L"(docs\\INSTALL.md, \"Antivirus\"), then click Resume. The build continues where it stopped.";
+        return L"This looks like a compile error, not an antivirus problem. Please report it (docs\\REPORTING.md) "
+               L"with logs\\build.log attached. A port folder path without spaces avoids a known build bug.";
+    }
     if (Contains(l, L"not the expected version") || Contains(l, L"game copy"))
         return L"Pick the supported game version (" + g_prof.titleId + L"), then click Resume.";
     return L"Fix the problem above and click Resume: finished steps are skipped.";
@@ -850,6 +1019,14 @@ static wstring Hint(const wstring& msg) {
 // runs setup.ps1 once; returns 0 ok, 1 failed, 2 out of memory, 3 cancelled
 static int RunSetupOnce(const Choice& c, const Jobs& j, wstring& stopMsg) {
     wstring cmd = PsFile(P(L"setup.ps1")) + L" -Unattended";
+    // --prepare: the launcher's question counts as the yes - system-wide, or portable again when that was chosen before
+    int consent = g_toolConsent;
+    if (!consent && g_prepare) {
+        bool ms = false;
+        consent = PortableChosenBefore(&ms) ? (ms ? 3 : 2) : 1;
+    }
+    if (consent == 1) cmd += L" -InstallTools";
+    else if (consent >= 2) cmd += consent == 3 ? L" -PortableTools -AcceptMicrosoftLicense" : L" -PortableTools";
     if (!c.game.empty()) cmd += L" -Game " + Arg(c.game);
     if (!c.copyMode.empty()) cmd += L" -GameCopyMode " + c.copyMode;
     cmd += c.sdks ? L" -AcceptSdkLicenses" : L" -NoOptionalSdks";
@@ -861,11 +1038,39 @@ static int RunSetupOnce(const Choice& c, const Jobs& j, wstring& stopMsg) {
 
     // follow the build logs for Ninja's [N/M] (build_rpcs3.log is not echoed to the console)
     std::atomic<bool> stop{false};
+    // a ticking clock on the step line and a note during quiet stretches, so a long step never looks hung;
+    // while the game is copied, an ETA from the size of gamefiles\ (Write-Progress does not reach us)
+    std::function<double(const wstring&)> dirBytes = [&](const wstring& d) {
+        double t = 0;
+        WIN32_FIND_DATAW fd;
+        HANDLE h = FindFirstFileW((d + L"\\*").c_str(), &fd);
+        if (h == INVALID_HANDLE_VALUE) return t;
+        do {
+            if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..")) continue;
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) continue;
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) t += dirBytes(d + L"\\" + fd.cFileName);
+            else t += (double)(((ULONGLONG)fd.nFileSizeHigh << 32) | fd.nFileSizeLow);
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+        return t;
+    };
+    std::mutex stepMx;
+    wstring stepBase;
+    ULONGLONG stepT0 = GetTickCount64();
+    std::atomic<ULONGLONG> lastOut{GetTickCount64()};
+    // setup.ps1 reports its own progress ("@@SETUP pct=<0..1000> eta=<s> idle=<s> <text>", tools\installer\progress.ps1):
+    // once it does, those lines drive the bar and the detail line instead of the build logs and the fixed step percentages
+    std::atomic<bool> psProgress{false};
+    ULONGLONG psLogged = 0, psShown = 0;
+    SetEnvironmentVariableW(L"PORT_SETUP_PROGRESS", L"1");
     std::thread tail([&] {
         auto logs = BuildLogs();
         Meter meter;
-        ULONGLONG lastShown = 0;
+        ULONGLONG lastShown = 0, lastFeed = 0, lastClock = 0, copyT0 = 0;
+        double copy0 = -1, copyNow = 0;
+        int copyTick = 0;
         while (!stop) {
+            bool fed = false;
             for (auto& b : logs) {
                 WIN32_FILE_ATTRIBUTE_DATA fa{};
                 if (!GetFileAttributesExW(P(b.rel).c_str(), GetFileExInfoStandard, &fa) || CompareFileTime(&fa.ftLastWriteTime, &start) < 0) continue;
@@ -874,7 +1079,15 @@ static int RunSetupOnce(const Choice& c, const Jobs& j, wstring& stopMsg) {
                 if (size == b.off) continue;
                 HANDLE h = CreateFileW(P(b.rel).c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr);
                 if (h == INVALID_HANDLE_VALUE) continue;
-                if (size - b.off > 4 * 1024 * 1024) { b.off = size - 64 * 1024; b.pend.clear(); }
+                if (b.enc < 0) {
+                    if (size < 2) { CloseHandle(h); continue; }
+                    char bom[2] = {};
+                    DWORD g2 = 0;
+                    ReadFile(h, bom, 2, &g2, nullptr);
+                    b.enc = (g2 == 2 && (unsigned char)bom[0] == 0xFF && (unsigned char)bom[1] == 0xFE) ? 1 : 0;
+                    if (b.enc == 1 && b.off == 0) b.off = 2;
+                }
+                if (size - b.off > 4 * 1024 * 1024) { b.off = size - 64 * 1024; if (b.enc == 1) b.off &= ~1LL; b.pend.clear(); }
                 LARGE_INTEGER li;
                 li.QuadPart = b.off;
                 SetFilePointerEx(h, li, nullptr, FILE_BEGIN);
@@ -885,16 +1098,62 @@ static int RunSetupOnce(const Choice& c, const Jobs& j, wstring& stopMsg) {
                 chunk.resize(got);
                 b.off += got;
                 b.pend += chunk;
-                size_t a = 0, i;
-                while ((i = b.pend.find('\n', a)) != std::string::npos) {
-                    meter.Feed(Trim(Widen(b.pend.substr(a, i - a), CP_UTF8)), b);
-                    a = i + 1;
+                if (b.enc == 1) {
+                    wstring w((const wchar_t*)b.pend.data(), b.pend.size() / 2);
+                    size_t a = 0, i;
+                    while ((i = w.find(L'\n', a)) != wstring::npos) { fed |= meter.Feed(Trim(w.substr(a, i - a)), b); a = i + 1; }
+                    b.pend.erase(0, a * 2);
+                } else {
+                    size_t a = 0, i;
+                    while ((i = b.pend.find('\n', a)) != std::string::npos) {
+                        fed |= meter.Feed(Trim(Widen(b.pend.substr(a, i - a), CP_UTF8)), b);
+                        a = i + 1;
+                    }
+                    b.pend.erase(0, a);
                 }
-                b.pend.erase(0, a);
             }
-            if (meter.m && GetTickCount64() - lastShown > 900) {
+            ULONGLONG now = GetTickCount64();
+            if (fed) lastFeed = now;
+            bool quiet = now - lastOut > 30000 && now - lastFeed > 30000;
+            if (meter.m && now - lastShown > 900 && !psProgress) {
                 SetDetail(meter.Text(), meter.Progress());
-                lastShown = GetTickCount64();
+                lastShown = now;
+            }
+            if ((!g_console || g_prepare) && now - lastClock >= (ULONGLONG)(g_prepare ? 5000 : 1000)) {
+                lastClock = now;
+                wstring base;
+                ULONGLONG t0;
+                { std::lock_guard<std::mutex> lk(stepMx); base = stepBase; t0 = stepT0; }
+                if (!base.empty()) {
+                    ULONGLONG s = (now - t0) / 1000;
+                    wstring clock = s >= 3600 ? Fmt(L"%d:%02d:%02d", (int)(s / 3600), (int)(s / 60 % 60), (int)(s % 60))
+                                              : Fmt(L"%d:%02d", (int)(s / 60), (int)(s % 60));
+                    int copyProg = -1;
+                    if (StartsWith(base, L"2/5") && g_prof.minBytes > 0) {
+                        if (copyTick++ % 2 == 0) {
+                            copyNow = dirBytes(P(L"gamefiles"));
+                            if (copy0 < 0) { copy0 = copyNow; copyT0 = now; }
+                        }
+                        double total = std::max(g_prof.minBytes, copyNow * 1.01);
+                        clock += Fmt(L"  \x2022  %.1f of about %.1f GB", copyNow / 1e9, total / 1e9);
+                        double el = (now - copyT0) / 1000.0, done = copyNow - copy0;
+                        if (el > 15 && done > 200e6) clock += L"  \x2022  " + Duration((total - copyNow) / (done / el)) + L" left";
+                        copyProg = 100 + (int)(100 * std::min(1.0, copyNow / total));
+                    }
+                    if (g_prepare) {
+                        if (copyProg >= 0) g_prepProg = copyProg;
+                        if (copyProg >= 0 || quiet) PrepProgress((meter.m && copyProg < 0 ? meter.Text() : base) + L"   (" + clock + L")");
+                        continue;
+                    }
+                    std::lock_guard<std::mutex> lk(g_ui.mx);
+                    g_ui.step = base + L"   (" + clock + L")";
+                    if (copyProg >= 0) g_ui.progress = copyProg;
+                    if (quiet && !meter.m && !psProgress)
+                        g_ui.detail = Fmt(L"Still working: no new messages for %d min %02d s. Some steps print nothing for 10+ minutes; this is normal.",
+                                          (int)((now - lastOut) / 60000), (int)((now - lastOut) / 1000 % 60));
+                    g_ui.dirty = true;
+                }
+                Kick();
             }
             for (int k = 0; k < 10 && !stop; ++k) Sleep(100);
         }
@@ -905,20 +1164,35 @@ static int RunSetupOnce(const Choice& c, const Jobs& j, wstring& stopMsg) {
     int rc = Run(cmd, [&](const wstring& raw) {
         wstring l = Trim(raw);
         if (l.empty()) return;
+        if (StartsWith(l, L"@@SETUP ")) {
+            int pct = -1, eta = -1, idle = -1, used = 0;
+            if (swscanf_s(l.c_str(), L"@@SETUP pct=%d eta=%d idle=%d %n", &pct, &eta, &idle, &used) >= 3 && used > 0) {
+                psProgress = true;
+                lastOut = GetTickCount64();
+                wstring text = l.substr((size_t)used);
+                ULONGLONG now = GetTickCount64();
+                if (now - psLogged >= 60000) { psLogged = now; LogRaw(L"[progress] " + text); }
+                // the console gets a line every 30 s; the window and the launcher follow every update
+                if (!g_console || g_prepare || now - psShown >= 30000) { psShown = now; SetDetail(text, std::min(1000, std::max(0, pct))); }
+            }
+            return;
+        }
         LogRaw(L"| " + raw);
+        lastOut = GetTickCount64();
         if (!g_console) { std::lock_guard<std::mutex> lk(g_ui.mx); g_ui.lines.push_back(l); if (g_ui.lines.size() > 2000) g_ui.lines.pop_front(); Kick(); }
         last.push_back(l);
         if (last.size() > 400) last.pop_front();
         if (StartsWith(l, L"== ")) {
             wstring s = l.substr(3);
             SetStep(s);
+            { std::lock_guard<std::mutex> lk(stepMx); stepBase = s; stepT0 = GetTickCount64(); }
             int p = StartsWith(s, L"1/5") ? 50 : StartsWith(s, L"2/5") ? 100 : StartsWith(s, L"3/5") ? 200 : StartsWith(s, L"4/5") ? 230 : StartsWith(s, L"5/5") ? 280 : 20;
-            SetDetail(L"", p);
+            SetDetail(L"", psProgress ? -1 : p);
         } else if (StartsWith(l, L"SETUP STOPPED")) {
             stopMsg = l.substr(l.find(L':') + 1);
         } else if (StartsWith(l, L"SETUP COMPLETE")) {
             complete = true;
-        } else if (l[0] != L'[' && !g_console) {
+        } else if (l[0] != L'[' && !g_console && !psProgress) {
             // the latest message, unless the Ninja progress ("Building ...") is showing
             std::lock_guard<std::mutex> lk(g_ui.mx);
             if (g_ui.detail.empty() || !StartsWith(g_ui.detail, L"Building")) g_ui.detail = l.substr(0, 160);
@@ -962,12 +1236,46 @@ static void SetupWorker(Choice c) {
     Lines ids = MissingIds(&names);
     if (!g_toolsChecked) { Fail(L"The build-tool check did not run.", L"Make sure PowerShell is not blocked (docs\\INSTALL.md), then click Resume."); goto out; }
     if (!ids.empty()) {
-        wstring t = L"Setup will install these free build tools:\r\n\r\n" + names +
-                    Fmt(L"\r\nThey need about %.0f GB on drive C: and a download of several GB. Windows asks once for administrator permission.\r\n\r\nContinue?", ToGB(ToolsBytes(ids)) + 0.5);
-        if (Ask(t, MB_OKCANCEL | MB_ICONINFORMATION) != IDOK) { SetStep(L"Cancelled."); goto out; }
-        SetStep(L"Installing the build tools");
+        // say what is installed, why and from where, and ask first (GitHub issue: "setup made my PC install Python and IDLE")
+        wstring why = ExplainTools(ids, false);
+        LogRaw(L"Missing build tools:\r\n" + why);
+        wstring t = L"These free build tools are missing on this PC. " + g_prof.name + L" is compiled here from your own game (compiled game code "
+                    L"cannot be shared), so Setup needs a compiler and its helpers:\r\n\r\n" + why +
+                    L"\r\nNothing else is installed, and tools already on this PC are used as they are. Setup records what it installs; "
+                    L"Setup.exe > Uninstall can remove exactly those again.\r\n\r\n"
+                    L"Yes: install them system-wide with winget or the official installers (recommended). Windows asks once for administrator permission.\r\n"
+                    L"No: EXPERIMENTAL portable mode - download them only into this folder (tools_cache\\): no installers, no administrator rights.\r\n"
+                    L"Cancel: install nothing.";
+        // --prepare (the launcher already asked): system-wide, or portable again when the manifest says it was chosen before
+        bool msBefore = false, portableBefore = g_prepare && PortableChosenBefore(&msBefore);
+        int a = g_console ? (portableBefore ? IDNO : IDYES) : Ask(t, MB_YESNOCANCEL | MB_ICONQUESTION);
+        if (a != IDYES && a != IDNO) { SetStep(L"Cancelled: no build tools were installed."); goto out; }
         wstring err, todo;
-        if (!InstallTools(ids, err, todo)) { Fail(err, todo); goto out; }
+        if (a == IDNO) {
+            bool ms = NeedsMsvc(ids);
+            if (portableBefore) {
+                if (ms && !msBefore) {
+                    Fail(L"The portable build tools were chosen before, and the MSVC libraries + Windows SDK are needed again, "
+                         L"but Microsoft's licence for them has not been accepted on this PC.",
+                         L"Open Setup.exe and click Install/Resume: it shows Microsoft's licence and asks first.");
+                    goto out;
+                }
+                LogRaw(L"--prepare: the portable build tools were chosen before (tools_cache\\installed_by_setup.txt): portable again");
+            } else {
+                wstring q = L"Portable build tools (EXPERIMENTAL), downloaded into " + P(L"tools_cache") + L":\r\n\r\n" + ExplainTools(ids, true) +
+                            (ms ? L"\r\nThe MSVC libraries and the Windows SDK are Microsoft's: xwin downloads them from Microsoft's servers for you, "
+                                  L"under Microsoft's licence (link above).\r\n\r\nDo you accept Microsoft's licence and continue?"
+                                : L"\r\nContinue?");
+                if (Ask(q, MB_YESNO | MB_ICONQUESTION) != IDYES) { SetStep(L"Cancelled: no build tools were installed."); goto out; }
+            }
+            g_toolConsent = (ms || msBefore) ? 3 : 2;
+            SetStep(L"Downloading the portable build tools (experimental)");
+            if (!InstallPortable(ids, ms, err, todo)) { Fail(err, todo); goto out; }
+        } else {
+            g_toolConsent = 1;
+            SetStep(L"Installing the build tools");
+            if (!InstallTools(ids, err, todo)) { Fail(err, todo); goto out; }
+        }
         CheckTools();
         ShowTools();
         names.clear();
@@ -1072,6 +1380,13 @@ static void SetupWorker(Choice c) {
     SetDetail(L"Start the game with the launcher (Start menu or desktop).", 1000);
     MakeShortcuts(c.desktop);
     Say(L"SETUP COMPLETE.");
+    g_result = 0;
+    if (g_prepare) {
+        // the RecompLauncher shows settings.ini: write the values recommended for this PC (never over the player's own)
+        if (!Exists(P(L"settings.ini")) && Exists(P(L"Launcher.exe")))
+            Run(Arg(P(L"Launcher.exe")) + L" --resave", [](const wstring&) {});
+        goto out;
+    }
     if (c.launch && Exists(P(L"Launcher.exe"))) ShellExecuteW(nullptr, L"open", P(L"Launcher.exe").c_str(), nullptr, g_port.c_str(), SW_SHOWNORMAL);
     else if (!c.launch) Ask(g_prof.name + L" is ready. Start it with the launcher (Start menu or desktop shortcut).", MB_OK | MB_ICONINFORMATION);
 out:
@@ -1090,10 +1405,11 @@ static int DryRun() {
         BuildLog src{L"(log)", L"Building", 30, 98};
         Meter m;
         int lines = 0, updates = 0;
-        for (auto& l : Split(Widen(b, CP_UTF8), L'\n')) { ++lines; if (m.Feed(Trim(l), src)) ++updates; }
+        wstring text = DecodeLog(b);
+        for (auto& l : Split(text, L'\n')) { ++lines; if (m.Feed(Trim(l), src)) ++updates; }
         ConsoleWrite(Fmt(L"== Parsed %s: %d lines, %d progress lines, last [%d/%d] = %d.%d%% of the bar, out of memory: %s\r\n\r\n",
                          g_opt.parseLog.c_str(), lines, updates, m.n, m.m, m.Progress() / 10, m.Progress() % 10,
-                         LooksLikeOom(Widen(b, CP_UTF8)) ? L"YES (would retry with fewer jobs)" : L"no"));
+                         LooksLikeOom(text) ? L"YES (would retry with fewer jobs)" : L"no"));
         return 0;
     }
 
@@ -1104,10 +1420,20 @@ static int DryRun() {
     Lines ids = MissingIds(&names);
     if (ids.empty()) ConsoleWrite(L"   nothing to install\r\n");
     else {
-        ConsoleWrite(L"   would install (one UAC prompt):\r\n" + names);
-        ConsoleWrite(L"   elevated command: powershell " + InstallCommandArgs(ids, false) + L"\r\n   its dry run:\r\n");
-        Run(PsFile(P(L"tools\\installer\\prereqs.ps1")) + L" -Install -DryRun -Ids " + Arg([&] { wstring s; for (auto& i : ids) s += (s.empty() ? L"" : L",") + i; return s; }()),
+        ConsoleWrite(L"   would explain them and ask first:\r\n" + names);
+        for (auto& l : Split(ExplainTools(ids, false), L'\n')) if (!Trim(l).empty()) ConsoleWrite(L"     " + Trim(l) + L"\r\n");
+        ConsoleWrite(L"   Yes = system-wide (one UAC prompt), elevated command: powershell " + InstallCommandArgs(ids, false) + L"\r\n   its dry run:\r\n");
+        Run(PsFile(P(L"tools\\installer\\prereqs.ps1")) + L" -Install -DryRun -Ids " + Arg(IdList(ids)),
             [](const wstring& l) { ConsoleWrite(L"     " + l + L"\r\n"); });
+        ConsoleWrite(L"   No = portable in tools_cache\\ (experimental, not elevated):\r\n");
+        for (auto& l : Split(ExplainTools(ids, true), L'\n')) if (!Trim(l).empty()) ConsoleWrite(L"     " + Trim(l) + L"\r\n");
+        ConsoleWrite(L"   its dry run:\r\n");
+        Run(PsFile(P(L"tools\\installer\\prereqs.ps1")) + L" -Portable -DryRun -Ids " + Arg(IdList(ids)),
+            [](const wstring& l) { ConsoleWrite(L"     " + l + L"\r\n"); });
+    }
+    {
+        Lines mine = SetupToolLines();
+        if (!mine.empty()) ConsoleWrite(L"   installed by Setup earlier (Setup.exe --uninstall offers to remove them):\r\n" + SetupToolText(mine));
     }
 
     ConsoleWrite(L"\r\n== Game copy\r\n");
@@ -1164,6 +1490,10 @@ static int DryRun() {
     wstring cmd = PsFile(P(L"setup.ps1")) + L" -Unattended";
     if (!have && !game.empty()) cmd += L" -Game " + Arg(game) + L" -GameCopyMode Copy";
     ConsoleWrite(L"   " + cmd + L" -NoOptionalSdks  (or -AcceptSdkLicenses when the SDK box is ticked)\r\n");
+    ConsoleWrite(L"   + -InstallTools after Yes to the build-tools question (with --prepare always, unless the portable tools were\r\n"
+                 L"     chosen before: then -PortableTools, + -AcceptMicrosoftLicense only if it was accepted before), -PortableTools\r\n"
+                 L"     [-AcceptMicrosoftLicense] after No; without either (nothing was missing) setup.ps1 installs no build tools and\r\n"
+                 L"     stops if one is missing\r\n");
 
     ConsoleWrite(L"\r\n== Shortcuts at the end\r\n   " + StartMenuDir() + L"\\" + g_prof.saveFolder + L".lnk  -> Launcher.exe\r\n   " +
                  StartMenuDir() + L"\\Setup (repair, rebuild, uninstall).lnk  -> Setup.exe\r\n   " + DesktopLink() + L"  -> Launcher.exe (optional)\r\n");
@@ -1271,7 +1601,7 @@ static LRESULT CALLBACK WndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         Ctl(w, L"BUTTON", L"1   Build tools", BS_GROUPBOX, 12, 64, 676, 80, 0);
         h_tools = Ctl(w, L"STATIC", L"Checking the build tools...", 0, 24, 84, 652, 54, 0);
         Ctl(w, L"BUTTON", L"2   Your game", BS_GROUPBOX, 12, 150, 676, 116, 0);
-        h_game = Ctl(w, L"EDIT", GetState(L"game").c_str(), WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP, 24, 172, 452, 24, ID_GAME);
+        h_game = Ctl(w, L"EDIT", (g_opt.game.empty() ? GetState(L"game") : g_opt.game).c_str(), WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP, 24, 172, 452, 24, ID_GAME);
         Ctl(w, L"BUTTON", L"ISO...", WS_TABSTOP, 484, 171, 90, 26, ID_ISO);
         Ctl(w, L"BUTTON", L"Folder...", WS_TABSTOP, 582, 171, 94, 26, ID_FOLDER);
         h_gameSt = Ctl(w, L"STATIC", L"", 0, 24, 202, 652, 58, 0);
@@ -1301,11 +1631,16 @@ static LRESULT CALLBACK WndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         EnableWindow(h_cancel, FALSE);
         UpdateGoButton();
         ShowGameState();
+        if (!g_opt.game.empty() && !HaveGameFiles())  // the installer passes the copy picked in its wizard
+            PostMessageW(w, WM_APP_PREFILL, 0, 0);
         g_busy = true;
         EnableWindow(h_go, FALSE);
         std::thread([] { CheckTools(); if (g_hwnd) PostMessageW(g_hwnd, WM_APP_TOOLS, 0, 0); }).detach();
         return 0;
     }
+    case WM_APP_PREFILL:
+        CheckPickedGame(g_opt.game);
+        return 0;
     case WM_APP_TOOLS:
         SetWindowTextW(h_tools, ToolsText().c_str());
         if (!g_worker.joinable()) { g_busy = false; EnableWindow(h_go, TRUE); }
@@ -1421,6 +1756,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
         if (a == L"--help" || a == L"-h" || a == L"/?") g_opt.help = true;
         else if (a == L"--dry-run") g_opt.dryRun = true;
         else if (a == L"--uninstall") g_opt.uninstall = true;
+        else if (a == L"--prepare") g_opt.prepare = true;
         else if (a == L"--game") g_opt.game = next();
         else if (a == L"--ram-gb") g_opt.ramGB = _wtof(next().c_str());
         else if (a == L"--free-gb") g_opt.freeGB = _wtof(next().c_str());
@@ -1438,18 +1774,22 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
         OpenConsole();
         ConsoleWrite(L"Setup.exe: one-click setup of this PC port (window). Options:\r\n"
                      L"  --dry-run            check this PC and print what Setup would do; changes nothing\r\n"
-                     L"  --game <iso|folder>  with --dry-run: also check that game copy\r\n"
-                     L"  --uninstall          remove what Setup made (with --dry-run: only list it)\r\n"
+                     L"  --game <iso|folder>  fill in the game copy (the installer passes it); with --dry-run: also check it\r\n"
+                     L"  --uninstall          remove what Setup made, and (asks first) the build tools it installed (with --dry-run: only list it)\r\n"
+                     L"  --prepare            no window (RecompLauncher): install tools, copy the game (--game) and build;\r\n"
+                     L"                       prints \"progress <0..1> <text>\" lines; exit code 0 = ready to play\r\n"
                      L"  --ram-gb N, --free-gb N, --cores N, --ppu-gb N, --reduce N\r\n"
                      L"                       pretend this RAM / free RAM / core count / GB per big file / out-of-memory retry\r\n"
                      L"                       level when planning the build job counts (also for a real run)\r\n"
                      L"  --parse-log <log>    dry run of the build-progress and out-of-memory parser on a build log\r\n"
                      L"  --port <folder>      act on another port folder (testing)\r\n"
                      L"Unattended setup without the window: setup.ps1 -Unattended -Game <iso|folder> [-AcceptSdkLicenses | -NoOptionalSdks]\r\n"
+                     L"  [-PortableTools -AcceptMicrosoftLicense]   (experimental: the build tools inside this folder, see docs\\INSTALL.md)\r\n"
                      L"(set PORT_PPU_JOBS, PORT_JOBS, RFOM_JOBS and RPCS3_JOBS to limit the build; see docs\\INSTALL.md).\r\n");
         return 0;
     }
     if (g_opt.dryRun) OpenConsole();
+    if (g_opt.prepare && !g_opt.dryRun) { g_prepare = true; OpenConsole(); }
     if (!LoadProfile() || !Exists(P(L"setup.ps1"))) {
         wstring t = L"Setup.exe must be in the port folder, next to setup.ps1 and the tools folder (" + g_port +
                     L").\r\n\r\nUnzip the whole release zip first, then run Setup.exe from the unzipped folder.";
@@ -1470,9 +1810,28 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
         HWND other = FindWindowW(L"ResistancePortSetup", nullptr);
         if (other) { ShowWindow(other, SW_RESTORE); SetForegroundWindow(other); }
+        if (g_prepare) { ConsoleWrite(L"Setup is already running for this game. Finish or close it, then try again.\r\n"); return 1; }
         return 0;
     }
     OpenLog(L"setup.log");
+    if (g_prepare) {
+        Choice c;
+        c.game = g_opt.game;
+        c.launch = false;
+        c.desktop = false;  // the launcher starts the game; a Start menu entry is still made
+        wstring sdk = GetState(L"sdks");
+        if (sdk.empty())
+            sdk = MessageBoxW(nullptr, (L"Also download the optional NVIDIA DLSS and Intel XeSS SDKs for " + g_prof.name +
+                                        L"?\r\n\r\nYes = I accept NVIDIA's and Intel's SDK licences.\r\nNo = skip them (AMD FSR works without them).").c_str(),
+                              (g_prof.name + L" setup").c_str(), MB_YESNO | MB_ICONQUESTION | MB_TOPMOST | MB_SETFOREGROUND) == IDYES
+                      ? L"accept" : L"skip";
+        c.sdks = sdk == L"accept";
+        SetupWorker(c);
+        if (g_result) ConsoleWrite(L"Setup did not finish. Details: " + P(L"logs\\setup.log") + L"\r\n");
+        if (g_log) fclose(g_log);
+        if (mutex) CloseHandle(mutex);
+        return g_result;
+    }
     if (g_opt.uninstall) {
         int r = Uninstall();
         if (g_log) fclose(g_log);

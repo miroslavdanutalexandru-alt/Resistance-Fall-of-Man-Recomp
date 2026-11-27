@@ -5,17 +5,26 @@
  *   report.txt        what this is: game, version, git commit, exe builds,
  *                     Windows, CPU, RAM, monitors, GPUs + driver versions (DXGI
  *                     and Vulkan), the last crash line, what was left out
+ *   pcinfo.txt        the PC alone: Windows build, CPU, RAM, GPUs + drivers,
+ *                     monitors (refresh rate, HDR), the install drive's file
+ *                     system and free space
+ *   VERSION           the port version
  *   note.txt          the tester's description (when one was typed)
- *   crash\            the newest dump (.dmp) and its readable report (.txt),
- *                     the other recent reports (.txt), crashes.txt
- *   logs\             run.log, out.log, launcher.log, ... (the last 8 MB of each)
+ *   crash\            the newest two dumps (.dmp, only when together at most
+ *                     200 MB) and their readable reports (.txt), the other
+ *                     recent reports (.txt), crashes.txt
+ *   logs\             run.log, out.log, launcher.log, update.log, ... (the last
+ *                     8 MB of each), setup / build logs (the last 2 MB), the
+ *                     newest five frame-time summaries (frametimes_*.txt)
  *   settings\         settings.ini, settings.bat, rpcs3_config.yml, controls.txt,
  *                     mouselook*.cfg, run.bat
  *   saves\            only when "Include my save files" is ticked
  * Never: game data, shader caches, builds, anything not on the lists above.
- * Everything packed is at most 50 MB (before compression); what does not fit is
- * left out and listed in report.txt. The Windows user name and profile path are
- * replaced by <user> / %USERPROFILE% in the text files. The zip is made by the
+ * Everything but the dumps is at most 50 MB (before compression); what does not
+ * fit is left out and listed in report.txt. The Windows user name and profile
+ * path are replaced by <user> / %USERPROFILE% in the text files (any
+ * \Users\<name>\ too; the PC name by <pc>, a moved OneDrive folder by %OneDrive%). The launcher then opens GitHub's new-issue page with a
+ * template (version, PC summary, the tester's note); nothing is uploaded. The zip is made by the
  * tar.exe that ships with Windows 10 1803+ (deflate); without it, by the
  * stored-zip writer below. */
 #include "port_report.h"
@@ -366,6 +375,53 @@ static std::string git_info(const std::string& root)
     return br;
 }
 
+/* the monitors as Windows drives them: exact refresh rate and HDR state */
+static void monitor_info(std::string& s)
+{
+    UINT32 np = 0, nm = 0;
+    if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &np, &nm) != ERROR_SUCCESS || !np) return;
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths(np);
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes(nm ? nm : 1);
+    if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &np, paths.data(), &nm, modes.data(), NULL) != ERROR_SUCCESS) return;
+    for (UINT32 i = 0; i < np; i++) {
+        const DISPLAYCONFIG_PATH_INFO& p = paths[i];
+        DISPLAYCONFIG_TARGET_DEVICE_NAME tn; memset(&tn, 0, sizeof tn);
+        tn.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME; tn.header.size = sizeof tn;
+        tn.header.adapterId = p.targetInfo.adapterId; tn.header.id = p.targetInfo.id;
+        const bool named = DisplayConfigGetDeviceInfo(&tn.header) == ERROR_SUCCESS && tn.monitorFriendlyDeviceName[0];
+        DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO ac; memset(&ac, 0, sizeof ac);
+        ac.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO; ac.header.size = sizeof ac;
+        ac.header.adapterId = p.targetInfo.adapterId; ac.header.id = p.targetInfo.id;
+        const bool color = DisplayConfigGetDeviceInfo(&ac.header) == ERROR_SUCCESS;
+        const DISPLAYCONFIG_RATIONAL& rr = p.targetInfo.refreshRate;
+        s += fmt("Monitor %u: %s, %.2f Hz, HDR %s\r\n", i, named ? narrow(tn.monitorFriendlyDeviceName).c_str() : "?",
+                 rr.Denominator ? (double)rr.Numerator / rr.Denominator : 0.0,
+                 !color ? "unknown" : !ac.advancedColorSupported ? "not supported" : ac.advancedColorEnabled ? "on" : "off (supported)");
+    }
+}
+
+/* the drive the port is installed on */
+static void drive_info(std::string& s, const std::string& root)
+{
+    char vol[MAX_PATH] = "", fsname[64] = "";
+    if (!GetVolumePathNameA(root.c_str(), vol, sizeof vol)) return;
+    DWORD serial = 0, maxc = 0, flags = 0;
+    GetVolumeInformationA(vol, NULL, 0, &serial, &maxc, &flags, fsname, sizeof fsname);
+    static const char* types[] = { "unknown", "unknown", "removable", "fixed", "network", "CD/DVD", "RAM disk" };
+    const UINT t = GetDriveTypeA(vol);
+    ULARGE_INTEGER fr, tot, tf;
+    if (!GetDiskFreeSpaceExA(root.c_str(), &fr, &tot, &tf)) fr.QuadPart = tot.QuadPart = 0;
+    s += fmt("Drive:     %s %s, %s, %.1f GB free of %.1f GB\r\n", vol, fsname[0] ? fsname : "?", t < 7 ? types[t] : "unknown",
+             fr.QuadPart / 1073741824.0, tot.QuadPart / 1073741824.0);
+}
+
+/* PORT_REPORT_LEGACY=1 restores the report as it was before pcinfo.txt / two dumps / setup logs / the GitHub page */
+static bool report_legacy()
+{
+    char v[8] = "";
+    return GetEnvironmentVariableA("PORT_REPORT_LEGACY", v, sizeof v) && v[0] && v[0] != '0';
+}
+
 std::string system_info(const std::string& root)
 {
     std::string s;
@@ -398,6 +454,7 @@ std::string system_info(const std::string& root)
         s += fmt("Display:   %s %lux%lu @ %lu Hz on %s%s\r\n", dd.DeviceName, m.dmPelsWidth, m.dmPelsHeight, m.dmDisplayFrequency,
                  dd.DeviceString, (dd.StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE) ? " (primary)" : "");
     }
+    if (!report_legacy()) { monitor_info(s); drive_info(s, root); }
     dxgi_info(s);
     vulkan_info(s);
     /* the port */
@@ -432,6 +489,17 @@ static void replace_all_ci(std::string& s, const std::string& what, const std::s
         else i++;
     }
 }
+/* `what` only as a path part / whole word, not inside other words */
+static void replace_word_ci(std::string& s, const std::string& u, const char* with)
+{
+    const size_t wl = strlen(with);
+    for (size_t i = 0; i + u.size() <= s.size();) {
+        const bool l = i == 0 || !isalnum((unsigned char)s[i - 1]);
+        const bool r = i + u.size() == s.size() || !isalnum((unsigned char)s[i + u.size()]);
+        if (l && r && !_strnicmp(s.c_str() + i, u.c_str(), u.size())) { s.replace(i, u.size(), with); i += wl; }
+        else i++;
+    }
+}
 static void scrub(std::string& s)
 {
     char prof[MAX_PATH] = "", user[256] = "";
@@ -442,14 +510,26 @@ static void scrub(std::string& s)
         std::string fwd = prof; std::replace(fwd.begin(), fwd.end(), '\\', '/');
         replace_all_ci(s, fwd, "%USERPROFILE%");
     }
-    if (strlen(user) >= 3) {
-        /* only as a path part / whole word, not inside other words */
-        const std::string u = user;
-        for (size_t i = 0; i + u.size() <= s.size();) {
-            const bool l = i == 0 || !isalnum((unsigned char)s[i - 1]);
-            const bool r = i + u.size() == s.size() || !isalnum((unsigned char)s[i + u.size()]);
-            if (l && r && !_strnicmp(s.c_str() + i, u.c_str(), u.size())) { s.replace(i, u.size(), "<user>"); i += 6; }
-            else i++;
+    if (strlen(user) >= 3) replace_word_ci(s, user, "<user>");   /* also in UNC / OneDrive paths */
+    if (!report_legacy()) {
+        char od[MAX_PATH] = "", pc[256] = "";
+        /* OneDrive moved out of the profile (D:\OneDrive - <name>) */
+        for (const char* k : { "OneDriveCommercial", "OneDriveConsumer", "OneDrive" })
+            if (GetEnvironmentVariableA(k, od, sizeof od) && od[0]) replace_all_ci(s, od, std::string("%") + k + "%");
+        /* the machine name: \\<pc>\share paths, host names in logs */
+        if (GetEnvironmentVariableA("COMPUTERNAME", pc, sizeof pc) && strlen(pc) >= 3) replace_word_ci(s, pc, "<pc>");
+    }
+    /* any other profile: C:\Users\<name>\ -> C:\Users\<user>\ */
+    if (!report_legacy()) for (const char* key : { "\\Users\\", "/Users/" }) {
+        const size_t kl = strlen(key);
+        for (size_t i = 0; (i = s.find(key, i)) != std::string::npos;) {
+            const size_t b = i + kl;
+            size_t e = b;
+            while (e < s.size() && s[e] != key[0] && s[e] != '\r' && s[e] != '\n' && s[e] != '"' && s[e] != '\'') e++;
+            const std::string name = s.substr(b, e - b);
+            if (e > b && e < s.size() && s[e] == key[0] && _stricmp(name.c_str(), "Public") && _stricmp(name.c_str(), "Default") &&
+                name != "<user>") s.replace(b, e - b, "<user>");
+            i = b;
         }
     }
 }
@@ -549,7 +629,7 @@ static bool tar_zip(const std::string& staging, const std::vector<std::string>& 
 /* ---- the bundle ---- */
 struct Packer {
     std::string staging;
-    uint64_t cap, used = 0;
+    uint64_t cap, used = 0, dump_bytes = 0;
     Result* r;
     std::vector<std::string> top;
     std::string listing;
@@ -638,6 +718,66 @@ static std::wstring desktop()
     return d;
 }
 
+std::string find_repo(const std::string& root)
+{
+#ifdef DIST_REPO
+    (void)root;
+    return DIST_REPO;
+#else
+    std::string j;
+    if (!read_file(root + "\\recomplauncher.json", j, 0)) return std::string();
+    size_t k = j.find("\"repo\"");
+    if (k == std::string::npos || (k = j.find(':', k)) == std::string::npos || (k = j.find('"', k)) == std::string::npos) return std::string();
+    const size_t e = j.find('"', k + 1);
+    std::string r = e == std::string::npos ? std::string() : j.substr(k + 1, e - k - 1);
+    for (char c : r) if (!isalnum((unsigned char)c) && !strchr("-_./", c)) return std::string();
+    return r;
+#endif
+}
+
+static std::string url_encode(const std::string& s)
+{
+    std::string o;
+    for (unsigned char c : s) {
+        if (isalnum(c) || strchr("-_.~", c)) o += (char)c;
+        else o += fmt("%%%02X", c);
+    }
+    return o;
+}
+
+/* GitHub's new-issue page with a filled-in template; short (no logs) so the URL stays a few KB */
+std::string issue_url(const std::string& root, const std::string& repo, const std::string& note, const std::string& zip_name)
+{
+    if (repo.empty()) return std::string();
+    std::string ver, info = system_info(root), pick;
+    if (read_file(root + "\\VERSION", ver)) { while (!ver.empty() && (ver.back() == '\n' || ver.back() == '\r' || ver.back() == ' ')) ver.pop_back(); }
+    /* the PC lines worth having in the issue itself */
+    size_t s = 0;
+    while (s < info.size()) {
+        size_t e = info.find('\n', s);
+        if (e == std::string::npos) e = info.size();
+        std::string l = info.substr(s, e - s);
+        while (!l.empty() && (l.back() == '\r' || l.back() == ' ')) l.pop_back();
+        if (!l.compare(0, 8, "Windows:") || !l.compare(0, 4, "CPU:") || !l.compare(0, 4, "RAM:") || !l.compare(0, 4, "GPU ") ||
+            !l.compare(0, 8, "Monitor ") || !l.compare(0, 6, "Drive:"))
+            if (pick.size() < 700) pick += "    " + l + "\n";
+        s = e + 1;
+    }
+    std::string n = note.substr(0, 600);
+    scrub(n);
+    std::string title = n.substr(0, (std::min)(n.find_first_of("\r\n"), (size_t)80));
+    std::string body;
+    body += "**Version:** " + (ver.empty() ? std::string("?") : ver) + "\n\n";
+    body += "**What happened?**\n" + (n.empty() ? std::string("(describe the problem)") : n) + "\n\n";
+    body += "**Steps to reproduce / where in the game:**\n1. \n\n";
+    body += "**Expected:**\n\n";
+    body += "**PC:**\n" + pick + "\n";
+    body += "**Report zip:** please drag `" + zip_name + "` (on your Desktop) into this box.\n";
+    scrub(body);
+    return "https://github.com/" + repo + "/issues/new?title=" + url_encode(title.empty() ? "Problem report" : title) +
+           "&body=" + url_encode(body);
+}
+
 bool create(const Options& o, Result& r)
 {
     r = Result();
@@ -651,6 +791,9 @@ bool create(const Options& o, Result& r)
     }
     r.zip = out + L"\\" + widen(game + "_report_" + ts + ".zip");
 
+    /* PORT_REPORT_LEGACY=1: the report as before (newest dump only, inside the cap; no VERSION / pcinfo.txt /
+     * setup logs / older runs; user name scrub of the current user only; no GitHub page) */
+    const bool legacy = report_legacy();
     Packer pk;
     pk.r = &r;
     pk.cap = o.cap_bytes ? o.cap_bytes : (50ull << 20);
@@ -664,31 +807,82 @@ bool create(const Options& o, Result& r)
         std::string n = o.note;
         pk.put("note.txt", n, false);   /* the tester's own words: not scrubbed */
     }
-    /* crash reports: the newest dump and its .txt first, then the other recent reports */
+    /* crash reports: the newest dumps' .txt first, then the other recent reports */
     const std::string cdir = root + "\\logs\\crash";
-    const std::vector<DumpFile> dumps = find_files(cdir, "*.dmp");
+    std::vector<DumpFile> dumps = find_files(cdir, "*.dmp");
+    if (!legacy) for (const DumpFile& d : find_files(root + "\\logs", "crash_*.dmp")) dumps.push_back(d);
+    std::sort(dumps.begin(), dumps.end(), [](const DumpFile& a, const DumpFile& b) { return a.t > b.t; });
+    if (dumps.size() > (legacy ? 1u : 2u)) dumps.resize(legacy ? 1 : 2);
     const std::vector<DumpFile> txts = find_files(cdir, "*_*_*.txt");
-    std::string newest_txt;
-    if (!dumps.empty()) {
-        newest_txt = dumps[0].path.substr(0, dumps[0].path.size() - 4) + ".txt";
-        pk.file(newest_txt, "crash\\" + dumps[0].name.substr(0, dumps[0].name.size() - 4) + ".txt", true);
+    std::vector<std::string> dump_txts;
+    for (const DumpFile& d : dumps) {
+        const std::string t = d.path.substr(0, d.path.size() - 4) + ".txt";
+        dump_txts.push_back(t);
+        pk.file(t, "crash\\" + d.name.substr(0, d.name.size() - 4) + ".txt", true);
     }
     pk.file(cdir + "\\crashes.txt", "crash\\crashes.txt", true, 256 * 1024);
     /* settings */
     static const char* settings[] = { "settings.ini", "settings.bat", "rpcs3_config.yml", "controls.txt", "run.bat",
                                       "mouselook.cfg", "mouselook_r2.cfg", "mouselook_r3.cfg" };
     for (const char* s : settings) pk.file(root + "\\" + s, std::string("settings\\") + s, true, 1u << 20);
-    /* the dump */
-    if (!dumps.empty()) pk.file(dumps[0].path, "crash\\" + dumps[0].name, false);
-    /* logs: the end of each */
+    if (!legacy) {
+        pk.file(root + "\\VERSION", "VERSION", true, 4096);
+        std::string pc = fmt("%s PC port -- this PC\r\n", game.c_str());
+        pc += system_info(root);
+        pk.put("pcinfo.txt", pc, true);
+    }
+    /* the dumps: the newest two, on their own allowance (dump_cap_bytes, never cut) */
+    {
+        uint64_t total = 0;
+        std::vector<uint64_t> sz;
+        for (const DumpFile& d : dumps) {
+            WIN32_FILE_ATTRIBUTE_DATA fa;
+            const uint64_t n = GetFileAttributesExA(d.path.c_str(), GetFileExInfoStandard, &fa) ? ((uint64_t)fa.nFileSizeHigh << 32) | fa.nFileSizeLow : 0;
+            sz.push_back(n); total += n;
+        }
+        const uint64_t dcap = o.dump_cap_bytes;
+        for (size_t i = 0; i < dumps.size(); i++) {
+            if (legacy) { pk.file(dumps[i].path, "crash\\" + dumps[i].name, false); continue; }   /* the old way: inside the 50 MB cap */
+            if (total > dcap) {
+                r.skipped.push_back(fmt("crash\\%s (%.1f MB, the dumps are over the %llu MB limit)", dumps[i].name.c_str(),
+                                        sz[i] / 1048576.0, (unsigned long long)(dcap >> 20)));
+                continue;
+            }
+            const uint64_t saved = pk.cap, before = pk.used;
+            pk.cap = pk.used + sz[i] + 1;
+            pk.file(dumps[i].path, "crash\\" + dumps[i].name, false);
+            pk.cap = saved;
+            pk.dump_bytes += pk.used - before;
+            pk.used = before;
+        }
+    }
+    /* logs: the end of each; setup / build logs: the last 2 MB */
     static const char* logs[] = { "run.log", "out.log", "launcher.log", "update.log", "rpcs3_rsx.log", "rpcs3_rsx.prev.log",
                                   "semlog.txt", "dbg.txt", "hitch.txt" };
     for (const char* l : logs) pk.file(root + "\\logs\\" + l, std::string("logs\\") + l, true, 8ull << 20);
+    static const char* setup_logs[] = { "setup.log", "setup_script.log", "prereqs_install.log", "configure.log", "build.log",
+                                        "configure_game.log", "build_game.log", "configure_rpcs3.log", "build_rpcs3.log" };
+    if (!legacy) for (const char* l : setup_logs) pk.file(root + "\\logs\\" + l, std::string("logs\\") + l, true, 2ull << 20);
+    /* earlier runs (run.prev.log, run_<time>.log, ...): the newest three */
+    int runs = 0;
+    for (const DumpFile& l : find_files(root + "\\logs", "run?*.log")) {
+        if (legacy || runs >= 3) break;
+        if (!_stricmp(l.name.c_str(), "run.log")) continue;   // "run?*.log" also matches run.log, already packed
+        ++runs;
+        pk.file(l.path, "logs\\" + l.name, true, 8ull << 20);
+    }
+    /* frame-time summaries (port_frametime.h): the newest five */
+    int fts = 0;
+    for (const DumpFile& l : find_files(root + "\\logs", "frametimes_*.txt")) {
+        if (legacy || fts++ >= 5) break;
+        pk.file(l.path, "logs\\" + l.name, true, 512 * 1024);
+    }
     /* other recent crash / hang reports (small text) */
     int more = 0;
     FILETIME nowft; GetSystemTimeAsFileTime(&nowft);
     for (const DumpFile& t : txts) {
-        if (!_stricmp(t.path.c_str(), newest_txt.c_str()) || t.t + 14ull * 24 * 3600 * 10000000ull < ft64(nowft)) continue;
+        if (std::find_if(dump_txts.begin(), dump_txts.end(), [&](const std::string& d) { return !_stricmp(d.c_str(), t.path.c_str()); }) != dump_txts.end() ||
+            t.t + 14ull * 24 * 3600 * 10000000ull < ft64(nowft)) continue;
         if (more++ >= 6) break;
         pk.file(t.path, "crash\\" + t.name, true, 512 * 1024);
     }
@@ -811,8 +1005,18 @@ static void do_create()
     finish(1);
     if (ok) {
         ShellExecuteW(owner, L"open", L"explorer.exe", (L"/select,\"" + r.zip + L"\"").c_str(), NULL, SW_SHOWNORMAL);
-        std::wstring m = L"Saved on your Desktop:\n" + r.zip + L"\n\nAttach this zip to your bug report. Nothing was sent anywhere.";
+        const std::wstring zname = r.zip.substr(r.zip.find_last_of(L'\\') + 1);
+        const std::string url = port_report::report_legacy() ? std::string() :
+                                port_report::issue_url(o.root, port_report::find_repo(o.root), o.note, port_report::narrow(zname));
+        std::wstring m = L"Saved on your Desktop:\n" + r.zip + L"\n\nNothing was sent anywhere.";
         if (!r.skipped.empty()) m += L"\n\nSome files were too large and were left out (listed in report.txt).";
+        if (!url.empty()) {
+            ShellExecuteW(owner, L"open", port_report::widen(url).c_str(), NULL, NULL, SW_SHOWNORMAL);
+            m += L"\n\nGitHub's new-issue page is opening in your browser: describe the problem there and drag " + zname +
+                 L" into the text box (needs a free GitHub account).";
+        } else {
+            m += L"\n\nAttach this zip to your bug report.";
+        }
         MessageBoxW(owner, m.c_str(), L"Report a problem", MB_OK | MB_ICONINFORMATION);
     } else {
         MessageBoxA(owner, ("Could not create the report: " + r.error).c_str(), "Report a problem", MB_OK | MB_ICONWARNING);

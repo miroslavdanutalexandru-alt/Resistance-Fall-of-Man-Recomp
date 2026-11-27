@@ -354,6 +354,41 @@ typedef struct rsx_state {
      * BEGIN/END; the backend concatenates those and must not merge across a
      * boundary, where the transform constants can change. */
     u32 begin_epoch;
+    /* Bumped by writes inside BEGIN/END that end the current primitive range
+     * (vertex data base offset / index, transform constant load / data): RPCS3
+     * inserts an execution barrier there, so no primitive spans the write. */
+    u32 prim_break;
+    /* Resistance port, phase 2 (rsx_ext_state.h): NV4097_SET_ANTI_ALIASING_CONTROL
+     * (0x1D7C; bit4 = alpha-to-coverage), SET_USER_CLIP_PLANE_CONTROL (0x1478),
+     * SET_POINT_SIZE (0x1EE0, float) and SET_POINT_SPRITE_CONTROL (0x1EE8). */
+    u32 aa_control;
+    u32 clip_plane_control;
+    float point_size;
+    u32 point_sprite_control;
+    /* Feature-gap batch (rsx_ext_state.h "ext2"): state the backend used to
+     * drop. *_set = the game has written the register at least once (MRT
+     * state then overrides the old mirror-RT0 behaviour). */
+    u32 blend_color2;                  /* 0x037C: B/A halves for FP16 targets */
+    u32 blend_enable_mrt, blend_enable_mrt_set;   /* 0x036C: bit i = RT i (1..3) */
+    u32 color_mask_mrt, color_mask_mrt_set;       /* 0x0370: nibble per RT */
+    u32 logic_op_enable, logic_op;     /* 0x0374 / 0x0378 (GL enum) */
+    u32 depth_bounds_enable;           /* 0x0380 */
+    float depth_bounds_min, depth_bounds_max;     /* 0x0384 / 0x0388 */
+    u32 zminmax_control;               /* 0x1D78: [3:0] clip, [7:4] clamp, [11:8] ignore W */
+    u32 front_polygon_mode, back_polygon_mode;    /* 0x1828 / 0x182C (GL 0x1B00..0x1B02) */
+    u32 fog_mode;                      /* 0x08CC */
+    float fog_params[2];               /* 0x08D0 / 0x08D4 */
+    u32 two_side_light;                /* 0x142C */
+    u32 render_enable;                 /* 0x1E98: mode << 24 | report offset */
+    u32 shade_model;                   /* 0x0368: 0x1D00 FLAT, 0x1D01 SMOOTH */
+    float line_width;                  /* 0x03B8 (6.3 fixed decoded) */
+    u32 line_smooth, poly_smooth, poly_stipple;   /* 0x03BC / 0x1838 / 0x147C */
+    u32 dither_enable;                 /* 0x0300 */
+    u32 window_offset;                 /* 0x02B8: x [15:0], y [31:16] */
+    u32 tex_coord_control[10];         /* 0x0B40.. */
+    u32 cylindrical_wrap;              /* 0x0238 */
+    u32 point_params_enable;           /* 0x1EE4 */
+    u32 color_key;                     /* 0x1D00 SET_COLOR_KEY_COLOR */
     u32 index_array_offset;
     u32 index_array_dma;
     /* NV4097_SET_RESTART_INDEX_ENABLE (0x1DAC) / _INDEX (0x1DB0). */

@@ -440,7 +440,9 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
     /* Diagnostic: main-thread per-frame poll on q=2/q=3 (timeout ~30us) never
      * advances to content. Dump its guest call chain to identify the frame-loop
      * function + the value it waits on. Fires a few times. YDKJ_Q23STACK. */
-    if ((queue_id == 2 || queue_id == 3) && getenv("YDKJ_Q23STACK")) {
+    static int s_ydkj_q23stack = -1;   /* read once: this is on every receive */
+    if (s_ydkj_q23stack < 0) s_ydkj_q23stack = getenv("YDKJ_Q23STACK") ? 1 : 0;
+    if ((queue_id == 2 || queue_id == 3) && s_ydkj_q23stack) {
 #ifdef _WIN32
         static int _gs23 = 0; if (PS3_LOG_FIRST(_gs23, 4)) {
             void* fr[48]; unsigned short n=RtlCaptureStackBackTrace(0,48,fr,0);
@@ -956,6 +958,14 @@ uint32_t sys_event_find_queue_by_key(uint64_t key)
     return 0;
 }
 
+/* YDKJ_NO_PORTROUTE, read once (it was a CRT getenv on every routed send). */
+static int sys_event_no_portroute(void)
+{
+    static int s_v = -1;
+    if (s_v < 0) s_v = getenv("YDKJ_NO_PORTROUTE") ? 1 : 0;
+    return s_v;
+}
+
 int64_t sys_event_port_send(ppu_context* ctx)
 {
     uint32_t port_id = LV2_ARG_U32(ctx, 0);
@@ -983,7 +993,7 @@ int64_t sys_event_port_send(ppu_context* ctx)
          * sends; we only fix the port->queue routing our HLE lost. Env YDKJ_PORTROUTE
          * (default ON) can be disabled for A/B. */
         if (port_id <= SYS_EVENT_QUEUE_MAX && g_sys_event_queues[port_id - 1].active
-                && (!getenv("YDKJ_NO_PORTROUTE"))) {
+                && !sys_event_no_portroute()) {
             sys_event_queue_info* rq = &g_sys_event_queues[port_id - 1];
             sys_event_t revt; revt.source = 0; revt.data1 = data1; revt.data2 = data2; revt.data3 = data3;
             int rc = event_queue_push(rq, &revt);

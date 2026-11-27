@@ -84,16 +84,14 @@ typedef struct {
     int           stream;   /* SOCK_STREAM or SOCK_STREAM_P2P */
     uint16_t      vport;    /* the P2P vport it was bound to */
     int           listening;
-    /* A DNS answer this port made up for a query it did not really send
-     * (see the built-in resolver below). */
+    /* A DNS answer made up locally for a query that was never sent (see
+     * "Built-in DNS" below); recvfrom hands it out once. */
     uint8_t       dns[512];
     uint32_t      dns_len;
     struct sockaddr_in dns_from;
 } net_socket_slot;
 
 static net_socket_slot s_sockets[SYS_NET_MAX_SOCKETS];
-/* Guest LR of the last socket call, for the packet trace (see h_send below). */
-static uint32_t s_io_lr;
 static int s_net_initialized = 0;
 
 /* Guest scratch, allocated on first use through the allocator the runtime
@@ -187,6 +185,7 @@ static int alloc_slot(host_socket_t fd)
             s_sockets[i].stream = 0;
             s_sockets[i].vport = 0;
             s_sockets[i].listening = 0;
+            s_sockets[i].dns_len = 0;
             return i;
         }
     return -1;
@@ -606,8 +605,8 @@ static void trace(const char* op, int32_t s, int n, const struct sockaddr_in* a)
     hh = (unsigned)tm.tm_hour; mm = (unsigned)tm.tm_min; ss = (unsigned)tm.tm_sec;
     ms = (unsigned)(tv.tv_usec / 1000);
 #endif
-    printf("[sys_net %02u:%02u:%02u.%03u] %s(%d) %s:%u -> %d (host error %d) lr=0x%08X\n", hh, mm, ss, ms,
-           op, s, ip, a ? ntohs(a->sin_port) : 0, n, err, s_io_lr);
+    printf("[sys_net %02u:%02u:%02u.%03u] %s(%d) %s:%u -> %d (host error %d)\n", hh, mm, ss, ms,
+           op, s, ip, a ? ntohs(a->sin_port) : 0, n, err);
 }
 
 int32_t sys_net_bnet_send(int32_t s, const void* buf, uint32_t len, int32_t flags)
@@ -622,17 +621,19 @@ int32_t sys_net_bnet_send(int32_t s, const void* buf, uint32_t len, int32_t flag
 /* ---------------------------------------------------------------------------
  * Built-in DNS for PS3_NET_HOSTS.
  *
- * The front end does NOT use gethostbyname for the Sony hostnames. Its own
- * resolver sends a UDP query straight to 8.8.8.8:53 (logged as
- * `sendto(1) 8.8.8.8:53 -> 48`), which PS3_NET_HOSTS cannot touch, and those
- * names no longer exist -- so the answer is NXDOMAIN and Medius never
- * connects. Answer the query ourselves instead, with the same mapping
- * net_hosts.txt already provides, so pointing a title at a community server
- * needs no system resolver change. Names we do not know are passed through to
- * the real server untouched.
+ * Some titles do not resolve through gethostbyname: their own resolver sends
+ * a UDP query straight to a public DNS server (8.8.8.8:53, say). The
+ * gethostbyname override below never sees those, and for a retired service
+ * the real answer is NXDOMAIN. So a single-question A/IN query sent to port 53
+ * for a name PS3_NET_HOSTS lists is answered here, and the answer is handed
+ * out by the next recvfrom on that socket; nothing goes on the wire. Every
+ * other query is sent to the real server untouched.
+ *
+ * One pending answer per socket: a second query before the first answer is
+ * read replaces it, which is what a resolver retrying the same name expects.
  * -----------------------------------------------------------------------*/
 
-/* Defined below with PS3_NET_HOSTS; the resolver above needs it earlier. */
+/* Defined below with gethostbyname, which uses it too. */
 static int hosts_override(const char* host, struct in_addr* out);
 
 static int dns_pending(int32_t s)
@@ -680,7 +681,7 @@ static int dns_maybe_answer(int32_t s, const void* guest_buf, uint32_t len,
 
     struct in_addr answer;
     if (!hosts_override(name, &answer)) {
-        printf("[sys_net] DNS query '%s' -> real server (not in PS3_NET_HOSTS)\n", name);
+        if (net_trace()) printf("[sys_net] DNS query '%s' -> real server (not in PS3_NET_HOSTS)\n", name);
         return 0;
     }
 
@@ -745,17 +746,17 @@ int32_t sys_net_bnet_recvfrom(int32_t s, void* buf, uint32_t len, int32_t flags,
     int n;
     if (!valid_socket(s)) return fail(SYS_NET_EBADF);
 
-    /* A DNS answer we made up for a query the title sent to 8.8.8.8:53. */
+    /* The answer to a DNS query answered locally (see "Built-in DNS"). */
     if (s_sockets[s].dns_len) {
         net_socket_slot* sl = &s_sockets[s];
-        uint32_t n = sl->dns_len;
-        if (n > len) n = len;
-        memcpy(GUEST_PTR(EA(buf), uint8_t*), sl->dns, n);
+        uint32_t dn = sl->dns_len;
+        if (dn > len) dn = len;
+        memcpy(GUEST_PTR(EA(buf), uint8_t*), sl->dns, dn);
         a = sl->dns_from;
-        sl->dns_len = 0;
-        if (net_trace()) trace("recvfrom(dns)", s, (int)n, &a);
+        if (!(flags & SYS_NET_MSG_PEEK)) sl->dns_len = 0;   /* a peek leaves it queued */
+        if (net_trace()) trace("recvfrom(dns)", s, (int)dn, &a);
         write_sockaddr(EA(from), EA(fromlen), &a);
-        return (int32_t)n;
+        return (int32_t)dn;
     }
 
     /* psnr's own packets (probe replies, peers' punches) are consumed here;
@@ -1214,80 +1215,10 @@ static void h_listen(ppu_context* ctx)      { RET_S(sys_net_bnet_listen(S32(3), 
 static void h_accept(ppu_context* ctx)      { RET_S(sys_net_bnet_accept(S32(3), PTR(4), PTR(5))); }
 static void h_connect(ppu_context* ctx)     { RET_S(sys_net_bnet_connect(S32(3), PTR(4), R32(5))); }
 static void h_shutdown(ppu_context* ctx)    { RET_S(sys_net_bnet_shutdown(S32(3), S32(4))); }
-/* Which guest function called send/recv. The title's own network code lives
- * in hundreds of unnamed recompiled functions, so "who sent these 4 bytes" is
- * otherwise unanswerable; with the LR, the call site is a func_XXXXXXXX name
- * in recompiled/ and the caller can be read as C++. */
-/* ---------------------------------------------------------------------------
- * PS3_NET_BT=<n>: host backtrace whenever the title sends or receives.
- *
- * The guest stack scanner behind PS3_DEBUG's `threads` cannot follow a call
- * made through a virtual dispatch, and the Medius message layer is full of
- * them -- the record reader func_00602A68 has no static callers at all. The
- * HOST stack has no such problem: every recompiled function is a real C++
- * frame, so the frames here ARE the recompiled functions, and the addresses
- * can be resolved against build\\ResistanceFoM.pdb.
- *
- * Prints module-relative addresses (rva) because the exe is relocated.
- * -----------------------------------------------------------------------*/
-#ifdef _WIN32
-#include <windows.h>
-static void host_bt_emit(const char* what)
-{
-    void* frames[48];
-    unsigned short c = RtlCaptureStackBackTrace(0, 48, frames, NULL);
-    char* base = (char*)GetModuleHandleA(NULL);
-    fprintf(stderr, "[netbt] %s:", what);
-    for (unsigned short i = 0; i < c; i++) fprintf(stderr, " %llX", (unsigned long long)((char*)frames[i] - base));
-    fprintf(stderr, "\n");
-    fflush(stderr);
-}
-
-/* PS3_NET_BT_ALL=1: backtrace EVERY send/recv, no budget.
- *
- * The budget below never worked: the game reads PS3_NET_BT=400 (the string is in
- * the exe, the bat sets it unconditionally) and still stops after exactly 40
- * lines, so whatever the cause, a count-based gate cannot be trusted to reach
- * the call we care about -- the 0x0B send is around the 60th socket call. This
- * switch has no counter, so it cannot run out. Lines land next to the transport
- * log in the same stderr stream, so a given send is found by reading backwards
- * from its [sys_net] line. */
-static int bt_all(void)
-{
-    static int s_all = -1;
-    if (s_all == -1) { const char* e = getenv("PS3_NET_BT_ALL"); s_all = (e && *e && *e != '0') ? 1 : 0;
-        if (s_all) fprintf(stderr, "[netbt] PS3_NET_BT_ALL=1: unbudgeted backtraces\n"); }
-    return s_all;
-}
-
-static void host_bt(const char* what, int n)
-{
-    (void)what; (void)n;
-    /* budget path: report what it actually decided, once, so a repeat of the
-     * "set 400, got 40" mystery names itself instead of costing a guess. */
-    static int s_n = -1;
-    if (s_n == -1) {
-        const char* e = getenv("PS3_NET_BT");
-        s_n = e ? atoi(e) : 0;
-        if (s_n > 0) fprintf(stderr, "[netbt] budget=%d (PS3_NET_BT=\"%s\")\n", s_n, e);
-        fflush(stderr);
-    }
-    if (bt_all()) { host_bt_emit(what); return; }
-    if (s_n <= 0) return;
-    static int s_left = -3;
-    if (s_left == -3) s_left = s_n;
-    if (s_left <= 0) return;
-    s_left--;
-    host_bt_emit(what);
-}
-#else
-static void host_bt(const char* what, int n) { (void)what; (void)n; }
-#endif
-
-static void h_send(ppu_context* ctx)        { s_io_lr = (uint32_t)ctx->lr; host_bt("send", S32(3)); RET_S(sys_net_bnet_send(S32(3), PTR(4), R32(5), S32(6))); }
-static void h_sendto(ppu_context* ctx)      { s_io_lr = (uint32_t)ctx->lr; RET_S(sys_net_bnet_sendto(S32(3), PTR(4), R32(5), S32(6), PTR(7), R32(8))); }
-static void h_recv(ppu_context* ctx)        { s_io_lr = (uint32_t)ctx->lr; host_bt("recv", S32(3)); RET_S(sys_net_bnet_recv(S32(3), PTR(4), R32(5), S32(6))); }
-static void h_recvfrom(ppu_context* ctx)    { s_io_lr = (uint32_t)ctx->lr; RET_S(sys_net_bnet_recvfrom(S32(3), PTR(4), R32(5), S32(6), PTR(7), PTR(8))); }
+static void h_send(ppu_context* ctx)        { RET_S(sys_net_bnet_send(S32(3), PTR(4), R32(5), S32(6))); }
+static void h_sendto(ppu_context* ctx)      { RET_S(sys_net_bnet_sendto(S32(3), PTR(4), R32(5), S32(6), PTR(7), R32(8))); }
+static void h_recv(ppu_context* ctx)        { RET_S(sys_net_bnet_recv(S32(3), PTR(4), R32(5), S32(6))); }
+static void h_recvfrom(ppu_context* ctx)    { RET_S(sys_net_bnet_recvfrom(S32(3), PTR(4), R32(5), S32(6), PTR(7), PTR(8))); }
 static void h_setsockopt(ppu_context* ctx)  { RET_S(sys_net_bnet_setsockopt(S32(3), S32(4), S32(5), PTR(6), R32(7))); }
 static void h_getsockopt(ppu_context* ctx)  { RET_S(sys_net_bnet_getsockopt(S32(3), S32(4), S32(5), PTR(6), PTR(7))); }
 static void h_getsockname(ppu_context* ctx) { RET_S(sys_net_bnet_getsockname(S32(3), PTR(4), PTR(5))); }

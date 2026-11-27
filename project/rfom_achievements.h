@@ -1,4 +1,5 @@
-// Resistance: Fall of Man PC port: fan-made achievements for the launcher (the PS3 game has no trophies).
+// Resistance: Fall of Man PC port: fan-made achievements for the launcher and the in-game pop-ups
+// (rfom_trophies.cpp; the PS3 game has no trophies).
 // Computed read-only from the game's profile save, PROFILE.SAV
 // (<saves>\dev_hdd0\home\00000001\savedata\BCUS98107_PROFILE\PROFILE.SAV).
 //
@@ -94,7 +95,8 @@ struct Achievement {
     int have, need;            // progress (need 0 = yes/no)
 };
 
-// The fan-made set. Only what PROFILE.SAV records reliably; never awarded in game.
+// The fan-made set. Only what PROFILE.SAV records reliably; never awarded to the game itself (the port
+// only announces them when the save shows them earned).
 inline std::vector<Achievement> evaluate(const Profile& p)
 {
     std::vector<Achievement> a;

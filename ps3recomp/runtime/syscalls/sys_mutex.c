@@ -9,6 +9,7 @@
 #include <string.h>
 #include <stdlib.h>   /* getenv, atoi (v181) */
 #include <stdio.h>
+#include "../platform/port_hires_sleep.h"   /* port_sleep_1ms (perf pass 9) */
 
 /* ---------------------------------------------------------------------------
  * Globals
@@ -179,7 +180,7 @@ int64_t sys_mutex_destroy(ppu_context* ctx)
  * r4 = timeout_usec (0 = infinite)
  * -----------------------------------------------------------------------*/
 #ifdef _WIN32
-#pragma comment(lib, "Synchronization.lib")   /* WaitOnAddress */
+#pragma comment(lib, "synchronization.lib")   /* WaitOnAddress; lowercase for the case-sensitive Linux / xwin SDK */
 static struct { volatile ULONGLONG t0; uint64_t tid; uint32_t mutex, lr; int logged; } s_mw[256];
 static DWORD WINAPI mtx_watch_thread(LPVOID p)
 {
@@ -279,7 +280,7 @@ int64_t sys_mutex_lock(ppu_context* ctx)
                 return (int64_t)(int32_t)CELL_ETIMEDOUT;
             }
             if (timeout_us < 1000) SwitchToThread();
-            else                   Sleep(1);
+            else                   port_sleep_1ms();   /* perf pass 9: HR timer (PORT_HIRES_SLEEP) */
         }
     }
 #else

@@ -152,7 +152,7 @@ static inline int spurs_mt_lane_cpus(const spurs_mt_topo* t, uint64_t allowed, u
 #endif
 #include <windows.h>
 #if defined(_MSC_VER)
-#pragma comment(lib, "Synchronization.lib")   /* WaitOnAddress / WakeByAddressSingle */
+#pragma comment(lib, "synchronization.lib")   /* WaitOnAddress / WakeByAddressSingle; lowercase for the case-sensitive Linux / xwin SDK */
 #endif
 #endif
 

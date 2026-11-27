@@ -6,6 +6,7 @@
 #define SYS_COND_H
 
 #include "lv2_syscall_table.h"
+#include "../platform/port_cacheline.h"   /* PS3_CACHELINE_ALIGN (perf final pass) */
 #include "sys_mutex.h"
 #include "../ppu/ppu_context.h"
 #include "../../include/ps3emu/ps3types.h"
@@ -30,7 +31,7 @@ extern "C" {
  * 130 by then. ~100 bytes a slot. */
 #define SYS_COND_MAX  8192
 
-typedef struct sys_cond_info {
+typedef struct PS3_CACHELINE_ALIGN sys_cond_info {
     int      active;
     uint32_t mutex_id;   /* associated mutex */
     char     name[8];

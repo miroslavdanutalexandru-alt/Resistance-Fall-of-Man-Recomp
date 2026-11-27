@@ -10,8 +10,8 @@ Thanks for testing! A good report has two parts: **what happened** (in your word
 4. Tick **Include my save files** only if the problem depends on where you are in the game (for example, a crash when loading one save). It is off by default.
 5. Click **Create report**. The launcher writes
    `Desktop\ResistanceFoM_report_<date>_<time>.zip`
-   and opens Explorer with the file selected.
-6. Attach that zip to your bug report (Discord / GitHub issue / wherever the beta asks for reports), together with a short description. Screenshots or a short video help a lot for graphics bugs.
+   and opens Explorer with the file selected. It also opens a new GitHub issue for this port in your browser with the version, your note and a short PC summary filled in (nothing is sent until you click *Submit*).
+6. Drag the zip into the issue (or attach it wherever the beta asks for reports). Screenshots or a short video help a lot for graphics bugs.
 
 **After a crash or freeze:** the game saves crash information by itself. The next time you start the launcher, it asks *"The game crashed last time. Create a report?"*. Click **Create report** to get the same zip. **Not now** asks again at the next start, for up to a week.
 
@@ -24,11 +24,13 @@ Everything is a plain file you can open and read before sending. The zip is capp
 | In the zip | What it is |
 |---|---|
 | `report.txt` | Windows version, CPU, RAM, monitors, GPU(s) and driver version (DXGI and Vulkan), game exe version/build date/git commit, which files were included or left out |
+| `pcinfo.txt` | Windows build, CPU, GPU(s) and driver, RAM, monitors (resolution, refresh rate, HDR), and the game drive's file system and free space. User names in paths are replaced with `<user>` |
+| `VERSION` | The port version |
 | `note.txt` | What you typed in "What happened?" |
 | `crash\*.txt` | Latest crash/freeze report: error code, where it happened (module + offset, and the game function if known), short stack traces of all threads, last lines of the log, relevant settings |
-| `crash\*.dmp` | Latest minidump (small, usually under a few MB, not a full memory dump). It lets developers see the state of the crash |
+| `crash\*.dmp` | The newest two minidumps (small, usually under a few MB, not full memory dumps). They let developers see the state of the crash. They do not count toward the 50 MB cap and are left out if together over 200 MB |
 | `crash\crashes.txt` | One line per crash/freeze so far |
-| `logs\` | `run.log`, `out.log` and other port logs (only the last 8 MB of each) |
+| `logs\` | `run.log`, `out.log` and other port logs (only the last 8 MB of each), the last three `run*.log`, and Setup's logs (`setup.log`, `build.log`, `configure.log`... the last 2 MB of each) |
 | `settings\` | Launcher settings (`settings.ini` / `settings.bat`, `controls.txt`, `run.bat`) |
 | `saves\` | **Only if you ticked the box.** Your save files from `Saved Games\Resistance Fall of Man` (or your custom save location / `gamedata\...\savedata`) |
 
@@ -53,6 +55,7 @@ Set these as environment variables (for example in `settings.bat` or before runn
 | (not set) | Freeze report only after the game loop has stopped for 90 s (`RFOM_HANG_S` changes it). |
 | `PORT_CRASH_DUMPS=0` | Turn the crash reporter off (also `RFOM_CRASH_DUMPS=0`). |
 | `PORT_CRASH_DUMPS=full` | Full-memory dumps (very large, several GB; only when a developer asks for one). |
+| `PORT_REPORT_LEGACY=1` | **Report a problem** as before: newest dump only, no `pcinfo.txt` / `VERSION` / Setup logs, no GitHub issue page. |
 | `PORT_CRASH_KEEP=<n>` | How many crash dumps to keep in `logs\crash` (default 12). |
 
 Crash files are written to `logs\crash\` in the game folder (`<TAG>_<date>_<time>_crash.dmp` + `.txt`; `_hang` for freezes).

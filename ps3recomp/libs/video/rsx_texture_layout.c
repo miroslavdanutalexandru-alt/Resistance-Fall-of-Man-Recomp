@@ -3,8 +3,10 @@
  */
 #include "rsx_texture_layout.h"
 
+#include <stdio.h>    /* fprintf      */
 #include <stdlib.h>   /* getenv, atoi */
 #include <string.h>   /* memcpy       */
+#include "../../../project/port_native_summary.h"   /* port_native_parse_bool: the shared switch rules */
 
 u32 rsx_log2_ceil(u32 v)
 {
@@ -273,12 +275,10 @@ static void decode_texel(const rsx_tex_layout* tl, const u8* s, u8* d,
     }
 }
 
-void rsx_texture_decode(void* dst, u32 dst_pitch,
-                        const u8* src, u32 w, u32 h,
-                        const rsx_tex_layout* tl, int argb_as_rgba)
+static void texdec_ref(void* dst, u32 dst_pitch,
+                       const u8* src, u32 w, u32 h,
+                       const rsx_tex_layout* tl, int argb_as_rgba)
 {
-    if (!dst || !src || !tl || !w || !h) return;
-
     u8* d = (u8*)dst;
 
     if (tl->compressed) {
@@ -370,6 +370,306 @@ void rsx_texture_decode(void* dst, u32 dst_pitch,
             decode_texel(tl, s, drow + (size_t)x * dbpp, argb_as_rgba);
         }
     }
+}
+
+/* ---------------------------------------------------------------------------
+ * Resistance port (native hot path, RSX_NATIVE_TEXDEC, default 1): the decode
+ * above, rewritten around 4x4 texel blocks. A swizzled image with both sides
+ * >= 4 stores each 4x4 block as 16 consecutive texels (the low two bits of x
+ * and y are the low four bits of the Morton offset), so a block is one
+ * contiguous load, a fixed shuffle into rows and one SIMD conversion, instead
+ * of 16 table lookups and 16 per-texel format switches. The packed 16-bit
+ * colour formats go through a 64K-entry table built FROM decode_texel, so
+ * they are exact by construction; the others are bit moves (rotate, byte
+ * swaps, copies). The wrapper below checks this against texdec_ref on the
+ * first 64 decodes and on 1 in 512 after, and turns itself off for the rest
+ * of the run on any difference. DEPTH24_D8 (a float conversion) stays on the
+ * reference path.
+ * -------------------------------------------------------------------------*/
+#if defined(__SSE2__) || defined(_M_X64) || defined(_M_AMD64)
+#include <emmintrin.h>
+#define TEXNH_SSE2 1
+#else
+#define TEXNH_SSE2 0
+#endif
+
+enum { NHC_NONE = 0, NHC_COPY, NHC_ARGB, NHC_SWAP16, NHC_SWAP32, NHC_LUT16 };
+
+static int nh_class(const rsx_tex_layout* tl)
+{
+    const u32 sb = tl->bytes_per_texel, db = tl->dst_bytes_per_texel;
+    if (tl->compressed || !sb || !db) return NHC_NONE;
+    switch (tl->base_format) {
+    case 0x85: case 0x9E:
+        return (sb == 4 && db == 4) ? NHC_ARGB : NHC_NONE;
+    case 0x82: case 0x83: case 0x84: case 0x97: case 0x9D:
+        return (sb == 2 && db == 4) ? NHC_LUT16 : NHC_NONE;
+    case 0x90:
+        return NHC_NONE;
+    default: break;
+    }
+    if (sb != db) return NHC_NONE;
+    switch (tl->fmt) {
+    case RSX_TEXFMT_R16: case RSX_TEXFMT_R16G16: case RSX_TEXFMT_R16G16F:
+    case RSX_TEXFMT_R16G16B16A16F:
+        return NHC_SWAP16;
+    case RSX_TEXFMT_R32F: case RSX_TEXFMT_R32G32B32A32F:
+        return NHC_SWAP32;
+    default:
+        return NHC_COPY;
+    }
+}
+
+#if TEXNH_SSE2
+/* The packed 16-bit formats: host texel for every guest half-word. */
+static u32* volatile s_nh_lut[5];
+static int nh_lut_index(u32 bf)
+{
+    switch (bf) { case 0x82: return 0; case 0x83: return 1; case 0x84: return 2;
+                  case 0x97: return 3; case 0x9D: return 4; default: return -1; }
+}
+static const u32* nh_lut(const rsx_tex_layout* tl)
+{
+    const int li = nh_lut_index(tl->base_format);
+    if (li < 0) return NULL;
+    u32* t = s_nh_lut[li];
+    if (t) return t;
+    t = (u32*)malloc(65536u * sizeof(u32));
+    if (!t) return NULL;
+    for (u32 v = 0; v < 65536u; v++) {
+        const u8 s[2] = { (u8)(v >> 8), (u8)v };
+        u8 o[4];
+        decode_texel(tl, s, o, 0);
+        memcpy(&t[v], o, 4);
+    }
+#if defined(_MSC_VER) && !defined(__clang__)
+    {   void* prev = _InterlockedCompareExchangePointer((void* volatile*)&s_nh_lut[li], t, NULL);
+        if (prev) { free(t); t = (u32*)prev; } }
+#else
+    {   u32* expect = NULL;
+        if (!__atomic_compare_exchange_n(&s_nh_lut[li], &expect, t, 0,
+                                         __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) { free(t); t = expect; } }
+#endif
+    return t;
+}
+
+/* n contiguous source texels -> n contiguous host texels. */
+static void nh_conv(int cls, const u8* s, u8* d, u32 n, u32 sbpp,
+                    __m128i amask, int rot, const u32* lut)
+{
+    u32 i = 0;
+    switch (cls) {
+    case NHC_COPY:
+        memcpy(d, s, (size_t)n * sbpp);
+        return;
+    case NHC_ARGB:
+        for (; i + 4 <= n; i += 4) {
+            __m128i v = _mm_loadu_si128((const __m128i*)(s + (size_t)i * 4u));
+            if (rot) v = _mm_or_si128(_mm_srli_epi32(v, 8), _mm_slli_epi32(v, 24));
+            _mm_storeu_si128((__m128i*)(d + (size_t)i * 4u), _mm_or_si128(v, amask));
+        }
+        for (; i < n; i++) {
+            u32 v; memcpy(&v, s + (size_t)i * 4u, 4);
+            if (rot) v = (v >> 8) | (v << 24);
+            v |= (u32)_mm_cvtsi128_si32(amask);
+            memcpy(d + (size_t)i * 4u, &v, 4);
+        }
+        return;
+    case NHC_SWAP16:
+    case NHC_SWAP32: {
+        const size_t nb = (size_t)n * sbpp;
+        size_t b = 0;
+        for (; b + 16 <= nb; b += 16) {
+            __m128i v = _mm_loadu_si128((const __m128i*)(s + b));
+            v = _mm_or_si128(_mm_slli_epi16(v, 8), _mm_srli_epi16(v, 8));
+            if (cls == NHC_SWAP32)
+                v = _mm_shufflehi_epi16(_mm_shufflelo_epi16(v, 0xB1), 0xB1);
+            _mm_storeu_si128((__m128i*)(d + b), v);
+        }
+        if (cls == NHC_SWAP16)
+            for (; b + 2 <= nb; b += 2) { d[b] = s[b + 1]; d[b + 1] = s[b]; }
+        else
+            for (; b + 4 <= nb; b += 4) { d[b] = s[b + 3]; d[b + 1] = s[b + 2];
+                                          d[b + 2] = s[b + 1]; d[b + 3] = s[b]; }
+        return;
+    }
+    case NHC_LUT16:
+        for (; i < n; i++) {
+            const u32 v = lut[((u32)s[(size_t)i * 2u] << 8) | s[(size_t)i * 2u + 1u]];
+            memcpy(d + (size_t)i * 4u, &v, 4);
+        }
+        return;
+    default:
+        return;
+    }
+}
+#endif /* TEXNH_SSE2 */
+
+/* Returns 1 when it decoded the image, 0 (nothing written) when the layout is
+ * one it leaves to the reference path. */
+int rsx_texture_decode_native(void* dst, u32 dst_pitch,
+                              const u8* src, u32 w, u32 h,
+                              const rsx_tex_layout* tl, int argb_as_rgba)
+{
+#if TEXNH_SSE2
+    if (!dst || !src || !tl || !w || !h) return 0;
+    const int cls = nh_class(tl);
+    if (cls == NHC_NONE) return 0;
+    const u32 sbpp = tl->bytes_per_texel, dbpp = tl->dst_bytes_per_texel;
+    const int swz = tl->swizzled;
+    if (!swz && (cls == NHC_COPY || cls == NHC_ARGB))
+        return 0;   /* the reference's row memcpy / vectorised rotate already */
+    if (swz && (w < 4u || h < 4u || w > 4096u || h > 4096u)) return 0;
+    const u32* lut = NULL;
+    if (cls == NHC_LUT16 && !(lut = nh_lut(tl))) return 0;
+    const __m128i amask = _mm_set1_epi32(tl->base_format == 0x9Eu ? (int)0xFF000000u : 0);
+    const int rot = !argb_as_rgba;
+    u8* d = (u8*)dst;
+
+    if (!swz) {
+        for (u32 y = 0; y < h; y++)
+            nh_conv(cls, src + (size_t)y * tl->row_bytes, d + (size_t)y * dst_pitch,
+                    w, sbpp, amask, rot, lut);
+        return 1;
+    }
+
+    const u32 l2w = rsx_log2_ceil(w), l2h = rsx_log2_ceil(h);
+    static _Thread_local u32 txb[1024], tyb[1024];
+    const u32 bw = w >> 2, bh = h >> 2;
+    for (u32 bx = 0; bx < bw; bx++) txb[bx] = rsx_swizzle_offset(bx << 2, 0, l2w, l2h);
+    for (u32 by = 0; by < bh; by++) tyb[by] = rsx_swizzle_offset(0, by << 2, l2w, l2h);
+
+    /* Each 4-row strip is built in a cached scratch buffer and then copied out
+     * row by row. The destination is the D3D12 upload ring, which is
+     * write-combined: storing 16 bytes into four rows at a time there split
+     * every combining buffer and ran slower than the per-texel loop it
+     * replaces (scratch\nativehot bench), while sequential rows run at full
+     * write-combining speed. */
+    const size_t srow = (size_t)w * (sbpp > dbpp ? sbpp : dbpp);
+    static _Thread_local u8* s_strip = NULL;
+    static _Thread_local size_t s_strip_cap = 0;
+    if (s_strip_cap < 4u * srow) {
+        u8* nb = (u8*)realloc(s_strip, 4u * srow);
+        if (!nb) return 0;
+        s_strip = nb; s_strip_cap = 4u * srow;
+    }
+    u8* const st = s_strip;
+
+    if (cls == NHC_ARGB) {
+        for (u32 by = 0; by < bh; by++) {
+            u8* r0 = st;
+            u8* r1 = r0 + srow; u8* r2 = r1 + srow; u8* r3 = r2 + srow;
+            const u32 yo = tyb[by];
+            for (u32 bx = 0; bx < bw; bx++) {
+                const u8* b = src + (size_t)(txb[bx] | yo) * 4u;
+                const __m128i q0 = _mm_loadu_si128((const __m128i*)(b));
+                const __m128i q1 = _mm_loadu_si128((const __m128i*)(b + 16));
+                const __m128i q2 = _mm_loadu_si128((const __m128i*)(b + 32));
+                const __m128i q3 = _mm_loadu_si128((const __m128i*)(b + 48));
+                __m128i v0 = _mm_unpacklo_epi64(q0, q1), v1 = _mm_unpackhi_epi64(q0, q1);
+                __m128i v2 = _mm_unpacklo_epi64(q2, q3), v3 = _mm_unpackhi_epi64(q2, q3);
+                if (rot) {
+                    v0 = _mm_or_si128(_mm_srli_epi32(v0, 8), _mm_slli_epi32(v0, 24));
+                    v1 = _mm_or_si128(_mm_srli_epi32(v1, 8), _mm_slli_epi32(v1, 24));
+                    v2 = _mm_or_si128(_mm_srli_epi32(v2, 8), _mm_slli_epi32(v2, 24));
+                    v3 = _mm_or_si128(_mm_srli_epi32(v3, 8), _mm_slli_epi32(v3, 24));
+                }
+                const size_t xo = (size_t)bx * 16u;
+                _mm_storeu_si128((__m128i*)(r0 + xo), _mm_or_si128(v0, amask));
+                _mm_storeu_si128((__m128i*)(r1 + xo), _mm_or_si128(v1, amask));
+                _mm_storeu_si128((__m128i*)(r2 + xo), _mm_or_si128(v2, amask));
+                _mm_storeu_si128((__m128i*)(r3 + xo), _mm_or_si128(v3, amask));
+            }
+            u8* out = d + (size_t)(by << 2) * dst_pitch;
+            for (u32 r = 0; r < 4; r++)
+                memcpy(out + (size_t)r * dst_pitch, st + (size_t)r * srow, (size_t)w * 4u);
+        }
+        return 1;
+    }
+
+    /* Any other format: gather each block's 16 texels into row-major order in
+     * the strip (Morton pair k holds texels 2k, 2k+1; row r is pairs P and P+2
+     * with P = (r & 1) + 4 * (r >> 1)), then convert the strip's four rows
+     * straight into the destination. */
+    const u32 pair = 2u * sbpp;
+    for (u32 by = 0; by < bh; by++) {
+        const u32 yo = tyb[by];
+        for (u32 bx = 0; bx < bw; bx++) {
+            const u8* b = src + (size_t)(txb[bx] | yo) * sbpp;
+            u8* o = st + (size_t)bx * 2u * pair;
+            for (u32 r = 0; r < 4; r++) {
+                const u32 p = (r & 1u) + 4u * (r >> 1);
+                memcpy(o + (size_t)r * srow,        b + (size_t)p * pair,        pair);
+                memcpy(o + (size_t)r * srow + pair, b + (size_t)(p + 2u) * pair, pair);
+            }
+        }
+        u8* out = d + (size_t)(by << 2) * dst_pitch;
+        for (u32 r = 0; r < 4; r++)
+            nh_conv(cls, st + (size_t)r * srow, out + (size_t)r * dst_pitch, w, sbpp, amask, rot, lut);
+    }
+    return 1;
+#else
+    (void)dst; (void)dst_pitch; (void)src; (void)w; (void)h; (void)tl; (void)argb_as_rgba;
+    return 0;
+#endif
+}
+
+void rsx_texture_decode_reference(void* dst, u32 dst_pitch,
+                                  const u8* src, u32 w, u32 h,
+                                  const rsx_tex_layout* tl, int argb_as_rgba)
+{
+    if (!dst || !src || !tl || !w || !h) return;
+    texdec_ref(dst, dst_pitch, src, w, h, tl, argb_as_rgba);
+}
+
+static volatile int s_nh_texdec = -1;   /* RSX_NATIVE_TEXDEC; 0 after a mismatch */
+static volatile unsigned s_nh_texdec_n;
+
+void rsx_texture_decode(void* dst, u32 dst_pitch,
+                        const u8* src, u32 w, u32 h,
+                        const rsx_tex_layout* tl, int argb_as_rgba)
+{
+    if (!dst || !src || !tl || !w || !h) return;
+
+    if (s_nh_texdec < 0) { const char* e = getenv("RSX_NATIVE_TEXDEC"); s_nh_texdec = port_native_parse_bool(e, 1); }
+    if (s_nh_texdec > 0 && TEXNH_SSE2 && !tl->compressed && nh_class(tl) != NHC_NONE) {
+        const unsigned n = s_nh_texdec_n++;
+        const int verify = n < 64u || (n & 511u) == 0u;
+        const size_t vsz = (size_t)w * h * tl->dst_bytes_per_texel;
+        static volatile int logged = 0;
+        if (verify && vsz > (16u << 20)) {
+            /* too big to check by copy: this one goes the reference way */
+        } else if (!verify) {
+            if (rsx_texture_decode_native(dst, dst_pitch, src, w, h, tl, argb_as_rgba)) return;
+        } else {
+            const size_t row = (size_t)w * tl->dst_bytes_per_texel, sz = row * h;
+            u8* a = (u8*)malloc(sz);
+            u8* b = (u8*)malloc(sz);
+            int done = 0;
+            if (a && b && rsx_texture_decode_native(a, (u32)row, src, w, h, tl, argb_as_rgba)) {
+                texdec_ref(b, (u32)row, src, w, h, tl, argb_as_rgba);
+                const int same = memcmp(a, b, sz) == 0;
+                if (!same) {
+                    s_nh_texdec = 0;
+                    fprintf(stderr, "[native-hot] texdec: MISMATCH against the reference decode"
+                                    " (fmt 0x%02X %ux%u swz=%d) -- native decode off for this run%c",
+                            tl->base_format, w, h, tl->swizzled, 10);
+                } else if (!logged) {
+                    logged = 1;
+                    fprintf(stderr, "[native-hot] texdec: SSE2 4x4-block untile/convert engaged"
+                                    " (verified on the first 64 decodes, 1 in 512 after;"
+                                    " RSX_NATIVE_TEXDEC=0 = reference)%c", 10);
+                }
+                const u8* res = same ? a : b;
+                for (u32 y = 0; y < h; y++)
+                    memcpy((u8*)dst + (size_t)y * dst_pitch, res + (size_t)y * row, row);
+                done = 1;
+            }
+            free(a); free(b);
+            if (done) return;
+        }
+    }
+    texdec_ref(dst, dst_pitch, src, w, h, tl, argb_as_rgba);
 }
 
 void rsx_texture_component_remap(u32 control1, u32 rsx_fmt, u8 out[4])
@@ -483,4 +783,83 @@ u8 rsx_texture_expand_mask(u32 format, u32 control1, u32 filter, u32 address)
     /* Bit 4: 16-bit channels (X16, Y16_X16) re-centre on 32768/32767. */
     if (mask && ((format & 0x9Fu) == 0x94u || (format & 0x9Fu) == 0x95u)) mask |= 0x10u;
     return mask;
+}
+
+/* --- BC1/2/3 to RGBA8 ----------------------------------------------------- */
+
+static void bc_color_block(const u8* b, int four_colour, u8 out[16][4])
+{
+    const u32 c0 = (u32)b[0] | ((u32)b[1] << 8), c1 = (u32)b[2] | ((u32)b[3] << 8);
+    const u32 idx = (u32)b[4] | ((u32)b[5] << 8) | ((u32)b[6] << 16) | ((u32)b[7] << 24);
+    u8 pal[4][4];
+    for (int i = 0; i < 2; i++) {
+        const u32 c = i ? c1 : c0;
+        const u32 r = (c >> 11) & 31u, g = (c >> 5) & 63u, bl = c & 31u;
+        pal[i][0] = (u8)((r << 3) | (r >> 2));
+        pal[i][1] = (u8)((g << 2) | (g >> 4));
+        pal[i][2] = (u8)((bl << 3) | (bl >> 2));
+        pal[i][3] = 255;
+    }
+    if (four_colour || c0 > c1) {
+        for (int k = 0; k < 3; k++) {
+            pal[2][k] = (u8)((2u * pal[0][k] + pal[1][k] + 1u) / 3u);
+            pal[3][k] = (u8)((pal[0][k] + 2u * pal[1][k] + 1u) / 3u);
+        }
+        pal[2][3] = pal[3][3] = 255;
+    } else {
+        for (int k = 0; k < 3; k++) pal[2][k] = (u8)((pal[0][k] + pal[1][k] + 1u) / 2u);
+        pal[2][3] = 255;
+        pal[3][0] = pal[3][1] = pal[3][2] = pal[3][3] = 0;   /* BC1 punch-through */
+    }
+    for (int i = 0; i < 16; i++) memcpy(out[i], pal[(idx >> (2 * i)) & 3u], 4);
+}
+
+int rsx_texture_bc_to_rgba8(void* dst, u32 dst_pitch, const u8* src,
+                            u32 w, u32 h, const rsx_tex_layout* tl)
+{
+    if (!dst || !src || !tl || !w || !h || !tl->compressed) return 0;
+    const u32 bw = (w + 3u) / 4u, bh = (h + 3u) / 4u;
+    if (dst_pitch < w * 4u || tl->row_bytes < bw * tl->block_bytes || tl->rows < bh) return 0;
+    u8* d = (u8*)dst;
+    for (u32 by = 0; by < bh; by++) {
+        const u8* row = src + (size_t)by * tl->row_bytes;
+        for (u32 bx = 0; bx < bw; bx++) {
+            const u8* b = row + (size_t)bx * tl->block_bytes;
+            u8 px[16][4];
+            if (tl->fmt == RSX_TEXFMT_BC1) {
+                bc_color_block(b, 0, px);
+            } else {
+                bc_color_block(b + 8, 1, px);   /* BC2/BC3 colour is always the 4-colour mode */
+                if (tl->fmt == RSX_TEXFMT_BC2) {
+                    for (int i = 0; i < 16; i++) {
+                        const u32 a = (b[i >> 1] >> ((i & 1) * 4)) & 15u;
+                        px[i][3] = (u8)(a * 17u);
+                    }
+                } else {
+                    const u32 a0 = b[0], a1 = b[1];
+                    u8 ap[8];
+                    ap[0] = (u8)a0; ap[1] = (u8)a1;
+                    if (a0 > a1) {
+                        for (u32 k = 1; k < 7; k++) ap[k + 1] = (u8)(((7u - k) * a0 + k * a1 + 3u) / 7u);
+                    } else {
+                        for (u32 k = 1; k < 5; k++) ap[k + 1] = (u8)(((5u - k) * a0 + k * a1 + 2u) / 5u);
+                        ap[6] = 0; ap[7] = 255;
+                    }
+                    u64 bits = 0;
+                    for (int k = 0; k < 6; k++) bits |= (u64)b[2 + k] << (8 * k);
+                    for (int i = 0; i < 16; i++) px[i][3] = ap[(bits >> (3 * i)) & 7u];
+                }
+            }
+            for (u32 y = 0; y < 4; y++) {
+                const u32 ty = by * 4u + y;
+                if (ty >= h) break;
+                for (u32 x = 0; x < 4; x++) {
+                    const u32 tx = bx * 4u + x;
+                    if (tx >= w) break;
+                    memcpy(d + (size_t)ty * dst_pitch + (size_t)tx * 4u, px[y * 4u + x], 4);
+                }
+            }
+        }
+    }
+    return 1;
 }

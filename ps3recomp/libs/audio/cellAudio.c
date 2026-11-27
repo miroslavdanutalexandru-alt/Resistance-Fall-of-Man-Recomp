@@ -21,7 +21,36 @@
 #include <stdint.h>
 #include <math.h>
 #include "ps3emu/log_first.h"
+#include "ps3emu/port_pc_extras.h"   /* master volume / mono */
 #include "audio_out.h"
+#include "audio_adapt.h"
+#include "audio_elastic.h"
+#include "audio_decomb.h"
+
+/* PORT_AUDIO_LOG (or R2_RSX_PROF) set and not 0: the periodic audio statistics
+ * lines. Off by default. */
+static inline int audio_stats_log(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char* e = getenv("PORT_AUDIO_LOG"); const char* p = getenv("R2_RSX_PROF");
+        on = (e && *e) ? (atoi(e) != 0) : (p && *p && atoi(p)) ? 1 : 0;
+    }
+    return on;
+}
+
+/* accumulate an AudioOutStats window into another (the 5 s line and the 10 s underrun window) */
+static void ao_stats_merge(AudioOutStats* a, const AudioOutStats* b)
+{
+    if (!b->ticks) { a->underruns += b->underruns; a->silence_ms += b->silence_ms; a->overflow_frames += b->overflow_frames; return; }
+    if (!a->ticks || b->level_min_ms < a->level_min_ms) a->level_min_ms = b->level_min_ms;
+    if (!a->ticks || b->tempo_min < a->tempo_min) a->tempo_min = b->tempo_min;
+    const double n = (double)a->ticks + (double)b->ticks;
+    a->level_avg_ms = (a->level_avg_ms * a->ticks + b->level_avg_ms * b->ticks) / n;
+    a->tempo_avg = (a->tempo_avg * a->ticks + b->tempo_avg * b->ticks) / n;
+    a->ticks += b->ticks; a->stretch_ticks += b->stretch_ticks;
+    a->underruns += b->underruns; a->silence_ms += b->silence_ms; a->overflow_frames += b->overflow_frames;
+}
 
 /* Event-queue push/lookup (runtime/syscalls/sys_event.c). Forward-declared
  * rather than including sys_event.h to avoid pulling PPU context/syscall
@@ -158,6 +187,21 @@ static mutex_t       s_audio_mutex;
 /* Runtime mute, set by the window code (rsx_d3d12_backend.c) while the game
  * window is in the background with RSX_FOCUS_PAUSE on. */
 volatile long g_ps3_audio_mute_rt = 0;
+extern volatile int g_ps3_host_paused;   /* sys_ppu_thread.c: PC menu / focus pause */
+/* PC port: bump on focus regained (WM_ACTIVATEAPP) to restart the output stage, as in R2 / R3.
+ * R1's window procedure does not bump it yet: a focus pause (RSX_FOCUS_PAUSE) or the F10 menu
+ * restarts it through the long-hold path below instead. */
+volatile long g_port_audio_focus_gen = 0;
+/* PC port: master volume in percent (-1 = not read yet) and mono downmix (see audio_mix_one_block) */
+static volatile int g_port_volume_pct = -1, g_port_audio_mono = 0;
+void cellaudio_set_pc_mix(int volume_pct, int mono)
+{
+    if (g_port_volume_pct < 0 && volume_pct < 0) {   /* mono alone: read the start-up volume first (the mixer would overwrite mono) */
+        g_port_volume_pct = pcx_parse_pct(getenv("PORT_VOLUME"), 100, 0, 100);
+    }
+    if (volume_pct >= 0) g_port_volume_pct = volume_pct > 100 ? 100 : volume_pct;
+    if (mono >= 0) g_port_audio_mono = mono != 0;
+}
 
 /* Output mix buffer (stereo, one block worth) */
 static float s_mix_buffer[CELL_AUDIO_BLOCK_SAMPLES * 2];
@@ -166,6 +210,47 @@ static float s_mix_buffer[CELL_AUDIO_BLOCK_SAMPLES * 2];
  * sentinel)? The SoundTouch stage's late-block wait only waits for a port
  * that was producing. */
 static unsigned char s_port_written[CELL_AUDIO_PORT_MAX];
+
+/* PORT_AUDIO_ELASTIC (default 0; audio_elastic.h, after the GoW Ascension recomp): a late block of a port
+ * that is feeding sound is waited for while the host buffer holds 90% of the target, then concealed
+ * without consuming it; the debt is repaid on silence. Replaces the late-block wait.
+ * PORT_AUDIO_ELASTIC_CAP_MS (150): give up on a port after that long; PORT_AUDIO_ELASTIC_DEBT (8). */
+static int          s_el_on = -1;
+static AudioElastic s_el;
+static AudioElPort  s_el_port[CELL_AUDIO_PORT_MAX];
+static int audio_elastic_on(void)
+{
+    if (s_el_on < 0) {
+        const char* e = getenv("PORT_AUDIO_ELASTIC");
+        int on = e && *e && *e != '0';
+        const char* s = getenv("AUDIO_SENTINEL");
+        if (on && s && atoi(s) == 0) {
+            fprintf(stderr, "[audio] PORT_AUDIO_ELASTIC needs AUDIO_SENTINEL=1: elastic off%c", 10);
+            on = 0;
+        }
+        e = getenv("PORT_AUDIO_ELASTIC_CAP_MS"); int cap = (e && *e) ? atoi(e) : 150;
+        if (cap < 20) cap = 20; if (cap > 1000) cap = 1000;
+        e = getenv("PORT_AUDIO_ELASTIC_DEBT"); int debt = (e && *e) ? atoi(e) : 8;
+        if (debt < 0) debt = 0; if (debt > 64) debt = 64;
+        audio_el_init(&s_el, (double)cap, (unsigned)debt);
+        s_el_on = on;
+    }
+    return s_el_on;
+}
+
+/* Publish a port's ring slot to the guest after read_index advanced. SurMixer multiplies this value by the
+ * block size directly; an unbounded counter walks beyond the audio buffer.
+ * Resistance port: AUDIO_LEAD (default 0; v119b: 3 made it worse): the index the guest sees runs that many
+ * blocks AHEAD of the block this mixer reads. */
+static void audio_publish_read_index(AudioPortSlot* port, u32 nblock)
+{
+    if (!port->read_idx_addr) return;
+    static int lead = -1;
+    if (lead < 0) { const char* e = getenv("AUDIO_LEAD"); lead = e ? atoi(e) : 0;
+                    if (lead < 0) lead = 0; }
+    u32 l = (u32)lead; if (l > nblock - 2) l = nblock > 2 ? nblock - 2 : 0;
+    vm_write64((u32)port->read_idx_addr, (port->read_index + l) % nblock);
+}
 
 /* Logical CPUs on the host (all processor groups). */
 static int audio_host_cpus(void)
@@ -275,6 +360,10 @@ static u32 audio_backend_queued_samples(void)
     return 0;
 }
 
+/* PORT_AUDIO_REOPEN: device loss is a WASAPI-only path */
+static long audio_backend_health(void) { return 0; }
+static int audio_backend_reopen(void) { return -1; }
+
 #endif /* AUDIO_BACKEND_SDL2 */
 
 #if AUDIO_BACKEND_WASAPI
@@ -284,6 +373,9 @@ static IAudioRenderClient*  s_wasapi_render = NULL;
 static HANDLE               s_wasapi_event  = NULL;
 static UINT32               s_wasapi_buf_frames = 0;
 static long long            s_wasapi_period_100ns = 0;   /* engine period */
+/* PORT_AUDIO_REOPEN: set while audio_backend_reopen retries, so a missing
+ * device does not print the init failure lines once per attempt. */
+static int                  s_wasapi_quiet = 0;
 
 static int audio_backend_init(void)
 {
@@ -291,7 +383,7 @@ static int audio_backend_init(void)
 
     hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
     if (FAILED(hr) && hr != S_FALSE && hr != RPC_E_CHANGED_MODE) {
-        printf("[cellAudio] CoInitializeEx failed: 0x%08lX\n", hr);
+        if (!s_wasapi_quiet) printf("[cellAudio] CoInitializeEx failed: 0x%08lX\n", hr);
         return -1;
     }
 
@@ -299,7 +391,7 @@ static int audio_backend_init(void)
     hr = CoCreateInstance(&CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL,
                           &IID_IMMDeviceEnumerator, (void**)&enumerator);
     if (FAILED(hr)) {
-        printf("[cellAudio] Failed to create device enumerator: 0x%08lX\n", hr);
+        if (!s_wasapi_quiet) printf("[cellAudio] Failed to create device enumerator: 0x%08lX\n", hr);
         return -1;
     }
 
@@ -308,7 +400,7 @@ static int audio_backend_init(void)
                                                       eConsole, &device);
     enumerator->lpVtbl->Release(enumerator);
     if (FAILED(hr)) {
-        printf("[cellAudio] Failed to get default audio endpoint: 0x%08lX\n", hr);
+        if (!s_wasapi_quiet) printf("[cellAudio] Failed to get default audio endpoint: 0x%08lX\n", hr);
         return -1;
     }
 
@@ -316,7 +408,7 @@ static int audio_backend_init(void)
                                    NULL, (void**)&s_wasapi_client);
     device->lpVtbl->Release(device);
     if (FAILED(hr)) {
-        printf("[cellAudio] Failed to activate audio client: 0x%08lX\n", hr);
+        if (!s_wasapi_quiet) printf("[cellAudio] Failed to activate audio client: 0x%08lX\n", hr);
         return -1;
     }
 
@@ -360,7 +452,7 @@ static int audio_backend_init(void)
             AUDCLNT_SHAREMODE_SHARED,
             convert, buf_duration, 0, &wfx, NULL);
         if (FAILED(hr)) {
-            printf("[cellAudio] WASAPI Initialize failed: 0x%08lX\n", hr);
+            if (!s_wasapi_quiet) printf("[cellAudio] WASAPI Initialize failed: 0x%08lX\n", hr);
             s_wasapi_client->lpVtbl->Release(s_wasapi_client);
             s_wasapi_client = NULL;
             CloseHandle(s_wasapi_event);
@@ -380,7 +472,7 @@ static int audio_backend_init(void)
     hr = s_wasapi_client->lpVtbl->GetService(
         s_wasapi_client, &IID_IAudioRenderClient, (void**)&s_wasapi_render);
     if (FAILED(hr)) {
-        printf("[cellAudio] Failed to get render client: 0x%08lX\n", hr);
+        if (!s_wasapi_quiet) printf("[cellAudio] Failed to get render client: 0x%08lX\n", hr);
         s_wasapi_client->lpVtbl->Release(s_wasapi_client);
         s_wasapi_client = NULL;
         return -1;
@@ -471,6 +563,27 @@ static u32 audio_backend_queued_samples(void)
     return padding;
 }
 
+/* PORT_AUDIO_REOPEN (ported from R2): 0 while the open device works, else the
+ * error it gives (AUDCLNT_E_DEVICE_INVALIDATED 0x88890004: default device
+ * changed, headset unplugged, HDMI display off, driver reset). */
+static long audio_backend_health(void)
+{
+    if (!s_wasapi_client) return 0;
+    UINT32 padding = 0;
+    const HRESULT hr = s_wasapi_client->lpVtbl->GetCurrentPadding(s_wasapi_client, &padding);
+    return FAILED(hr) ? (long)hr : 0;
+}
+
+/* Close the dead client and open the current default device. 0 = open. */
+static int audio_backend_reopen(void)
+{
+    audio_backend_shutdown();
+    s_wasapi_quiet = 1;
+    const int r = audio_backend_init();
+    s_wasapi_quiet = 0;
+    return r;
+}
+
 
 #endif /* AUDIO_BACKEND_WASAPI */
 
@@ -498,7 +611,8 @@ static int g_audio_held_tick = 0;      /* a port waited this tick: no guest noti
 /* Resistance port (v138): which speaker layout the game is mixing for. Every
  * 10 s of port-0 audio: each channel's share of the energy, and "surround"
  * when the centre/LFE/surround channels carry sound, "STEREO" when only L/R
- * do (the broken-positions state, which a launch picks at random). */
+ * do (the broken-positions state, which a launch picks at random).
+ * PORT_AUDIO_LOG=1 only. */
 extern void rfom_snd_mode(int surround, double c_pct, double nan_pct);   /* project/stubs.cpp (v144) */
 static void audio_mode_monitor(const float* src, u32 nch)
 {
@@ -660,7 +774,7 @@ static void audio_mix_one_block(void)
          * logs/audiorec_N.wav, 48 kHz 32-bit float, 8 channels
          * (L R C LFE Ls Rs Lb Rb). For diagnosing wrong 3D sound positions:
          * which output channels a sound lands in. */
-        if (p == 0) { audio_rec_block(src, nch); audio_mode_monitor(src, nch); }
+        if (p == 0) { audio_rec_block(src, nch); if (audio_stats_log()) audio_mode_monitor(src, nch); }
         /* v123: AUDIO_PORTWAV1=<file> -- the same for port 1 (libmixer: movies). */
         { static FILE* _pf1 = (FILE*)-1;
           if (_pf1 == (FILE*)-1) { const char* e = getenv("AUDIO_PORTWAV1"); _pf1 = e ? fopen(e, "wb") : NULL; }
@@ -730,7 +844,7 @@ static void audio_mix_one_block(void)
 #ifdef _WIN32
           { static ULONGLONG t0; ULONGLONG now = GetTickCount64(); if (!t0) t0 = now;
             if (now - t0 >= 5000) {
-                if (gaps || holds || g_audio_limited)
+                if ((gaps || holds || g_audio_limited) && audio_stats_log())
                     fprintf(stderr, "[audio] 5 s: %u underrun gap(s), %u hold(s), %u limited, %u blocks%c",
                             gaps, holds, g_audio_limited, blocks, 10);
                 gaps = holds = blocks = 0; g_audio_limited = 0; t0 = now;
@@ -762,14 +876,65 @@ static void audio_mix_one_block(void)
          * fold. v123 dumps: libmixer's port-1 output is the decoded AC3 x 0.42,
          * sample-exact on L/R/C/Ls/Rs, but its LFE channel carries the LFE at
          * 12x for the first 43 samples of EVERY 256-sample block -- a
-         * 187.5 Hz rasp under every bass line (the movie "static"). The bug is
-         * in the game's lifted channel-strip code; dropping LFE is also what a
-         * standard Dolby stereo downmix does. AUDIO_P1_LFE=<gain> (0.5 = old). */
+         * 187.5 Hz rasp under every bass line (the movie "static"). That is
+         * the title's own movie-audio callback (func_005FA060 scales sample
+         * i+5 by 12.0 for i < 256 in steps of nch -- the PS3 does the same),
+         * not a lift bug; dropping LFE is also what a standard Dolby stereo
+         * downmix does. AUDIO_P1_LFE=<gain> (0.5 = old). */
         float lfe_gain = 0.5f;
         if (p == 1) { static float g1 = -1.0f;
                       if (g1 < 0.0f) { const char* e = getenv("AUDIO_P1_LFE"); g1 = e ? (float)atof(e) : 0.0f; }
                       lfe_gain = g1; }
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#endif
+        /* AUDIO_P1_BACK=<gain> / AUDIO_P1_FOLD=dolby (opt-in diagnostics for the
+         * movie "reverb" report): port 1's back pair (6/7) and side pair (4/5)
+         * fold gains. Default 0.3 / 0.5 = unchanged. dolby = 0.707 sides, 0 backs. */
+        float side_gain = 0.5f, back_gain = 0.3f;
+        if (p == 1) { static float s1 = -1.0f, b1 = -1.0f;
+                      if (s1 < 0.0f) { const char* f = getenv("AUDIO_P1_FOLD"); const char* b = getenv("AUDIO_P1_BACK");
+                                       const int dolby = f && !_stricmp(f, "dolby");
+                                       const float bv = b ? (float)atof(b) : (dolby ? 0.0f : 0.3f);
+                                       b1 = bv < 0.0f ? 0.0f : bv;
+                                       s1 = dolby ? 0.707f : 0.5f; }
+                      side_gain = s1; back_gain = b1; }
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
+        /* Resistance port (R1 #10, "tin can" movie audio): libmixer's TYPE2A
+         * strip puts a 222-frame delayed copy of 2-ch movie audio on Ls/Rs;
+         * folded back into stereo that is a 216 Hz comb filter. When the side
+         * pair is detected to be the delayed fronts it is faded out of the
+         * fold (loudness compensated). See audio_decomb.h.
+         * AUDIO_P1_DECOMB=0 = old fold; AUDIO_P1_DECOMB_LAG=<frames>. */
+        float dc_w0 = 1.0f, dc_w1 = 1.0f, dc_g0 = 1.0f, dc_g1 = 1.0f;
+        if (p == 1 && nch == 8) {
+            static int dc_on = -1;
+            static AudioDecomb dc;
+            if (dc_on < 0) {
+                const char* e = getenv("AUDIO_P1_DECOMB");
+                const char* lg = getenv("AUDIO_P1_DECOMB_LAG");
+                dc_on = e ? atoi(e) != 0 : 1;
+                audio_decomb_init(&dc, lg ? (unsigned)atoi(lg) : AUDIO_DECOMB_DEFAULT_LAG);
+                fprintf(stderr, "[audio] port 1 de-comb %s (lag %u)%c", dc_on ? "on" : "off (AUDIO_P1_DECOMB=0)", dc.lag, 10);
+            }
+            if (dc_on) {
+                static float hf[CELL_AUDIO_BLOCK_SAMPLES * 8];
+                for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 8; i++) hf[i] = ld_be_f32(&src[i]);
+                const int ch = audio_decomb_block(&dc, hf, CELL_AUDIO_BLOCK_SAMPLES, 8, side_gain);
+                if (ch)
+                    fprintf(stderr, "[audio] port 1: side pair %s (delayed-front corr %.2f at lag %u)%s%c",
+                            ch > 0 ? "is a delayed front copy -- dropped from stereo fold" : "no longer a delayed copy (or silent ~1 s) -- folded",
+                            dc.corr, dc.best_lag, ch > 0 ? " [tin-can fix]" : "", 10);
+                dc_w0 = dc.w0; dc_w1 = dc.w1; dc_g0 = dc.g0; dc_g1 = dc.g1;
+            }
+        }
         for (u32 s = 0; s < CELL_AUDIO_BLOCK_SAMPLES; s++) {
+            const float dt = (float)s / (float)CELL_AUDIO_BLOCK_SAMPLES;
+            const float dc_w = dc_w0 + (dc_w1 - dc_w0) * dt;
+            const float dc_g = dc_g0 + (dc_g1 - dc_g0) * dt;
             float left, right;
             if (nch >= 2) {
                 left  = ld_be_f32(&src[s * nch + 0]) * level;
@@ -783,16 +948,16 @@ static void audio_mix_one_block(void)
             if (nch == 8) {
                 float center = ld_be_f32(&src[s * 8 + 2]) * level * 0.707f;
                 float lfe    = ld_be_f32(&src[s * 8 + 3]) * level * lfe_gain;
-                float rl     = ld_be_f32(&src[s * 8 + 4]) * level * 0.5f;
-                float rr     = ld_be_f32(&src[s * 8 + 5]) * level * 0.5f;
-                float sl     = ld_be_f32(&src[s * 8 + 6]) * level * 0.3f;
-                float sr     = ld_be_f32(&src[s * 8 + 7]) * level * 0.3f;
+                float rl     = ld_be_f32(&src[s * 8 + 4]) * level * side_gain * dc_w;
+                float rr     = ld_be_f32(&src[s * 8 + 5]) * level * side_gain * dc_w;
+                float sl     = ld_be_f32(&src[s * 8 + 6]) * level * back_gain;
+                float sr     = ld_be_f32(&src[s * 8 + 7]) * level * back_gain;
                 left  += center + lfe + rl + sl;
                 right += center + lfe + rr + sr;
             }
 
-            s_mix_buffer[s * 2 + 0] += left;
-            s_mix_buffer[s * 2 + 1] += right;
+            s_mix_buffer[s * 2 + 0] += left * dc_g;
+            s_mix_buffer[s * 2 + 1] += right * dc_g;
         }
 
         /* Firmware clears a ring-buffer block after consuming it. Besides
@@ -815,7 +980,7 @@ static void audio_mix_one_block(void)
               total++;
               ULONGLONG now = GetTickCount64(); if (!t0) t0 = now;
               if (now - t0 >= 5000) {
-                  fprintf(stderr, "[audio-sentinel] 5 s: %u blocks never written, %u written as silence, %u total%c",
+                  if (audio_stats_log()) fprintf(stderr, "[audio-sentinel] 5 s: %u blocks never written, %u written as silence, %u total%c",
                           unwritten, silent, total, 10);
                   unwritten = silent = total = 0; t0 = now;
               }
@@ -832,20 +997,11 @@ static void audio_mix_one_block(void)
          * size directly; an unbounded counter walks beyond the audio buffer. */
         port->read_index++;
         { extern uint64_t ps3_guest_system_time_us(void); port->ts_us = ps3_guest_system_time_us(); }
-        /* Resistance port: AUDIO_LEAD (default 3 blocks, 16 ms): the index the
-         * guest sees runs that many blocks AHEAD of the block this mixer reads.
-         * Fall of Man's libmixer writes the block AT the published index -- the
-         * one consumed 5.3 ms later -- so any wake-up later than one block left
-         * that block unwritten (AUDIO_SENTINEL: up to 27% of blocks "never
-         * written" in heavy scenes). The lead gives it 3 blocks of slack, the
-         * cost is 16 ms more latency. 0 = old behaviour. */
-        if (port->read_idx_addr) {
-            static int lead = -1;
-            if (lead < 0) { const char* e = getenv("AUDIO_LEAD"); lead = e ? atoi(e) : 0;   /* v119b: 3 made it worse */
-                            if (lead < 0) lead = 0; }
-            u32 l = (u32)lead; if (l > nblock - 2) l = nblock > 2 ? nblock - 2 : 0;
-            vm_write64((u32)port->read_idx_addr, (port->read_index + l) % nblock);
-        }
+        /* AUDIO_LEAD (audio_publish_read_index): Fall of Man's libmixer writes the block AT the published
+         * index -- the one consumed 5.3 ms later -- so any wake-up later than one block left that block
+         * unwritten (AUDIO_SENTINEL: up to 27% of blocks "never written" in heavy scenes). A lead gives it
+         * slack at the cost of latency. 0 = old behaviour. */
+        audio_publish_read_index(port, nblock);
     }
 
     mutex_unlock(&s_audio_mutex);
@@ -878,6 +1034,15 @@ static void audio_mix_one_block(void)
           }
           g = target;
       } }
+    /* PC port: master volume (PORT_VOLUME=0..100, default 100) and mono downmix (PORT_AUDIO_MONO=1),
+     * ps3emu/port_pc_extras.h; the F9 menu changes them live (cellaudio_set_pc_mix). */
+    if (g_port_volume_pct < 0) {
+        g_port_volume_pct = pcx_parse_pct(getenv("PORT_VOLUME"), 100, 0, 100);
+        const char* e = getenv("PORT_AUDIO_MONO"); g_port_audio_mono = e && *e && *e != '0';
+        if (g_port_volume_pct != 100 || g_port_audio_mono)
+            fprintf(stderr, "[audio] master volume %d%%%s%c", g_port_volume_pct, g_port_audio_mono ? ", mono" : "", 10);
+    }
+    pcx_audio_apply(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES, g_port_volume_pct / 100.0f, g_port_audio_mono);
     /* Clip to [-1.0, 1.0] */
     for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++) {
         if (s_mix_buffer[i] > 1.0f) s_mix_buffer[i] = 1.0f;
@@ -927,6 +1092,92 @@ static int audio_pending_ports(void)
     return np;
 }
 
+/* PORT_AUDIO_ELASTIC (audio_elastic.h). */
+static double audio_el_now_ms(void)
+{
+    LARGE_INTEGER q, f; QueryPerformanceCounter(&q); QueryPerformanceFrequency(&f);
+    return (double)q.QuadPart * 1000.0 / (double)f.QuadPart;
+}
+
+static int audio_el_port_ok(const AudioPortSlot* port)
+{
+    if (!port->in_use || !port->running || !port->buffer) return 0;
+    const u32 nch = (u32)port->param.nChannel, nblock = (u32)port->param.nBlock;
+    return nch >= 1 && nch <= 8 && nblock >= 2 && nblock <= 32;
+}
+
+/* 1 = a port that is feeding sound has no block at its cursor yet (the caller waits while the host buffer
+ * holds the floor, else conceals). */
+static int audio_el_gate(void)
+{
+    const double now = audio_el_now_ms();
+    int late = 0;
+    mutex_lock(&s_audio_mutex);
+    for (int p = 0; p < CELL_AUDIO_PORT_MAX; p++) {
+        AudioPortSlot* port = &s_ports[p];
+        AudioElPort* e = &s_el_port[p];
+        if (!audio_el_port_ok(port)) { e->wait_t0 = 0.0; continue; }
+        const u32 nch = (u32)port->param.nChannel, nblock = (u32)port->param.nBlock;
+        if (port->read_index < nblock) continue;   /* first lap: PortOpen's zeros */
+        const u32 nw = CELL_AUDIO_BLOCK_SAMPLES * nch, bi = (u32)(port->read_index % nblock);
+        const uint32_t* base = (const uint32_t*)port->buffer;
+        const int st = audio_el_block_state(base + bi * nw, nw, nch);
+        int ahead = 0;
+        if (st == 0 && audio_el_active(e, now))
+            for (u32 k = 1; k < nblock && !ahead; k++) ahead = audio_el_block_written(base + ((bi + k) % nblock) * nw, nw);
+        const unsigned gu = s_el.giveup, owed = s_el.debt;
+        if (audio_el_port_gate(&s_el, e, st, ahead, port->read_index, now)) late = 1;
+        else if (s_el.giveup != gu) {
+            static int n = 0;
+            if (n < 50) { n++;
+                fprintf(stderr, "[audio] port %d: no block for %.0f ms: elastic gives up, port quiet until the game "
+                        "writes again (%u block(s) owed, forgiven)%c", p, s_el.cap_ms, owed, 10); }
+        }
+    }
+    mutex_unlock(&s_audio_mutex);
+    return late;
+}
+
+/* Consume one block on every running port without playing it when that loses nothing (each is digital
+ * silence the game wrote, or the unwritten block of a port that is not feeding): repays one concealed
+ * block. 1 = consumed (the game is notified: a period passed for it). */
+static int audio_el_repay(void)
+{
+    const double now = audio_el_now_ms();
+    int any = 0, ok = 1;
+    mutex_lock(&s_audio_mutex);
+    for (int p = 0; p < CELL_AUDIO_PORT_MAX && ok; p++) {
+        AudioPortSlot* port = &s_ports[p];
+        if (!audio_el_port_ok(port)) continue;
+        const u32 nch = (u32)port->param.nChannel, nblock = (u32)port->param.nBlock;
+        if (port->read_index < nblock) { ok = 0; break; }
+        const u32 nw = CELL_AUDIO_BLOCK_SAMPLES * nch;
+        const uint32_t* w = (const uint32_t*)port->buffer + (u32)(port->read_index % nblock) * nw;
+        const int st = audio_el_block_state(w, nw, nch);
+        if (!audio_el_port_repayable(&s_el_port[p], st, st == 1 ? audio_el_block_nonzero(w, nw) : 0, now)) ok = 0;
+        any = 1;
+    }
+    if (ok && any) {
+        extern uint64_t ps3_guest_system_time_us(void);
+        const uint64_t ts = ps3_guest_system_time_us();
+        for (int p = 0; p < CELL_AUDIO_PORT_MAX; p++) {
+            AudioPortSlot* port = &s_ports[p];
+            if (!audio_el_port_ok(port)) continue;
+            const u32 nch = (u32)port->param.nChannel, nblock = (u32)port->param.nBlock;
+            const u32 nw = CELL_AUDIO_BLOCK_SAMPLES * nch, bi = (u32)(port->read_index % nblock);
+            uint32_t* w = (uint32_t*)port->buffer + bi * nw;
+            for (u32 i = 0; i < nw; i++) w[i] = AUDIO_EL_SENTINEL_BE;
+            port->read_index++;
+            port->ts_us = ts;
+            audio_publish_read_index(port, nblock);
+        }
+        audio_el_on_repaid(&s_el);
+    }
+    mutex_unlock(&s_audio_mutex);
+    if (ok && any) audio_notify_event_queues();
+    return ok && any;
+}
+
 /* Affinity of the mixer thread: off the cores main_core_keeper
  * (project/debugtools.inc) reserves for the main guest thread
  * (RFOM_MAIN_CPU, default 2) and the RSX FIFO thread (RFOM_FIFO_CPU,
@@ -972,11 +1223,16 @@ static void audio_thread_affinity(int def_on, char* desc, size_t dn)
         snprintf(desc, dn, "mask 0x%llX (off the main/FIFO cores)", (unsigned long long)mask);
 }
 
+/* Host thread id of the mixer (project/debugtools.inc: P-core placement). */
+static volatile unsigned long s_audio_mix_tid = 0;
+unsigned long cellAudio_mix_host_tid(void) { return s_audio_mix_tid; }
+
 typedef HANDLE (WINAPI* audio_avset_fn)(LPCWSTR, LPDWORD);
 typedef BOOL   (WINAPI* audio_avrevert_fn)(HANDLE);
 static unsigned __stdcall audio_mix_thread_func(void* arg)
 {
     (void)arg;
+    s_audio_mix_tid = GetCurrentThreadId();
     printf("[cellAudio] Mixing thread started\n");
 
     /* This thread is the audio clock. Priority is set here, by the thread
@@ -1037,6 +1293,19 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
      * target the guest clock runs AUDIO_CATCHUP_PCT (default 3) % fast to
      * rebuild it. PORT_AUDIO_STRETCH=0: the FIFO path below, unchanged. */
     AudioOut* ao = NULL;
+    /* audio_adapt.h: PORT_AUDIO_DRIFT (default 1) smooth clock-drift steering of the guest block clock;
+     * PORT_AUDIO_ADAPTIVE (default 1) raises the target after a bad 10 s window, up to
+     * PORT_AUDIO_BUFFER_MAX_MS (default 300); PORT_AUDIO_UNDERRUN_LOG=1 the 10 s underrun line (default: on only
+     * with PORT_AUDIO_LOG) */
+    int drift_on, adapt_on, ulog_on; unsigned adapt_max_ms;
+    { const char* e = getenv("PORT_AUDIO_DRIFT"); drift_on = !(e && *e == '0');
+      e = getenv("PORT_AUDIO_ADAPTIVE"); adapt_on = !(e && *e == '0');
+      e = getenv("PORT_AUDIO_UNDERRUN_LOG"); ulog_on = e ? (*e != '0') : audio_stats_log();
+      e = getenv("PORT_AUDIO_BUFFER_MAX_MS"); adapt_max_ms = (e && *e) ? (unsigned)atoi(e) : 300;
+      if (adapt_max_ms > 500) adapt_max_ms = 500;
+      if (adapt_max_ms < audio_buffer_ms()) adapt_max_ms = audio_buffer_ms(); }
+    AudioDrift drift; memset(&drift, 0, sizeof drift);
+    AudioAdapt adapt; audio_adapt_init(&adapt, audio_buffer_ms(), adapt_on ? adapt_max_ms : audio_buffer_ms());
     if (ao_want && audio_backend_room() >= 0) {
         AudioOutConfig cfg;
         audio_out_default_config(&cfg, CELL_AUDIO_SAMPLE_RATE, audio_buffer_ms());
@@ -1047,24 +1316,46 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
         audio_out_env_config(&cfg, period);
         { const int room = audio_backend_room() + (int)audio_backend_queued_samples();
           if (room > 0 && cfg.device_frames > (unsigned)room) cfg.device_frames = (unsigned)room; }
+        /* room for the largest adaptive target (audio_out_set_target keeps it <= half the ring) */
+        if (cfg.ring_frames < 2 * adapt.max_ms * (CELL_AUDIO_SAMPLE_RATE / 1000)) cfg.ring_frames = 2 * adapt.max_ms * (CELL_AUDIO_SAMPLE_RATE / 1000);
         ao = audio_out_create(&cfg);
     }
+    AudioOutStats acc_log, acc_win;
+    memset(&acc_log, 0, sizeof acc_log); memset(&acc_win, 0, sizeof acc_win);
+    ULONGLONG aw_t0 = GetTickCount64();
+    unsigned sess_underruns = 0, dev_dry_total = 0, win_dry0 = 0;
     static float ao_buf[4096 * 2];
     const long long period_q = (long long)CELL_AUDIO_BLOCK_SAMPLES * qf.QuadPart / CELL_AUDIO_SAMPLE_RATE;
-    const unsigned target_frames = audio_buffer_ms() * CELL_AUDIO_SAMPLE_RATE / 1000;
-    int ao_log_ms = 5000, late_ms = 20, catchup = 3;
+    unsigned target_frames = audio_buffer_ms() * CELL_AUDIO_SAMPLE_RATE / 1000;
+    int ao_log_ms = 0, late_ms = 20, catchup = 3, pause_freeze = 1;
     { const char* e = getenv("PORT_AUDIO_LOG"); const char* p = getenv("R2_RSX_PROF");
       if (e && *e) ao_log_ms = atoi(e) == 0 ? 0 : (atoi(e) == 1 ? 1000 : atoi(e) < 100 ? 1000 : atoi(e));
       else if (p && *p && atoi(p)) ao_log_ms = 1000;
       e = getenv("PORT_AUDIO_LATE_WAIT_MS"); if (e && *e) late_ms = atoi(e);
       if (late_ms < 0) late_ms = 0; if (late_ms > 40) late_ms = 40;
       e = getenv("AUDIO_CATCHUP_PCT"); if (e && *e) catchup = atoi(e);
-      if (catchup < 0) catchup = 0; if (catchup > 20) catchup = 20; }
+      if (catchup < 0) catchup = 0; if (catchup > 20) catchup = 20;
+      e = getenv("PORT_AUDIO_PAUSE_FREEZE"); if (e && *e) pause_freeze = atoi(e) != 0; }
     ULONGLONG ao_t0 = GetTickCount64();
+    /* PORT_AUDIO_REOPEN (default 1; 0 = the old behaviour, silent for the rest
+     * of the session): when the open device goes away, re-open the default
+     * device, checked once a second; after 10 failed re-opens, every 5 s. */
+    int reopen_on; long dev_lost = 0; unsigned reopen_tries = 0; ULONGLONG reopen_t0 = ao_t0;
+    { const char* e = getenv("PORT_AUDIO_REOPEN"); reopen_on = !(e && *e && atoi(e) == 0); }
+    /* PORT_AUDIO_FOCUS_REPRIME (default 1; 0 = off), as in R2 / R3: after the guest audio clock was
+     * held >= PORT_AUDIO_REPRIME_HOLD_MS (default 500: the F10 PC menu, a focus pause) or the window
+     * regained focus, drop what the output stage still holds -- ring, SoundTouch state and tempo --
+     * and re-prime to the target with fresh audio. Costs one buffer (~100 ms) of silence. */
+    int focus_reprime, reprime_hold_ms; long focus_seen = g_port_audio_focus_gen; int want_restart = 0, was_held = 0;
+    { const char* e = getenv("PORT_AUDIO_FOCUS_REPRIME"); focus_reprime = !(e && *e && (atoi(e) == 0 && *e == '0' || !_stricmp(e, "off") || !_stricmp(e, "false") || !_stricmp(e, "no")));
+      e = getenv("PORT_AUDIO_REPRIME_HOLD_MS"); reprime_hold_ms = (e && *e) ? atoi(e) : 500;
+      if (reprime_hold_ms < 0) reprime_hold_ms = 0; }
+    ULONGLONG hold_t0 = 0;
     int primed = 0, dev_dry_flag = 0;
     unsigned dev_dry = 0, waits = 0, caught = 0, gave_up = 0, resyncs = 0;
     long long slip_q = 0, wait_q0 = 0, late_max_q = 0;
-    { char dev[160], mm[48], outs[200];
+    float el_last_l = 0.0f, el_last_r = 0.0f;   /* PORT_AUDIO_ELASTIC: last output frame */
+    { char dev[160], mm[48], outs[256];
 #if AUDIO_BACKEND_WASAPI
       if (s_wasapi_client)
           snprintf(dev, sizeof dev, "WASAPI shared %s (engine period %.1f ms), buffer %u frames (%.0f ms)",
@@ -1078,18 +1369,74 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
       else snprintf(mm, sizeof mm, "FAILED (%ld)", (long)mm_err);
       if (ao) { const AudioOutConfig* c = audio_out_config(ao);
                 snprintf(outs, sizeof outs, "SoundTouch stretch (below %.0f%% of the target, min tempo %.2f, device queue %u ms, fade %u ms), "
-                         "late-block wait %d ms, catch-up %d%%",
+                         "late-block wait %d ms, catch-up %d%% (clock drift steer %s), target %s",
                          c->threshold * 100.0, c->min_tempo, c->device_frames * 1000 / c->rate, c->fade_frames * 1000 / c->rate,
-                         late_ms, catchup); }
+                         late_ms, catchup, drift_on ? "smooth" : "bang-bang", adapt.max_ms > adapt.base_ms ? "adaptive" : "fixed"); }
       else snprintf(outs, sizeof outs, "legacy FIFO%s", ao_want ? " (no device)" : " [PORT_AUDIO_STRETCH=0]");
-      fprintf(stderr, "[audio] output: %s; target buffer %u ms, %s, mixer %s, MMCSS %s, affinity %s, %s pacing, %d logical CPUs%c",
-              dev, ao ? audio_buffer_ms() : 0u, outs, prio_s, mm, aff, steady ? "steady" : "device", audio_host_cpus(), 10); }
+      fprintf(stderr, "[audio] output: %s; target buffer %u ms, %s, mixer %s, MMCSS %s, affinity %s, %s pacing, %d logical CPUs, elastic %s%c",
+              dev, ao ? audio_buffer_ms() : 0u, outs, prio_s, mm, aff, steady ? "steady" : "device", audio_host_cpus(),
+              audio_elastic_on() ? "on (PORT_AUDIO_ELASTIC)" : "off", 10); }
     while (s_mix_thread_running) {
+        if (g_port_audio_focus_gen != focus_seen) {
+            focus_seen = g_port_audio_focus_gen;
+            reopen_t0 = 0;                        /* device health check on this pass */
+            if (focus_reprime) want_restart = 1;
+        }
+        if (want_restart && !g_ps3_host_paused) {
+            want_restart = 0;
+            if (ao) {
+                AudioOutConfig c = *audio_out_config(ao);
+                const int room = audio_backend_room() + (int)audio_backend_queued_samples();
+                if (room > 0 && c.device_frames > (unsigned)room) c.device_frames = (unsigned)room;
+                AudioOut* n = audio_out_create(&c);
+                if (n) { audio_out_destroy(ao); ao = n; }
+            }
+            fhead = fcount = 0; primed = 0; dev_dry_flag = 0; wait_q0 = 0;
+            audio_drift_reset(&drift);
+            { LARGE_INTEGER t; QueryPerformanceCounter(&t);
+              q0.QuadPart = t.QuadPart - (long long)(blocks * CELL_AUDIO_BLOCK_SAMPLES * qf.QuadPart / CELL_AUDIO_SAMPLE_RATE); }
+            fprintf(stderr, "[audio] output restarted (focus regained / long hold): re-priming to the target "
+                            "(PORT_AUDIO_FOCUS_REPRIME=0 off)%c", 10);
+        }
+        if (reopen_on) {
+            const ULONGLONG tn = GetTickCount64();
+            if (tn - reopen_t0 >= (dev_lost && reopen_tries >= 10 ? 5000u : 1000u)) {
+                reopen_t0 = tn;
+                const long h = audio_backend_health();
+                if (h && !dev_lost) {
+                    dev_lost = h; reopen_tries = 0;
+                    fprintf(stderr, "[audio] output device lost (0x%08lX): re-opening the default device "
+                                    "(PORT_AUDIO_REOPEN=0 keeps it closed)%c", (unsigned long)h, 10);
+                }
+                if (dev_lost) {
+                    reopen_tries++;
+                    if (audio_backend_reopen() == 0) {
+#if AUDIO_BACKEND_WASAPI
+                        fprintf(stderr, "[audio] output device re-opened after %u attempt(s): buffer %u frames%c",
+                                reopen_tries, (unsigned)s_wasapi_buf_frames, 10);
+#endif
+                        if (ao) {   /* drop the audio queued while the device was gone */
+                            AudioOutConfig c = *audio_out_config(ao);
+                            const int room = audio_backend_room() + (int)audio_backend_queued_samples();
+                            if (room > 0 && c.device_frames > (unsigned)room) c.device_frames = (unsigned)room;
+                            AudioOut* n = audio_out_create(&c);
+                            if (n) { audio_out_destroy(ao); ao = n; }
+                        }
+                        fhead = fcount = 0; primed = 0; dev_dry_flag = 0;
+                        audio_drift_reset(&drift);
+                        dev_lost = 0;
+                    } else if (reopen_tries == 1 || reopen_tries % 30 == 0) {
+                        fprintf(stderr, "[audio] output device re-open failed (attempt %u), retrying every %s%c",
+                                reopen_tries, reopen_tries >= 10 ? "5 s" : "second", 10);
+                    }
+                }
+            }
+        }
         if (steady) {
             if (ao) {
                 /* the device itself ran dry since the last pass (it played a hole) */
                 if (primed) {
-                    if (audio_backend_room() >= 0 && audio_backend_queued_samples() == 0) { if (!dev_dry_flag) { dev_dry++; dev_dry_flag = 1; } }
+                    if (audio_backend_room() >= 0 && audio_backend_queued_samples() == 0) { if (!dev_dry_flag) { dev_dry++; dev_dry_total++; dev_dry_flag = 1; } }
                     else dev_dry_flag = 0;
                 }
                 /* 1. keep the device topped up to its queue cap from the ring
@@ -1133,7 +1480,45 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
                 else Sleep(1);
                 continue;
             }
+            /* PC menu / focus pause (g_ps3_host_paused): the game's threads are parked, so its
+             * blocks never arrive and every tick used to wait late_ms -- the buffer drained into
+             * the 0.5x stretch zone and resume crunched (GitHub issue #6). Hold the guest clock
+             * (no block consumed, no event) and keep the device fed with silence, so resume
+             * continues at the same buffer level. PORT_AUDIO_PAUSE_FREEZE=0: old behaviour. */
+            if (ao && pause_freeze && g_ps3_host_paused) {
+                if (!was_held) { was_held = 1; hold_t0 = GetTickCount64(); }
+                const unsigned qdev = audio_backend_queued_samples();
+                q0.QuadPart += period_q;
+                wait_q0 = 0;
+                memset(s_mix_buffer, 0, sizeof(s_mix_buffer));
+                audio_out_push(ao, s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
+                audio_out_tick(ao, qdev);
+                continue;
+            }
+            if (was_held) {
+                was_held = 0;
+                if (focus_reprime && GetTickCount64() - hold_t0 >= (ULONGLONG)reprime_hold_ms) { want_restart = 1; continue; }
+            }
+            int el_conceal = 0;
             if (ao) {
+                /* PORT_AUDIO_ELASTIC: repay concealment on silence; wait for a late block while the
+                 * host buffer holds 90% of the target (the stretcher stays out), conceal below */
+                if (audio_elastic_on() && blocks > 200 && audio_backend_room() >= 0) {
+                    if (s_el.debt && s_el.repay_ok && audio_el_repay()) continue;
+                    if (audio_el_gate()) {
+                        double kp = audio_out_config(ao)->threshold + 0.15; if (kp > 1.0) kp = 1.0;
+                        if (audio_out_level(ao, audio_backend_queued_samples()) >= (unsigned)(target_frames * kp)) {
+                            if (!wait_q0) { wait_q0 = now.QuadPart; waits++; }
+                            if (tmr) { LARGE_INTEGER d; d.QuadPart = -5000;
+                                       SetWaitableTimer(tmr, &d, 0, NULL, NULL, FALSE);
+                                       WaitForSingleObject(tmr, 5); }
+                            else Sleep(1);
+                            continue;
+                        }
+                        el_conceal = 1;
+                        if (wait_q0) gave_up++;
+                    } else if (wait_q0) caught++;
+                } else
                 /* late-block wait: a producing port's block is still
                  * unwritten -- give the producer up to late_ms, polling
                  * every 0.5 ms (the device keeps being fed above) */
@@ -1162,7 +1547,31 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
                 q0.QuadPart = now.QuadPart -
                     (long long)(blocks * CELL_AUDIO_BLOCK_SAMPLES * qf.QuadPart / CELL_AUDIO_SAMPLE_RATE);
             blocks++;
-            audio_mix_one_block();
+            if (el_conceal) {
+                /* PORT_AUDIO_ELASTIC: the game's block is not consumed (it plays when it lands); the last
+                 * output frame fades to 0 over 128 frames, then silence; no guest notify */
+                for (u32 s = 0; s < CELL_AUDIO_BLOCK_SAMPLES; s++) {
+                    const float g = s < 128 ? (float)(127 - s) / 128.0f : 0.0f;
+                    s_mix_buffer[s * 2] = el_last_l * g; s_mix_buffer[s * 2 + 1] = el_last_r * g;
+                }
+                el_last_l = el_last_r = 0.0f;
+                audio_el_on_conceal(&s_el);
+                g_audio_held_tick = 1;
+            } else {
+                audio_mix_one_block();
+                if (audio_elastic_on()) {
+                    if (s_el.run) {   /* back from concealment: fade in */
+                        for (u32 s = 0; s < 128; s++) {
+                            const float g = (float)(s + 1) / 129.0f;
+                            s_mix_buffer[s * 2] *= g; s_mix_buffer[s * 2 + 1] *= g;
+                        }
+                        s_el.run = 0;
+                    }
+                    audio_el_on_mixed(&s_el);
+                    el_last_l = s_mix_buffer[(CELL_AUDIO_BLOCK_SAMPLES - 1) * 2];
+                    el_last_r = s_mix_buffer[(CELL_AUDIO_BLOCK_SAMPLES - 1) * 2 + 1];
+                }
+            }
             { static FILE* _wf = (FILE*)-1;   /* AUDIO_WAV=<file>: raw f32le stereo 48 kHz of the final mix */
               if (_wf == (FILE*)-1) { const char* e = getenv("AUDIO_WAV"); _wf = e ? fopen(e, "wb") : NULL; }
               if (_wf) fwrite(s_mix_buffer, sizeof(float), CELL_AUDIO_BLOCK_SAMPLES * 2, _wf); }
@@ -1174,24 +1583,67 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
                  * buffer is below target, as much slow when it is far above
                  * (QPC vs device clock drift) */
                 const unsigned lvl = audio_out_level(ao, qdev);
-                if (lvl < target_frames) q0.QuadPart -= period_q * catchup / 100;
+                if (drift_on && catchup) {
+                    /* audio_adapt.h: smooth steer, converges on the device-vs-QPC clock drift */
+                    const double s = audio_drift_step(&drift, (double)lvl / (double)target_frames, catchup / 100.0);
+                    q0.QuadPart -= (long long)((double)period_q * s);
+                } else if (lvl < target_frames) q0.QuadPart -= period_q * catchup / 100;
                 else if (lvl > target_frames * 3 / 2) q0.QuadPart += period_q * catchup / 100;
-                /* [audio] every 5 s (1 s with PORT_AUDIO_LOG=1 or
-                 * R2_RSX_PROF=1, PORT_AUDIO_LOG=<ms> any period, 0 off).
+                /* [audio] every 1 s with PORT_AUDIO_LOG=1 or R2_RSX_PROF=1,
+                 * PORT_AUDIO_LOG=<ms> any period; off by default.
                  * Good: buffer min well above 0, tempo avg ~1.00, underruns 0,
                  * device dry 0. */
                 const ULONGLONG tn = GetTickCount64();
-                if (ao_log_ms && tn - ao_t0 >= (ULONGLONG)ao_log_ms) {
+                const int log_due = ao_log_ms && tn - ao_t0 >= (ULONGLONG)ao_log_ms;
+                const int win_due = tn - aw_t0 >= 10000;
+                if (log_due || win_due) {
                     AudioOutStats st; audio_out_take_stats(ao, &st);
+                    ao_stats_merge(&acc_log, &st); ao_stats_merge(&acc_win, &st);
+                }
+                if (log_due) {
+                    const AudioOutStats st = acc_log;
                     fprintf(stderr, "[audio] %.1f s: buffer min %.0f avg %.0f ms (target %u) | tempo min %.2f avg %.3f "
                             "(stretched %.0f%%) | underruns %u (silence %.0f ms, device dry %u) | guest blocks late: "
                             "waits %u (caught %u, gave up %u, slip %.0f ms) | mixer wake late max %.1f ms, resyncs %u%s%c",
-                            (tn - ao_t0) / 1000.0, st.level_min_ms, st.level_avg_ms, audio_buffer_ms(),
-                            st.tempo_min, st.tempo_avg, st.ticks ? 100.0 * st.stretch_ticks / st.ticks : 0.0,
+                            (tn - ao_t0) / 1000.0, st.level_min_ms, st.level_avg_ms, adapt.cur_ms,
+                            st.ticks ? st.tempo_min : 1.0, st.ticks ? st.tempo_avg : 1.0, st.ticks ? 100.0 * st.stretch_ticks / st.ticks : 0.0,
                             st.underruns, st.silence_ms, dev_dry, waits, caught, gave_up,
                             slip_q * 1000.0 / qf.QuadPart, late_max_q * 1000.0 / qf.QuadPart, resyncs,
                             st.overflow_frames ? " | ring overflow" : "", 10);
                     dev_dry = waits = caught = gave_up = resyncs = 0; slip_q = late_max_q = 0; ao_t0 = tn;
+                    memset(&acc_log, 0, sizeof acc_log);
+                }
+                if (win_due) {
+                    /* PORT_AUDIO_UNDERRUN_LOG=1: underruns every 10 s with session totals;
+                     * PORT_AUDIO_ADAPTIVE: a bad window raises the target (audio_adapt.h) */
+                    const AudioOutStats w = acc_win;
+                    const double spct = w.ticks ? 100.0 * w.stretch_ticks / w.ticks : 0.0;
+                    const unsigned dry_win = dev_dry_total - win_dry0;
+                    const unsigned ur = w.underruns + dry_win;
+                    sess_underruns += ur;
+                    const unsigned old_ms = adapt.cur_ms;
+                    const unsigned nt = g_ps3_host_paused ? 0u : audio_adapt_window(&adapt, ur, spct);
+                    if (ulog_on)
+                        fprintf(stderr, "[audio] underruns %u in last 10 s (stage %u, device dry %u, silence %.0f ms) | stretched %.0f%% "
+                                "(min tempo %.2f) | buffer min %.0f ms (target %u) | session: %u underruns | clock drift %+.0f ppm%c",
+                                ur, w.underruns, dry_win, w.silence_ms, spct, w.ticks ? w.tempo_min : 1.0,
+                                w.level_min_ms, adapt.cur_ms, sess_underruns, drift_on ? audio_drift_ppm(&drift) : 0.0, 10);
+                    if (nt) {
+                        target_frames = audio_out_set_target(ao, nt * (CELL_AUDIO_SAMPLE_RATE / 1000));
+                        fprintf(stderr, "[audio] target buffer %s to %u ms (%s; PORT_AUDIO_ADAPTIVE=0 keeps it fixed)%c",
+                                nt > old_ms ? "raised" : "lowered", nt,
+                                nt > old_ms ? "underruns / stretching in the last 10 s" : "5 clean minutes", 10);
+                    }
+                    memset(&acc_win, 0, sizeof acc_win);
+                    win_dry0 = dev_dry_total; aw_t0 = tn;
+                    if (audio_elastic_on() && ao_log_ms) {
+                        fprintf(stderr, "[audio] elastic 10 s: %u wait(s), %u saved (avg %.1f ms, max %.1f ms), %u concealed, "
+                                "%u skipped, %u gave up, %u repaid, debt %u, %u forgiven%c",
+                                s_el.waits, s_el.saved, s_el.saved ? s_el.wait_ms / s_el.saved : 0.0, s_el.wait_max_ms,
+                                s_el.conceal, s_el.skip, s_el.giveup, s_el.repaid, s_el.debt, s_el.forgiven, 10);
+                        s_el.waits = s_el.saved = s_el.conceal = s_el.skip = s_el.giveup = s_el.repaid = s_el.forgiven = 0;
+                        s_el.wait_ms = s_el.wait_max_ms = 0.0;
+                    }
                 }
             } else {
                 if (fcount == FIFO_N) fcount--;                       /* device stalled: drop the oldest */
@@ -1446,6 +1898,7 @@ s32 cellAudioPortOpen(const CellAudioPortParam* param, u32* portNum)
     port->param.nBlock   = nblk;
     port->read_index  = 0;
     port->write_index = 0;
+    memset(&s_el_port[found], 0, sizeof(s_el_port[found]));   /* PORT_AUDIO_ELASTIC state */
 
     /* Allocate the audio buffer in GUEST memory so portAddr/readIndexAddr are
      * real guest addresses (the game's mixer -- FMOD here -- writes PCM there

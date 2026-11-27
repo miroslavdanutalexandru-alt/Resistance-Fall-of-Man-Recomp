@@ -48,6 +48,18 @@ extern void spu_raw_note_image(uint32_t src_ea, uint32_t entry);
 
 #include "../platform/win32_compat.h"   /* QueryPerformanceCounter shim for the SPU_SPEED timing */
 #include "ps3emu/log_first.h"
+#include "../platform/port_hires_sleep.h"   /* port_sleep_1ms (perf pass 9) */
+
+/* Perf pass 9: SPU thread group start / thread exit diagnostics, read once
+ * instead of a getenv() (environment lock + scan) on every start and exit. */
+static int lv2_env_flag(volatile int* cache, const char* name)
+{
+    int v = *cache;
+    if (v < 0) *cache = v = getenv(name) ? 1 : 0;
+    return v;
+}
+static volatile int s_env_rd_done = -1, s_env_rd_mbox = -1, s_env_rd_interp = -1, s_env_rd_async = -1;
+
 
 /* ---------------------------------------------------------------------------
  * TTY syscalls (used by PS3 CRT for debug output)
@@ -440,14 +452,15 @@ static uint32_t vm_read_be32(uint32_t guest_addr)
  * Simpsons Arcade hashes it into the key each player announces when joining a
  * match, and with every console at zero the host took the joining player for
  * itself and never gave them a slot. PS3_OPEN_PSID=<32 hex digits> sets it;
- * otherwise the player's name derives one (np_psnr_identity: --username,
- * PS3_NP_ONLINE_ID, or the OS login when online); otherwise it stays zero, so
- * offline saves keyed on it are untouched. */
-extern const char* np_psnr_identity(void);   /* libs/network/np_psnr.c */
+ * otherwise the player's name and its saved salt derive one
+ * (np_psnr_identity_key: --username, PS3_NP_ONLINE_ID, or online the saved
+ * random name); otherwise it stays zero, so offline saves keyed on it are
+ * untouched. */
+extern const char* np_psnr_identity_key(void);   /* libs/network/np_psnr.c */
 static void open_psid(uint32_t w[4])
 {
     const char* e = getenv("PS3_OPEN_PSID");
-    const char* id = np_psnr_identity();
+    const char* id = np_psnr_identity_key();
     w[0] = w[1] = w[2] = w[3] = 0;
     if (e && strlen(e) >= 32) {
         for (int i = 0; i < 4; i++) {
@@ -764,7 +777,7 @@ static void* spu_fallback_thread_proc(void* arg)
      * to the connected queue -- PPU code may block in sys_event_queue_receive for
      * the SPU's completion signal (which normally comes from a WrOutIntrMbox the
      * SPU issues before finishing). Tests whether the render hang is that wait. */
-    if (getenv("RD_SPU_DONE_EVENT") && t->connected_queue) {
+    if (lv2_env_flag(&s_env_rd_done, "RD_SPU_DONE_EVENT") && t->connected_queue) {
         extern int sys_event_queue_push_by_id(uint32_t, uint64_t, uint64_t, uint64_t, uint64_t);
         sys_event_queue_push_by_id(t->connected_queue,
             ((uint64_t)t->tid << 32) | 0x2u, (uint64_t)(uint32_t)rc, 0, 0);
@@ -852,7 +865,7 @@ static int32_t spu_interp_fallback(uint32_t tid, uint32_t args_ea,
  * and signals completion -- satisfying the PPU's wait. Returns 1 if dispatched. */
 int spu_dispatch_frame_by_queue(uint32_t comp_queue, uint32_t work_ea)
 {
-    if (!getenv("RD_SPU_INTERP")) return 0;
+    if (!lv2_env_flag(&s_env_rd_interp, "RD_SPU_INTERP")) return 0;
     /* Two callers reach here: an event-port send, which carries the frame's
      * work descriptor in data2, and the blocking-receive path, which has none
      * and passes 0. A worker started without a descriptor reads an empty inbox,
@@ -914,7 +927,7 @@ int spu_dispatch_frame_by_queue(uint32_t comp_queue, uint32_t work_ea)
          * work descriptor reaches the SPU through that service instead. */
         LARGE_INTEGER _t0, _t1, _fq; QueryPerformanceCounter(&_t0);
         int32_t frc = spu_run_interp_job(ls, entry, t->args_ea, -1, t->tid, t->group_id,
-                                         getenv("RD_SPU_FRAME_MBOX") ? work_ea : 0u);
+                                         lv2_env_flag(&s_env_rd_mbox, "RD_SPU_FRAME_MBOX") ? work_ea : 0u);
         { static int _sp = -1; if (_sp < 0) _sp = getenv("SPU_SPEED") ? 1 : 0;
           if (_sp) { QueryPerformanceCounter(&_t1); QueryPerformanceFrequency(&_fq);
               extern uint64_t g_spu_interp_steps;
@@ -1125,7 +1138,7 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
                 }
             }
         }
-        if (!fb && getenv("RD_SPU_INTERP") && t->img_ea) {
+        if (!fb && lv2_env_flag(&s_env_rd_interp, "RD_SPU_INTERP") && t->img_ea) {
             /* No lifted fallback: interpret the image instead of instant-
              * completing. Additive + env-gated so it can't destabilize titles
              * that rely on a registered fallback. */
@@ -1156,7 +1169,7 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
          * group_start run and a write_spu_mb re-run competed for the same
          * mailbox word: one run consumed it, the other polled an empty box and
          * parked, and which got it varied run to run. */
-        if (fb == spu_interp_fallback && !getenv("RD_SPU_INTERP_ASYNC")) {
+        if (fb == spu_interp_fallback && !lv2_env_flag(&s_env_rd_async, "RD_SPU_INTERP_ASYNC")) {
             t->exit_status = fb(t->tid, t->args_ea, t->args_size, user);
             t->running = 0;
             instant++;
@@ -1193,7 +1206,7 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
         if (fb == spu_registry_fallback) {
             for (int spin = 0; spin < 2000 && !t->live_ctx && t->running; spin++)
 #ifdef _WIN32
-                Sleep(1);
+                port_sleep_1ms();
 #else
                 { struct timespec ts = {0, 1000000}; nanosleep(&ts, 0); }
 #endif
@@ -1529,7 +1542,7 @@ static int64_t sys_spu_thread_write_spu_mb_handler(ppu_context* ctx)
             int waited = 0;
             while (spu_channel_has_data(&c->ch_in_mbox) && waited < 250) {
 #ifdef _WIN32
-                Sleep(1);
+                port_sleep_1ms();
 #else
                 { struct timespec ts = {0, 1000000}; nanosleep(&ts, 0); }
 #endif
@@ -2160,7 +2173,7 @@ static int64_t sys_spu_image_open_handler(ppu_context* ctx)
 
     const char* ps3_path = (const char*)(vm_base + path_ea);
     char host_path[1024];
-    sys_fs_translate_path(ps3_path, host_path, sizeof(host_path));
+    sys_fs_translate_path_read(ps3_path, host_path, sizeof(host_path));
 
     FILE* f = fopen(host_path, "rb");
     if (!f) {

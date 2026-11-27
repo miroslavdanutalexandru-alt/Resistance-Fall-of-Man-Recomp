@@ -6,7 +6,7 @@
     RegionLabel = 'US'
     AppVer      = '01.00'
     TitleMatch  = 'Fall of Man'                  # other regions of the same game (for a clearer message)
-    Required    = @('PS3_GAME/PARAM.SFO', 'PS3_GAME/USRDIR/EBOOT.BIN', 'PS3_GAME/USRDIR/game.self')
+    Required    = @('PS3_GAME/PARAM.SFO', 'PS3_GAME/USRDIR/EBOOT.BIN', 'PS3_GAME/USRDIR/game.self', 'PS3_GAME/USRDIR/game.psarc')
     Program     = @('PS3_GAME/USRDIR/EBOOT.BIN', 'PS3_GAME/USRDIR/game.self')   # PS3 program files Setup decrypts
     Sha1        = @{
         'PS3_GAME/USRDIR/EBOOT.BIN' = '6a98d90e82f01a4a4a27a350b4dfc2f78fecf971'

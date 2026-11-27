@@ -1,12 +1,14 @@
 // Resistance: Fall of Man PC port: NVIDIA Reflex Low Latency through NVAPI (tools/nvapi, MIT).
 //
 // RFOM_REFLEX   0 / unset: off | 1: Reflex On | 2: Reflex On + Boost
+// PORT_LATENCY  unset: RFOM_REFLEX alone | off | reflex | antilag (AMD Anti-Lag 2) | auto (Reflex, else Anti-Lag 2)
 //
 // On an NVIDIA GPU (driver with Reflex support) the D3D12 device gets
 // NvAPI_D3D_SetSleepMode and the game thread calls NvAPI_D3D_Sleep once per
 // frame, right after the port's frame limiter and before the next frame's
-// simulation and input sampling. minimumIntervalUs is always 0: Reflex never
-// limits the frame rate, the port's limiter (RFOM_FPS) stays in charge.
+// simulation and input sampling. minimumIntervalUs is always 0 on this NVAPI path: Reflex never
+// limits the frame rate, the port's limiter (RFOM_FPS) stays in charge (with frame generation see
+// RFOM_REFLEX_LIMIT below).
 // Latency markers (one frame id per game frame, strictly increasing):
 //   SIMULATION_START / SIMULATION_END    game thread, rfom_frame_wait (stubs.cpp)
 //   INPUT_SAMPLE                         first port-0 cellPadGetData of the frame
@@ -21,6 +23,11 @@
 // With DLSS Frame Generation active (RFOM_DLSS_FG, rsx_dlssg.inc) the same markers and the sleep go through
 // NVIDIA Streamline instead of NVAPI (DLSS-G requires Reflex and must see the markers): the renderer sets the
 // g_pc_fg_* hooks before it calls g_pc_reflex_init, and Reflex is then always on.
+// RFOM_REFLEX_LIMIT (frame generation only): 1 / unset = Reflex's frame limit is the frame cap in effect
+// (RFOM_FPS or the RFOM_DISPLAY_SYNC plan, rendered frames before generation: 1e6 / fps us), updated when
+// the cap changes; the port's limiter then ends its wait 5% early (stubs.cpp) so Reflex sets the pace. Not
+// while fixed-refresh pacing's phase lock runs (it needs the port's limiter in charge). 2 = also then.
+// 0 = no Reflex frame limit (the old behaviour).
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -31,6 +38,17 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+
+// AMD Anti-Lag 2 (PORT_LATENCY=antilag | auto, port_latency.h): tools/antilag2 (AMD Anti-Lag 2 SDK, MIT).
+// The renderer calls g_pc_antilag_init with its D3D12 device (only without frame generation); Initialize
+// succeeds on Radeon drivers with Anti-Lag 2 only. Update(enable) is called where NvAPI_D3D_Sleep would
+// be: once per game frame after the limiter, just before input sampling (that call inserts the delay).
+#if __has_include("../tools/antilag2/ffx_antilag2_dx12.h")
+#include "../tools/antilag2/ffx_antilag2_dx12.h"
+#define RFOM_HAVE_AL2 1
+#else
+#define RFOM_HAVE_AL2 0
+#endif
 
 #if __has_include("nvapi.h")
 #include "nvapi.h"
@@ -43,13 +61,26 @@ extern "C" {
 // rsx_d3d12_backend.c hooks
 extern int (*volatile g_pc_reflex_init)(void* device);
 extern void (*volatile g_pc_reflex_marker)(int type);
+extern int (*volatile g_pc_antilag_init)(void* device);
+extern volatile int g_pc_reflex_want;   // RFOM_REFLEX after PORT_LATENCY (0 off, 1 on, 2 on + boost)
 // rsx_dlssg.inc: Streamline Reflex / PCL (set only while DLSS Frame Generation is usable)
 extern void (*volatile g_pc_fg_marker)(int type, unsigned long long id);
 extern void (*volatile g_pc_fg_sleep)(unsigned long long id);
 extern int (*volatile g_pc_fg_latency)(double* total_ms, double* render_ms, double* gpu_ms);
+// rsx_dlssg.inc, RFOM_FG_DIAG: the sleep below is timed while g_pc_fg_diag is set
+extern volatile int g_pc_fg_diag;
+extern volatile long long g_pc_fg_sleep_us;
+// rsx_dlssg.inc: Reflex frame limit through Streamline (null with an older rfom_dlssg.dll)
+extern int (*volatile g_pc_fg_limit)(unsigned us);
 // cellPad.c: port-0 cellPadGetData tick (shared with the key-prompt hot-swap, stubs.cpp)
 void rfom_pad_tick_install(void);
+// stubs.cpp: the frame cap in effect (fps, -1 = RFOM_FPS=orig); *pacing = from fixed-refresh pacing
+double rfom_fps_limit_now(int* pacing);
+// rsx_d3d12_backend.c: fixed-refresh pacing's phase lock running (0 without the renderer)
+int rfom_pacing_pll(void);
+int rfom_pacing_pll_default(void) { return 0; }
 }
+#pragma comment(linker, "/alternatename:rfom_pacing_pll=rfom_pacing_pll_default")
 
 namespace {
 
@@ -71,6 +102,12 @@ std::atomic<unsigned> s_head{0}, s_tail{0};
 unsigned long long s_render_id = 0, s_render_last = 0;   // render side only
 bool s_render_open = false;
 
+// RFOM_REFLEX_LIMIT (game thread): -1 unread, 0 off, 1 auto, 2 also under the phase lock
+int s_limit_env = -1;
+unsigned s_limit_want = ~0u;            // last limit asked for (us)
+int s_limit_src = -1;                   // its source (limit_update)
+std::atomic<unsigned> s_limit_us{0};    // the limit Streamline accepted, 0 = none (stubs.cpp reads it)
+
 std::mutex s_lat_mu;
 double s_lat_total_ms = 0, s_lat_render_ms = 0, s_lat_gpu_ms = 0;
 ULONGLONG s_lat_at = 0;
@@ -91,17 +128,58 @@ void marker(int t, unsigned long long id)
 #endif
 }
 
+// Game thread, before the Streamline sleep: Reflex's frame limit follows the frame cap in effect.
+void limit_update()
+{
+    if (s_limit_env < 0) {
+        const char* e = getenv("RFOM_REFLEX_LIMIT");
+        s_limit_env = e && *e ? atoi(e) : 1;
+        if (s_limit_env < 0) s_limit_env = 0;
+        if (s_limit_env > 2) s_limit_env = 2;
+        if (!s_limit_env) fprintf(stderr, "[reflex] frame limit off (RFOM_REFLEX_LIMIT=0): the port's frame limiter alone%c", 10);
+    }
+    if (!s_limit_env) return;
+    int (*fn)(unsigned) = g_pc_fg_limit;
+    if (!fn || !g_pc_fg_sleep) {   // older rfom_dlssg.dll, or frame generation failed (hooks cleared)
+        static int said = 0;
+        s_limit_us.store(0, std::memory_order_relaxed);
+        if (!fn && g_pc_fg_sleep && !said++)
+            fprintf(stderr, "[reflex] frame limit unavailable (rfom_dlssg.dll is older): the port's frame limiter alone%c", 10);
+        return;
+    }
+    int pacing = 0;
+    const double fps = rfom_fps_limit_now(&pacing);
+    unsigned us = 0;
+    int src;   // 0 RFOM_FPS=orig, 1 phase lock, 2 RFOM_FPS, 3 display sync plan
+    if (!(fps > 0.0)) src = 0;
+    else if (rfom_pacing_pll() && s_limit_env < 2) src = 1;
+    else { us = (unsigned)(1e6 / fps + 0.5); src = pacing ? 3 : 2; }
+    if (us == s_limit_want && src == s_limit_src) return;
+    s_limit_want = us; s_limit_src = src;
+    const int ok = fn(us);
+    s_limit_us.store(ok ? us : 0, std::memory_order_relaxed);
+    static int nlog = 0;
+    if (nlog >= 32) return;
+    nlog++;
+    static const char* const kSrc[] = {
+        "none: RFOM_FPS=orig, the game's own pacing",
+        "none: fixed-refresh phase lock, the port's limiter keeps the pace; RFOM_REFLEX_LIMIT=2 overrides",
+        "RFOM_FPS", "display sync plan" };
+    if (us) fprintf(stderr, "[reflex] frame limit %u us (source %s, %.4g fps rendered)%s%c", us, kSrc[src], fps,
+                    ok ? "" : " -- Streamline refused it, the port's limiter alone", 10);
+    else fprintf(stderr, "[reflex] frame limit 0 us (source %s)%c", kSrc[src], 10);
+}
+
 int reflex_init(void* device)
 {
-    const char* e = getenv("RFOM_REFLEX");
-    const int want = e ? atoi(e) : 0;
+    const int want = g_pc_reflex_want;
     if (g_pc_fg_marker && g_pc_fg_sleep) {
         // DLSS Frame Generation: Reflex is required and already configured in Streamline by the renderer
         s_fg = true;
         s_mode = want >= 2 ? 2 : 1;
         rfom_pad_tick_install();
         fprintf(stderr, "[reflex] NVIDIA Reflex Low Latency %s through Streamline (required by DLSS Frame Generation;"
-                        " the frame limiter stays RFOM_FPS)%c", want >= 2 ? "On + Boost" : "On", 10);
+                        " Reflex also paces the frame cap unless RFOM_REFLEX_LIMIT=0)%c", want >= 2 ? "On + Boost" : "On", 10);
         return 1;
     }
 #if RFOM_HAVE_NVAPI
@@ -205,9 +283,34 @@ void lat_update()
 }
 #endif
 
+#if RFOM_HAVE_AL2
+AMD::AntiLag2DX12::Context s_al2{};
+std::atomic<int> s_al2_on{0};
+
+int antilag_init(void* device)
+{
+    if (!device || s_al2_on) return s_al2_on;
+    const HRESULT hr = AMD::AntiLag2DX12::Initialize(&s_al2, static_cast<ID3D12Device*>(device));
+    if (hr != S_OK) {
+        fprintf(stderr, "[latency] AMD Anti-Lag 2 unavailable (0x%08lX: not a Radeon GPU, or the driver lacks it)%c",
+                (unsigned long)hr, 10);
+        return 0;
+    }
+    s_al2_on = 1;
+    fprintf(stderr, "[latency] AMD Anti-Lag 2 on (D3D12 SDK; the frame limiter stays RFOM_FPS)%c", 10);
+    return 1;
+}
+#endif
+
 struct HookInit
 {
-    HookInit() { g_pc_reflex_init = reflex_init; g_pc_reflex_marker = render_marker; }
+    HookInit()
+    {
+        g_pc_reflex_init = reflex_init; g_pc_reflex_marker = render_marker;
+#if RFOM_HAVE_AL2
+        g_pc_antilag_init = antilag_init;
+#endif
+    }
 } s_hook_init;
 
 } // namespace
@@ -216,6 +319,9 @@ extern "C" {
 
 // 0 off, 1 On, 2 On + Boost (NVAPI or Streamline active)
 int rfom_reflex_mode(void) { return s_mode; }
+
+// stubs.cpp rfom_frame_wait_impl (game thread): Reflex's frame limit in us, 0 = none
+unsigned rfom_reflex_limit_us(void) { return s_fg && s_mode ? s_limit_us.load(std::memory_order_relaxed) : 0u; }
 
 // Game thread, entry of rfom_frame_wait: the frame's simulation and command submission are done.
 void rfom_reflex_sim_end(void)
@@ -233,12 +339,21 @@ void rfom_reflex_sim_end(void)
 // Game thread, after the port's frame limiter: Reflex sleep, then the next frame starts.
 void rfom_reflex_sim_start(void)
 {
+#if RFOM_HAVE_AL2
+    if (s_al2_on) AMD::AntiLag2DX12::Update(&s_al2, true, 0);   // the Anti-Lag 2 delay, before input sampling
+#endif
     if (!s_mode) return;
     const unsigned long long id = s_sim.load(std::memory_order_relaxed) + 1;
-    if (s_fg) { if (g_pc_fg_sleep) g_pc_fg_sleep(id); }
+    LARGE_INTEGER t0 = {}, t1, qf;
+    if (g_pc_fg_diag) QueryPerformanceCounter(&t0);
+    if (s_fg) { limit_update(); if (g_pc_fg_sleep) g_pc_fg_sleep(id); }
 #if RFOM_HAVE_NVAPI
     else NvAPI_D3D_Sleep(s_dev);
 #endif
+    if (g_pc_fg_diag && t0.QuadPart) {   // RFOM_FG_DIAG: Reflex sleep time, read (and cleared) by the next present row
+        QueryPerformanceCounter(&t1); QueryPerformanceFrequency(&qf);
+        InterlockedExchangeAdd64(&g_pc_fg_sleep_us, (t1.QuadPart - t0.QuadPart) * 1000000LL / qf.QuadPart);
+    }
     s_sim.store(id, std::memory_order_relaxed);
     s_input_done.store(0, std::memory_order_relaxed);
     marker(SIMULATION_START, id);
@@ -266,6 +381,56 @@ int rfom_reflex_stats(double* total_ms, double* render_ms, double* gpu_ms)
 #else
     (void)total_ms; (void)render_ms; (void)gpu_ms;
     return 0;
+#endif
+}
+
+// RFOM_MOVIE_LFC (rsx_d3d12_backend.c): the NVIDIA driver profile's Vertical sync setting for this exe
+// (its application profile, else the global one), for run.log: a forced vsync changes how the movie's
+// repeated presents reach the screen. -1 unknown / not NVIDIA, 0 application-controlled, 1 forced On,
+// 2 forced Off, 3 something else (Fast, Adaptive, half rate...). Slow (loads the driver settings): call
+// it off the render thread.
+int rfom_nv_drs_vsync(void)
+{
+#if RFOM_HAVE_NVAPI
+    if (NvAPI_Initialize() != NVAPI_OK) return -1;
+    NvDRSSessionHandle ses = nullptr;
+    if (NvAPI_DRS_CreateSession(&ses) != NVAPI_OK || !ses) return -1;
+    int r = -1;
+    if (NvAPI_DRS_LoadSettings(ses) == NVAPI_OK) {
+        constexpr NvU32 kVsyncId = 0x00A879CF;   // VSYNCMODE_ID (NvApiDriverSettings.h)
+        NVDRS_SETTING s = {};
+        s.version = NVDRS_SETTING_VER;
+        bool found = false;
+        wchar_t path[MAX_PATH] = {};
+        const DWORD n = GetModuleFileNameW(nullptr, path, MAX_PATH);
+        if (n && n < MAX_PATH) {
+            const wchar_t* exe = wcsrchr(path, L'\\');
+            exe = exe ? exe + 1 : path;
+            NvAPI_UnicodeString name = {};
+            for (size_t i = 0; exe[i] && i + 1 < NVAPI_UNICODE_STRING_MAX; i++) name[i] = (NvU16)exe[i];
+            NvDRSProfileHandle prof = nullptr;
+            NVDRS_APPLICATION app = {};
+            app.version = NVDRS_APPLICATION_VER;
+            if (NvAPI_DRS_FindApplicationByName(ses, name, &prof, &app) == NVAPI_OK && prof)
+                found = NvAPI_DRS_GetSetting(ses, prof, kVsyncId, &s) == NVAPI_OK;
+        }
+        if (!found) {
+            NvDRSProfileHandle glob = nullptr;
+            s = {};
+            s.version = NVDRS_SETTING_VER;
+            if (NvAPI_DRS_GetCurrentGlobalProfile(ses, &glob) == NVAPI_OK && glob)
+                found = NvAPI_DRS_GetSetting(ses, glob, kVsyncId, &s) == NVAPI_OK;
+        }
+        if (!found) r = 0;   // not set anywhere: the driver default, application-controlled
+        else {
+            const NvU32 v = s.u32CurrentValue;
+            r = v == 0x60925292u ? 0 : v == 0x47814940u ? 1 : v == 0x08416747u ? 2 : 3;   // PASSIVE / FORCEON / FORCEOFF
+        }
+    }
+    NvAPI_DRS_DestroySession(ses);
+    return r;
+#else
+    return -1;
 #endif
 }
 

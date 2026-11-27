@@ -7,6 +7,7 @@
 
 #include "cellSysutil.h"
 #include "ps3emu/guest_call.h"
+#include "ps3emu/port_pc_extras.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -406,6 +407,16 @@ static s32 sysutil_language(void)
             if (sysutil_ieq(host, k[i].code)) { lang = k[i].id; from = "host"; break; }
     }
     printf("[cellSysutil] system language %d (%s)\n", (int)lang, from);
+    /* For the file layer's spoken-language fallback (lang_fallback.h): a disc
+     * without speech in this language plays the English voice-over. */
+    { char v[8];
+      snprintf(v, sizeof v, "%d", (int)lang);
+#ifdef _WIN32
+      _putenv_s("PS3_LANG_RESOLVED", v);
+#else
+      setenv("PS3_LANG_RESOLVED", v, 1);
+#endif
+    }
     return lang;
 }
 
@@ -420,7 +431,11 @@ s32 cellSysutilGetSystemParamInt(s32 id, u32 value_ea)
         v = sysutil_language();
         break;
     case CELL_SYSUTIL_SYSTEMPARAM_ID_ENTER_BUTTON_ASSIGN:
-        v = CELL_SYSUTIL_ENTER_BUTTON_ASSIGN_CROSS;
+        /* PC port: PS3_ENTER_BUTTON=circle = the Japanese layout (Circle confirms, Cross backs).
+         * The title reads this at boot; a game that hard-codes its buttons ignores it. */
+        v = pcx_enter_button(getenv("PS3_ENTER_BUTTON")) ? CELL_SYSUTIL_ENTER_BUTTON_ASSIGN_CROSS
+                                                          : CELL_SYSUTIL_ENTER_BUTTON_ASSIGN_CIRCLE;
+        { static int once; if (!once) { once = 1; printf("[cellSysutil] enter button %s\n", v ? "Cross" : "Circle"); } }
         break;
     case CELL_SYSUTIL_SYSTEMPARAM_ID_DATE_FORMAT:    v = 0; break; /* YYYYMMDD */
     case CELL_SYSUTIL_SYSTEMPARAM_ID_TIME_FORMAT:    v = 0; break; /* 24-hour */
@@ -434,7 +449,8 @@ s32 cellSysutilGetSystemParamInt(s32 id, u32 value_ea)
      * its reduced-gore mode (no blood on bullet hits). BCUS = Americas. */
     case 0x0122: { const char* e = getenv("RFOM_LICENSE_AREA"); v = e ? atoi(e) : 1; } break;   /* v163g: env for A/B tests */
     case CELL_SYSUTIL_SYSTEMPARAM_ID_CAMERA_PLFREQ:  v = 0; break; /* 60Hz */
-    case CELL_SYSUTIL_SYSTEMPARAM_ID_PAD_RUMBLE:     v = 1; break; /* Rumble on */
+    case CELL_SYSUTIL_SYSTEMPARAM_ID_PAD_RUMBLE:     /* Rumble on unless PAD_RUMBLE=off/0 */
+        v = pcx_parse_pct(getenv("PAD_RUMBLE"), 100, 0, 100) > 0; break;
     case CELL_SYSUTIL_SYSTEMPARAM_ID_KEYBOARD_TYPE:  v = 0; break; /* US/101 */
     case CELL_SYSUTIL_SYSTEMPARAM_ID_PAD_AUTOOFF:    v = 0; break; /* Disabled */
     default:

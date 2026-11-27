@@ -44,6 +44,7 @@ static LRESULT CALLBACK cover_proc(HWND h, UINT m, WPARAM w, LPARAM l)
         FillRect((HDC)w, &rc, (HBRUSH)GetStockObject(BLACK_BRUSH));
         return 1;
     }
+    case WM_MOUSEACTIVATE: return MA_NOACTIVATE;   /* a click must not take activation from the new game window */
     case WM_CLOSE: return 0;           /* closes only when the switch is done */
     }
     return DefWindowProcA(h, m, w, l);

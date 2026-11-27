@@ -12,6 +12,12 @@
 #ifndef OutDir
   #define OutDir "dist"
 #endif
+; PortLinkName: the Start Menu shortcut that starts the game. RecompLauncher finds an installed
+; game by the words in that name (two of them must be in its catalog name / repo name), so
+; port.iss can give it one that matches; older installs' shortcut under PortName is removed.
+#ifndef PortLinkName
+  #define PortLinkName PortName
+#endif
 
 [Setup]
 AppId={#PortAppId}
@@ -47,6 +53,8 @@ WizardSmallImageFile={#ArtDir}\wizsmall_*.png
 DisableWelcomePage=no
 #endif
 DirExistsWarning=no
+; store file times in UTC so they are not "in the future" for players west of the packing PC (Ninja loops on those)
+TimeStampsInUTC=yes
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Shortcuts:"
@@ -63,16 +71,22 @@ Source: "{#StageDir}\tools\installer\gamefiles.ps1"; Flags: dontcopy
 Source: "{#StageDir}\tools\installer\game_profile.psd1"; Flags: dontcopy
 
 [Icons]
-Name: "{autoprograms}\{#PortName}\{#PortName}"; Filename: "{app}\Launcher.exe"; WorkingDir: "{app}"; IconFilename: "{app}\project\launcher.ico"
-Name: "{autoprograms}\{#PortName}\Setup (locate game, rebuild)"; Filename: "{app}\Setup.bat"; WorkingDir: "{app}"; IconFilename: "{app}\project\launcher.ico"
+Name: "{autoprograms}\{#PortName}\{#PortLinkName}"; Filename: "{app}\Launcher.exe"; WorkingDir: "{app}"; IconFilename: "{app}\project\launcher.ico"
+Name: "{autoprograms}\{#PortName}\Setup (locate game, rebuild)"; Filename: "{app}\Setup.exe"; WorkingDir: "{app}"; IconFilename: "{app}\project\launcher.ico"
 Name: "{autoprograms}\{#PortName}\Uninstall"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#PortName}"; Filename: "{app}\Launcher.exe"; WorkingDir: "{app}"; IconFilename: "{app}\project\launcher.ico"; Tasks: desktopicon
 
+#if PortLinkName != PortName
+[InstallDelete]
+; an upgrade: the Start Menu shortcut of older installs (now PortLinkName), so there is one
+Type: files; Name: "{autoprograms}\{#PortName}\{#PortName}.lnk"
+#endif
+
 [Run]
-Filename: "{cmd}"; Parameters: "/c """"{app}\Setup.bat"" {code:GameArg}"""; WorkingDir: "{app}"; Description: "Run the first-time setup now (copies your game files and builds the port)"; Flags: postinstall nowait skipifsilent
+Filename: "{app}\Setup.exe"; Parameters: "{code:GameArg}"; WorkingDir: "{app}"; Description: "Open Setup now to build the port from your game (shows progress; click Install there)"; Flags: postinstall nowait skipifsilent
 
 [UninstallDelete]
-; Files made by Setup.bat and the build. Settings are copied to Saved Games first (see usUninstall below).
+; Files made by Setup and the build. Settings are copied to Saved Games first (see usUninstall below).
 Type: filesandordirs; Name: "{app}\build"
 Type: filesandordirs; Name: "{app}\build_game"
 Type: filesandordirs; Name: "{app}\build_regen"
@@ -81,6 +95,8 @@ Type: filesandordirs; Name: "{app}\rsxcap"
 Type: filesandordirs; Name: "{app}\recompiled"
 Type: filesandordirs; Name: "{app}\recompiled_game"
 Type: filesandordirs; Name: "{app}\logs"
+; the portable build tools (Setup.exe, experimental) and the list of what Setup installed (OfferToolRemoval runs first)
+Type: filesandordirs; Name: "{app}\tools_cache"
 Type: files; Name: "{app}\Launcher.exe"
 Type: files; Name: "{app}\settings.bat"
 Type: files; Name: "{app}\settings.ini"
@@ -98,7 +114,7 @@ var
   PathEdit: TNewEdit;
   StatusText: TNewStaticText;
   FoundPaths: TStringList;
-  Searched, ToolsReady: Boolean;
+  Searched, ToolsReady, DirChecked: Boolean;
 
 // ---------------------------------------------------------------- settings backup (Saved Games)
 function UserCfgDir(): String;
@@ -261,7 +277,7 @@ begin
   WizardForm.Refresh;
   if not RunCheck('-Game ' + QuoteArg(P) + ' -Dest ' + QuoteArg(WizardDirValue + '\gamefiles'), Lines) then
   begin
-    StatusText.Caption := 'The game files could not be checked here. Setup.bat checks them when it runs.';
+    StatusText.Caption := 'The game files could not be checked here. Setup checks them when it runs.';
     Exit;
   end;
   St := Field(Lines, 'status');
@@ -282,7 +298,7 @@ begin
     Result := False;
   end
   else
-    StatusText.Caption := 'The game files could not be checked here. Setup.bat checks them when it runs.';
+    StatusText.Caption := 'The game files could not be checked here. Setup checks them when it runs.';
 end;
 
 procedure InitializeWizard;
@@ -301,7 +317,7 @@ begin
   Intro.Width := GamePage.SurfaceWidth;
   Intro.Height := ScaleY(30);
   Intro.Caption := 'Use a decrypted disc image (.iso) or a disc dump folder (the one that contains PS3_GAME). ' +
-                   'Copies found on this PC are listed below. Leave the path empty to choose the game later with Setup.bat.';
+                   'Copies found on this PC are listed below. Leave the path empty to choose the game later in Setup.';
 
   FoundList := TNewListBox.Create(GamePage);
   FoundList.Parent := GamePage.Surface;
@@ -345,6 +361,21 @@ end;
 
 procedure CurPageChanged(CurPageID: Integer);
 begin
+  { A folder with spaces handed over before the folder page (RecompLauncher's /DIR="C:\Recomp Library\...")
+    can't be used (the build tools need no spaces): the previous install's folder, or the default, instead.
+    Done once, before the folder page, so a folder the player types is checked as usual. }
+  if not DirChecked then
+  begin
+    DirChecked := True;
+    if Pos(' ', WizardForm.DirEdit.Text) > 0 then
+    begin
+      if (WizardForm.PrevAppDir <> '') and (Pos(' ', WizardForm.PrevAppDir) = 0) then
+        WizardForm.DirEdit.Text := WizardForm.PrevAppDir
+      else
+        WizardForm.DirEdit.Text := ExpandConstant('{sd}\Games\{#PortShort}');
+      Log('Install folder had spaces; using ' + WizardForm.DirEdit.Text);
+    end;
+  end;
   if (CurPageID = GamePage.ID) and not Searched then SearchGames();
 end;
 
@@ -381,7 +412,7 @@ function GameArg(Param: String): String;
 begin
   Result := '';
   if Trim(PathEdit.Text) <> '' then
-    Result := '-Game "' + Trim(PathEdit.Text) + '"';
+    Result := '--game ' + QuoteArg(Trim(PathEdit.Text));
 end;
 
 function UpdateReadyMemo(Space, NewLine, MemoUserInfoInfo, MemoDirInfo, MemoTypeInfo, MemoComponentsInfo, MemoGroupInfo, MemoTasksInfo: String): String;
@@ -392,7 +423,7 @@ begin
   if Trim(PathEdit.Text) <> '' then
     Result := Result + Trim(PathEdit.Text) + NewLine + Space + '(copied into the install folder by the first-time setup)'
   else
-    Result := Result + 'choose it later with Setup.bat';
+    Result := Result + 'choose it later in Setup';
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
@@ -402,13 +433,49 @@ begin
       'Portable mode: settings and saves stay in this folder. Delete this file to keep a copy in Saved Games again.' + #13#10, False);
 end;
 
+// ---------------------------------------------------------------- build tools Setup installed
+// tools_cache\installed_by_setup.txt lists what Setup.exe / Setup.bat installed (never tools that were already on the PC).
+// Offer to remove them before the folder goes; prereqs.ps1 -Uninstall does it (one administrator prompt).
+procedure OfferToolRemoval(App: String);
+var
+  Lines: TArrayOfString;
+  I, N, Rc: Integer;
+  L, List: String;
+begin
+  if not LoadStringsFromFile(App + '\tools_cache\installed_by_setup.txt', Lines) then Exit;
+  List := '';
+  N := 0;
+  for I := 0 to GetArrayLength(Lines) - 1 do
+  begin
+    L := Trim(Lines[I]);
+    if (L <> '') and (Copy(L, 1, 1) <> '#') then
+    begin
+      StringChangeEx(L, '|', '  ', True);
+      List := List + '  ' + L + #13#10;
+      N := N + 1;
+    end;
+  end;
+  if (N = 0) or not FileExists(App + '\tools\installer\prereqs.ps1') then Exit;
+  if SuppressibleMsgBox('Also remove the build tools Setup installed on this PC?' + #13#10#13#10 + List + #13#10 +
+            'Tools that were on this PC before Setup are not listed and stay.', mbConfirmation, MB_YESNO or MB_DEFBUTTON2, IDNO) <> IDYES then Exit;
+  if not ShellExec('runas', ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+       '-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + App + '\tools\installer\prereqs.ps1" -Uninstall',
+       App, SW_HIDE, ewWaitUntilTerminated, Rc) then
+    SuppressibleMsgBox('The build tools were not removed. Remove them in Windows Settings > Apps.', mbInformation, MB_OK, IDOK)
+  else if FileExists(App + '\tools_cache\installed_by_setup.txt') then
+    SuppressibleMsgBox('Some build tools could not be removed. Remove them in Windows Settings > Apps.', mbInformation, MB_OK, IDOK);
+end;
+
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
   App: String;
 begin
   App := ExpandConstant('{app}');
   if CurUninstallStep = usUninstall then
+  begin
     SaveConfigToUser(App);
+    OfferToolRemoval(App);
+  end;
   if CurUninstallStep = usPostUninstall then
   begin
     if DirExists(App + '\game') or DirExists(App + '\gamefiles') or DirExists(App + '\gamedata') then

@@ -7,6 +7,7 @@
  */
 
 #include "sysPrxForUser.h"
+#include "../video/rsx_featcov.h"   /* rsx_featcov_dump on the fast exit */
 #include "../../runtime/memory/vm.h"
 #include <ps3emu/guest_call.h>
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base, vm_write32: translate + byte-swap */
@@ -16,6 +17,8 @@
 #include <stdlib.h>
 #include <ctype.h>
 #include "ps3emu/log_first.h"
+#include "ps3emu/milestone.h"   /* ps3_exit_hooks_run */
+#include "ps3emu/ps3_ftrace.h"   /* ps3_ft_dump on the fast exit */
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -169,8 +172,28 @@ static u32 s_next_heap_id = 1;
 int g_sys_process_exit_called = 0;
 s32 g_sys_process_exit_code   = 0;
 
+static int s_exit_started;
+
+static void exit_park_forever(void)
+{
+    for (;;) {
+#ifdef _WIN32
+        Sleep(1000);
+#else
+        struct timespec ts = {1,0}; nanosleep(&ts,0);
+#endif
+    }
+}
+
 void sys_process_exit(s32 exitcode)
 {
+    /* Fast exit (PS3_EXIT_CRT unset): only the first caller runs the exit hooks
+     * and leaves; a second thread exiting at the same time parks instead of
+     * racing the hooks or overwriting the exit code they report. */
+    const char* ec = getenv("PS3_EXIT_CRT");
+    const int fast_exit = !(ec && *ec && *ec != '0');
+    if (fast_exit && __atomic_exchange_n(&s_exit_started, 1, __ATOMIC_ACQ_REL))
+        exit_park_forever();
     g_sys_process_exit_code   = exitcode;
     g_sys_process_exit_called = 1;
     printf("[sysPrxForUser] sys_process_exit(code=%d)\n", exitcode);
@@ -193,6 +216,27 @@ void sys_process_exit(s32 exitcode)
             Sleep(1000);
 #else
             struct timespec ts = {1,0}; nanosleep(&ts,0);
+#endif
+        }
+    }
+    {
+        /* exit() runs the CRT's atexit handlers and static destructors while the
+         * RSX, D3D12 and SPU threads are still running (R3 saw heap corruption
+         * 0xC0000374 and a crash report on a clean guest exit). Leave the way
+         * the window-close path (pc_quit_clean) does. PS3_EXIT_CRT=1: the old exit().
+         * Handlers that must still run (boot-smoke verdict, milestone counts,
+         * PGO counters) are registered with ps3_exit_hook_register and
+         * run here first, then ftrace's dump (header-only, so it stays on plain
+         * atexit; the dump is idempotent). */
+        if (fast_exit) {
+            ps3_exit_hooks_run();
+            if (g_ps3_ft.buf) ps3_ft_dump();
+            rsx_featcov_dump("exit");
+            fflush(NULL);
+#ifdef _WIN32
+            ExitProcess((UINT)exitcode);
+#else
+            _exit(exitcode);
 #endif
         }
     }

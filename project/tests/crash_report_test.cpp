@@ -13,6 +13,8 @@
 #include "port_report.cpp"
 #include <dbghelp.h>
 #include <process.h>
+#include "port_frametime.h"
+#include "../../ps3recomp/libs/system/savedata_backup.h"
 #pragma comment(lib, "dbghelp.lib")
 
 /* ------------------------------------------------------------------ child */
@@ -25,6 +27,10 @@ static uint64_t t_frames() { return (uint64_t)g_frames; }
 static uint64_t t_rsx() { return (uint64_t)g_rsx; }
 static int t_paused() { return g_paused; }
 static void t_before() { printf("before_report called\n"); fflush(stdout); }
+static void t_guest(PortGuestState* g)   /* like rfom_crash.inc: the faulting thread's guest PPU state */
+{ g->valid = 1; g->thread_id = 7; g->lr = 0x82000F00; g->sp = 0xD0010000; g->syscall_last = 141; g->callsite = 0x82000100; }
+static size_t t_gthreads(char* b, size_t cap)   /* like ppu_crash_guest_threads */
+{ return (size_t)snprintf(b, cap, "tid  3 test_worker          IN syscall 130 (r3=0x00ABCDEF) for 5.0 s, callsite 0x82000200\n"); }
 
 static void nop_impl(int) {}
 static void (*volatile g_nop)(int) = nop_impl;
@@ -99,8 +105,32 @@ static unsigned __stdcall ticker(void* arg)
     }
 }
 
+/* holds the shared DbgHelp lock (like PORT_HITCHCATCH's writer loading a PDB) */
+static HANDLE g_locked_ev;
+static unsigned __stdcall dbghelp_holder(void* ms)
+{
+    port_dbghelp_lock();
+    SetEvent(g_locked_ev);
+    Sleep((DWORD)(uintptr_t)ms);
+    port_dbghelp_unlock();
+    return 0;
+}
+
 /* clang-cl only catches faults in a callee under /EHsc */
 static __declspec(noinline) void poke_low() { *(volatile int*)8 = 1; }
+/* a bad argument to the CRT, one call below a named frame (as fread(NULL) was in ppu_fs) */
+extern "C" __declspec(noinline) int invparam_caller(char* d) { g_nop(5); strcpy_s(d, 0, "x"); return 0; }
+extern "C" __declspec(noinline) int invparam_other(char* d) { g_nop(6); strcpy_s(d, 0, "y"); return 0; }
+/* iptwo: thread A hits an invalid parameter and stalls in crash() (guest_state
+ * runs before the report lock) while thread B hits one and wins the report */
+static DWORD g_ipa_tid;
+static HANDLE g_ipb_go;
+static void t_ip_stall(PortGuestState*)
+{
+    if (GetCurrentThreadId() == g_ipa_tid) { SetEvent(g_ipb_go); Sleep(3000); }
+}
+static unsigned __stdcall ip_thread_a(void*) { g_ipa_tid = GetCurrentThreadId(); return (unsigned)invparam_caller(NULL); }
+static unsigned __stdcall ip_thread_b(void*) { WaitForSingleObject(g_ipb_go, INFINITE); return (unsigned)invparam_other(NULL); }
 
 static int child(const char* mode)
 {
@@ -115,7 +145,8 @@ static int child(const char* mode)
     c.main_progress = t_frames; c.main_start_min = 1;
     c.rsx_progress = t_rsx; c.paused = t_paused;
     c.vm_base = &g_vm; c.vm_size = VM_TEST_SIZE;
-    c.guest_resolve = t_resolve; c.before_report = t_before;
+    c.guest_resolve = t_resolve; c.before_report = t_before; c.guest_state = t_guest;
+    c.guest_threads = t_gthreads;
     port_crash::init(c);
     if (!strcmp(mode, "chain")) s_after_prev = SetUnhandledExceptionFilter(t_after_filter);
     void* commit_veh = AddVectoredExceptionHandler(1, t_commit_veh);   /* registered after the reporter, first in line -- as in the ports */
@@ -130,8 +161,23 @@ static int child(const char* mode)
         return 0;
     }
     if (!strcmp(mode, "stackoverflow")) return recurse(0);
+    if (!strcmp(mode, "dbglock") || !strcmp(mode, "dbglate")) {   /* crash while another thread holds the DbgHelp lock */
+        g_locked_ev = CreateEventA(NULL, TRUE, FALSE, NULL);
+        CloseHandle((HANDLE)_beginthreadex(NULL, 0, dbghelp_holder, (void*)(uintptr_t)(!strcmp(mode, "dbglate") ? 3000 : INFINITE), 0, NULL));
+        WaitForSingleObject(g_locked_ev, INFINITE);
+        return caller_a(NULL);
+    }
     if (!strcmp(mode, "abort")) { abort(); }
-    if (!strcmp(mode, "invparam")) { char* d = NULL; strcpy_s(d, 0, "x"); return 0; }
+    if (!strcmp(mode, "invparam")) return invparam_caller(NULL);
+    if (!strcmp(mode, "iptwo")) {
+        g_ipb_go = CreateEventA(NULL, TRUE, FALSE, NULL);
+        port_crash::s_cfg.guest_state = t_ip_stall;
+        HANDLE h[2];
+        h[1] = (HANDLE)_beginthreadex(NULL, 0, ip_thread_b, NULL, 0, NULL);
+        h[0] = (HANDLE)_beginthreadex(NULL, 0, ip_thread_a, NULL, 0, NULL);
+        WaitForMultipleObjects(2, h, TRUE, INFINITE);
+        return 0;
+    }
     if (!strcmp(mode, "worker")) {
         HANDLE h = (HANDLE)_beginthreadex(NULL, 0, worker_crash, NULL, 0, NULL);
         WaitForSingleObject(h, INFINITE);
@@ -299,6 +345,71 @@ static std::string zip_read(const std::wstring& zip, const char* member, const s
     return slurp(scratch + "\\" + m);
 }
 
+/* port_frametime.h (stats, report, marker, file rotation) and savedata_backup.h (backup rotation) */
+static port_ft::Stats g_fts;
+static char g_ftbuf[64 * 1024];
+static void frametime_backup_tests(const std::string& work)
+{
+    using namespace port_ft;
+    Stats* s = &g_fts;
+    memset(s, 0, sizeof *s);
+    for (int i = 0; i < 990; i++) stats_add(s, 16.0, i * 0.016);
+    for (int i = 0; i < 10; i++) stats_add(s, 50.0, 20.0 + i);
+    stats_add(s, 3000.0, 40.0);
+    double l1, p99, l01, p999;
+    stats_low(s, 0.01, &l1, &p99);
+    stats_low(s, 0.001, &l01, &p999);
+    check(s->n == 1000 && s->stalls == 1 && fabs(s->sum / (double)s->n - 16.34) < 0.001, "frametime: average; a 3 s stall is left out",
+          port_report::fmt("n=%llu avg=%.3f", (unsigned long long)s->n, s->sum / (double)s->n));
+    check(fabs(l1 - 50.0) < 0.01 && fabs(l01 - 50.0) < 0.01 && fabs(p99 - 50.0) < 0.01, "frametime: 1% / 0.1% low from the histogram",
+          port_report::fmt("%.3f %.3f %.3f", l1, l01, p99));
+    uint64_t rows[HIST_ROWS];
+    hist_rows(s, rows);
+    check(rows[2] == 990 && rows[6] == 10, "frametime: histogram rows (16 ms, 50 ms)");
+    const Info in = { "Test", "T.exe", "20260101_000000", "exit", "Scroll Lock", 0, 60.0 };
+    const size_t n = format_report(s, &in, "", g_ftbuf, sizeof g_ftbuf);
+    const std::string rep(g_ftbuf, n);
+    check(has(rep, "average") && has(rep, "1% low") && has(rep, "0.1% low") && has(rep, "histogram") && has(rep, "worst 20 frames") &&
+          has(rep, "50.00 ms") && has(rep, "longest stalls") && has(rep, "3000.0 ms"), "frametime: report has lows, histogram, worst 20, stalls", rep);
+    static float ring[RING];
+    for (int i = 0; i < 300; i++) ring[i] = 16.0f;
+    const std::string mk(g_ftbuf, format_marker(1, 5.0, 0, ring, 300, g_ftbuf, sizeof g_ftbuf));
+    check(has(mk, "MARKER #1") && has(mk, "125 frames"), "frametime: marker holds the last 2 s", mk);
+    const char* fn[12];
+    char fnb[12][40];
+    for (int i = 0; i < 12; i++) { snprintf(fnb[i], 40, "frametimes_202601%02d_000000.txt", 12 - i); fn[i] = fnb[i]; }
+    int del[16];
+    const int nd = prune_plan(fn, 12, 9, del, 16);
+    check(nd == 3 && del[0] == 11 && del[1] == 10 && del[2] == 9, "frametime: keeps the newest files");
+    char hw[256];
+    const size_t hn = hook_warning(75.0, 0, hw, sizeof hw);
+    check(hn && has(hw, "present hook") && has(hw, "75 s") && !hook_warning(75.0, 1, hw, sizeof hw) && !hook_warning(30.0, 0, hw, sizeof hw),
+          "frametime: missing-present-hook warning only after 60 s with no presents");
+
+    const char bn[][SDBK_NAME] = { "20250101_000003", "20250101_000001", "20250101_000001_2", "notes", "20250101_000002.tmp",
+                                   "20250101_000004", "20250101_000005", "20250101_000006" };
+    int bdel[16];
+    const int bnd = sdbk_plan_prune(bn, 8, 5, bdel, 16);
+    check(bnd == 2 && ((bdel[0] == 4 && bdel[1] == 1) || (bdel[0] == 1 && bdel[1] == 4)), "savebackup: prune oldest + stale .tmp, keep notes");
+    const std::string sd = work + "\\sdbk", save = sd + "\\SLOT", broot = sd + "\\saves_backup";
+    port_report::remove_tree(sd);
+    port_report::make_dirs(save);
+    int done = 0, same = 0;
+    char out[1200], err[256];
+    for (int i = 0; i < 7; i++) {
+        port_report::write_file(save + "\\SAVE.DAT", port_report::fmt("save %d", i));
+        char st[32]; snprintf(st, sizeof st, "20250101_00000%d", i);
+        done += sdbk_run(save.c_str(), "SLOT", broot.c_str(), 5, 1 << 20, st, out, sizeof out, err, sizeof err) == SDBK_DONE;
+    }
+    same = sdbk_run(save.c_str(), "SLOT", broot.c_str(), 5, 1 << 20, "20250101_000009", out, sizeof out, err, sizeof err) == SDBK_SAME;
+    std::vector<sdbk_entry> ents(SDBK_MAX_FILES);
+    const int ne = sdbk_list((broot + "\\SLOT").c_str(), ents.data(), SDBK_MAX_FILES);
+    check(done == 7 && same && ne == 5 && slurp(broot + "\\SLOT\\20250101_000006\\SAVE.DAT") == "save 6" &&
+          GetFileAttributesA((broot + "\\SLOT\\20250101_000001").c_str()) == INVALID_FILE_ATTRIBUTES,
+          "savebackup: on disk, last 5 kept, unchanged save not duplicated", port_report::fmt("done=%d same=%d n=%d", done, same, ne));
+    port_report::remove_tree(sd);
+}
+
 static void bundle_tests(const std::string& work, const Run& crashed)
 {
     SetEnvironmentVariableA("PS3_GAMEDATA_ROOT", NULL);
@@ -315,6 +426,7 @@ static void bundle_tests(const std::string& work, const Run& crashed)
     touch(root + "\\logs\\run.log", 10 << 20);
     port_report::write_file(root + "\\logs\\out.log", "out log line\r\n");
     touch(root + "\\logs\\build_unrelated.log", 2 << 20);
+    port_report::write_file(root + "\\logs\\frametimes_20260101_000000.txt", std::string("frame-time report\r\nexe ") + prof + "\\x.exe\r\n");
     touch(root + "\\shadercache\\pipelines.bin", 1 << 20);
     touch(root + "\\gamedata\\dev_hdd0\\game\\BCUS98232\\USRDIR\\big.psarc", 1 << 20);
     touch(root + "\\gamedata\\dev_hdd0\\home\\00000001\\savedata\\BCUS98232_SAVE\\SAVE.DAT", 300 << 10);
@@ -346,6 +458,13 @@ static void bundle_tests(const std::string& work, const Run& crashed)
           "bundle: has report, note, logs, settings, dump + crash.txt", ls);
     check(!has(ls, "saves/") && !has(ls, "shadercache") && !has(ls, "psarc") && !has(ls, "build_unrelated") && !has(ls, ".exe"),
           "bundle: no saves (unticked), shader cache, game data, other logs, exes");
+    const std::string ftr = zip_read(r.zip, "logs/frametimes_20260101_000000.txt", work + "\\x");
+    check(has(ls, "logs/frametimes_20260101_000000.txt") && has(ftr, "frame-time report") && (!prof[0] || !has(ftr, prof)),
+          "bundle: frame-time summaries included, profile path scrubbed", ftr);
+    char pcn[256] = ""; GetEnvironmentVariableA("COMPUTERNAME", pcn, sizeof pcn);
+    std::string unc = std::string("open \\\\") + pcn + "\\share\\x.txt";
+    port_report::scrub(unc);
+    check(strlen(pcn) < 3 || (!has(unc, pcn) && has(unc, "\\\\<pc>\\share")), "bundle: PC name scrubbed (UNC paths)", unc);
     const std::string rep = zip_read(r.zip, "report.txt", work + "\\x");
     check(has(rep, "Windows:") && has(rep, "CPU:") && has(rep, "RAM:") && has(rep, "Version:   9.9.9") && has(rep, "Exe:       build\\Resistance3.exe"),
           "bundle: report.txt has OS / CPU / RAM / version / exe");
@@ -360,6 +479,12 @@ static void bundle_tests(const std::string& work, const Run& crashed)
     check(runlog.size() <= (8u << 20) + 200 && runlog.size() > (7u << 20) && has(runlog, "left out"), "bundle: big log cut to its last 8 MB",
           port_report::fmt("%zu bytes", runlog.size()));
     check(r.packed_bytes <= (50ull << 20), "bundle: under the 50 MB cap", port_report::fmt("%.1f MB", r.packed_bytes / 1048576.0));
+    const std::string pci = zip_read(r.zip, "pcinfo.txt", work + "\\x");
+    check(has(ls, "VERSION") && has(pci, "Windows:") && has(pci, "GPU 0:") && has(pci, "Drive:") && (!prof[0] || !has(pci, prof)),
+          "bundle: VERSION + pcinfo.txt (OS, GPU, drive; no profile path)", pci);
+    const std::string url = port_report::issue_url(root, "owner/repo", "it broke\r\nin C:\\Users\\someone\\x", "R_report_1.zip");
+    check(has(url, "https://github.com/owner/repo/issues/new?title=it%20broke&body=") && has(url, "R_report_1.zip") &&
+          !has(url, "someone") && url.size() < 8000, "bundle: issue URL prefilled, no user name", url);
     check(port_report::find_files(root + "\\logs", "report_staging_*").empty() && !port_report::is_dir(root + "\\logs\\report_staging_x"),
           "bundle: staging folder removed");
 
@@ -370,9 +495,16 @@ static void bundle_tests(const std::string& work, const Run& crashed)
     const std::string ls2 = zip_list(r2.zip);
     check(has(ls2, "saves/BCUS98232_SAVE/SAVE.DAT") && !has(ls2, "psarc") && !has(ls2, "note.txt"), "bundle: saves included when ticked (only savedata)");
 
-    /* the cap: a 60 MB dump does not fit, everything else still goes in */
+    /* the dump allowance: a 60 MB dump goes in under 200 MB (not counted in the 50 MB cap), not under 50 MB */
     touch(root + "\\logs\\crash\\TEST_29990101_000000_crash.dmp", 60 << 20, 'd');
     o.include_saves = false;
+    Sleep(1100);
+    port_report::Result r5;
+    port_report::create(o, r5);
+    const std::string ls5 = zip_list(r5.zip);
+    check(has(ls5, "29990101_000000_crash.dmp") && has(ls5, "_crash.dmp") && has(ls5, "logs/run.log") && r5.packed_bytes <= (50ull << 20),
+          "bundle: the newest two dumps go in on their own 200 MB allowance", ls5);
+    o.dump_cap_bytes = 50ull << 20;
     Sleep(1100);
     port_report::Result r3;
     port_report::create(o, r3);
@@ -381,8 +513,9 @@ static void bundle_tests(const std::string& work, const Run& crashed)
     for (auto& s : r3.skipped) listed |= has(s, "TEST_29990101_000000_crash.dmp");
     const std::string rep3 = zip_read(r3.zip, "report.txt", work + "\\x");
     check(listed && !has(ls3, "29990101_000000_crash.dmp") && has(ls3, "logs/run.log") && has(rep3, "left out:"),
-          "bundle: a dump over the 50 MB cap is left out and listed");
+          "bundle: dumps over the dump allowance are left out and listed");
     DeleteFileA((root + "\\logs\\crash\\TEST_29990101_000000_crash.dmp").c_str());
+    o.dump_cap_bytes = 200ull << 20;
 
     /* a small cap: the run.log tail (8 MB) no longer fits */
     o.cap_bytes = 3 << 20;
@@ -439,7 +572,20 @@ int main(int argc, char** argv)
     check(has(av.txt, "writing 0x0"), "av: fault address");
     check(has(av.crashes, "in func_82001234"), "av: crashes.txt names the guest function");
     check(has(av.txt, "exe pdb:    "), "av: PDB identity recorded");
+    check(has(av.txt, "guest:      PPU thread 7, lr=0x82000F00") && has(av.txt, "last 141 (last syscall/HLE call from func_82000100)"),
+          "av: guest PPU state + last syscall");
+    check(has(av.txt, "==== guest threads ====") && has(av.txt, "IN syscall 130 (r3=0x00ABCDEF)"), "av: guest threads section");
+    check(has(av.txt, "{lifted_func_82001234+0x") && has(av.txt, "{caller_a+0x"), "av: PDB symbols in the stack trace");
+    check(has(av.log, "crash report summary") && has(av.log, "faulting thread ") && has(av.log, "guest:      PPU thread 7"),
+          "av: crash summary in run.log");
     check_dump(av, "av", true, EXCEPTION_ACCESS_VIOLATION);
+
+    {   /* PORT_CRASH_EXTRA=0: the report as before guest state / symbols / run.log summary */
+        Run ox = run_child(work, "av", "PORT_CRASH_EXTRA=0\0", "av_extra0");
+        check(has(ox.txt, "guest fn:   func_82001234") && !has(ox.txt, "guest:      PPU thread") && !has(ox.txt, "==== guest threads") &&
+              !has(ox.txt, "{lifted_func_82001234+0x") && !has(ox.log, "crash report summary"),
+              "av, PORT_CRASH_EXTRA=0: old report (no guest state, symbols or run.log summary)");
+    }
 
     Run gav = run_child(work, "guestav");
     check(has(gav.txt, "writing guest 0x00001234"), "guestav: AV shown as a guest address");
@@ -466,11 +612,46 @@ int main(int argc, char** argv)
 
     Run ip = run_child(work, "invparam");
     check_crash_common(ip, "invparam", "0xC0000417");
+    check(has(ip.txt, "call stack: (from the invalid-parameter handler") && has(ip.txt, "invparam_caller") &&
+          has(ip.txt, "<== call site"), "invparam: the handler's stack names the caller");
+    {
+        const size_t a = ip.txt.find("address:    0x");
+        const std::string addr = a == std::string::npos ? "" : ip.txt.substr(a, ip.txt.find('\n', a) - a);
+        check(!addr.empty() && !has(addr, "on_invparam") && !has(addr, "crash_here") && has(addr, "invparam_caller"),
+              "invparam: the address is the call site, not the handler", addr);
+    }
+    {   /* two threads, A's invalid parameter first: the report (B's) must carry B's call site */
+        Run i2 = run_child(work, "iptwo");
+        const size_t a = i2.txt.find("address:    0x");
+        const std::string addr = a == std::string::npos ? "" : i2.txt.substr(a, i2.txt.find('\n', a) - a);
+        const size_t s = i2.txt.find("<== call site");
+        const size_t ls = s == std::string::npos ? 0 : i2.txt.rfind('\n', s);
+        const std::string site = s == std::string::npos ? "" : i2.txt.substr(ls, s - ls);
+        check(i2.txts.size() == 1 && has(i2.txt, "0xC0000417") && has(addr, "invparam_other") && has(site, "invparam_other"),
+              "iptwo: concurrent invalid parameters -> the report's call site is the reported thread's", addr + " |" + site);
+    }
 
     Run wk = run_child(work, "worker");
     check_crash_common(wk, "worker", "0xC0000005");
     check(has(wk.txt, "\"RSX test worker\"  <== CRASHED HERE"), "worker: crashing thread named and marked");
     check(has(wk.txt, "func_82001234"), "worker: guest function on a worker thread");
+
+    {   /* DbgHelp lock held by another thread for the whole crash (2 s waits): a report without any DbgHelp call */
+        Run dl = run_child(work, "dbglock", "PORT_CRASH_DBGHELP_WAIT_MS=2000\0");
+        check(!dl.txt.empty() && has(dl.txt, "0xC0000005 (access violation)") && has(dl.crashes, "[crash]") &&
+              dl.code == EXCEPTION_ACCESS_VIOLATION, "dbglock: report written while the DbgHelp lock is held, process dies",
+              port_report::fmt("exit 0x%08lX", dl.code));
+        check(has(dl.txt, "<== CRASHED HERE") && has(dl.txt, "#2 ") && has(dl.txt, "[func_82001234+0x") &&
+              has(dl.txt, "crash_report_test.exe+0x") && !has(dl.txt, "{lifted_func_82001234"),
+              "dbglock: faulting stack unwound without DbgHelp (RtlVirtualUnwind, module+offset, no symbols)");
+        check(has(dl.txt, "note:       DbgHelp lock held by thread") && has(dl.txt, "no minidump") && dl.dumps.empty(),
+              "dbglock: noted, minidump skipped", port_report::fmt("%zu dumps", dl.dumps.size()));
+        /* the holder lets go 3 s in: during the second wait -> the minidump is written after the report */
+        Run lt = run_child(work, "dbglate", "PORT_CRASH_DBGHELP_WAIT_MS=2000\0");
+        check(has(lt.txt, "DbgHelp lock freed after the report") && has(lt.txt, "[func_82001234+0x") && has(lt.crashes, "_crash.dmp"),
+              "dbglate: minidump written once the lock frees");
+        check_dump(lt, "dbglate", true, EXCEPTION_ACCESS_VIOLATION);
+    }
 
     Run rc = run_child(work, "race");
     check(rc.dumps.size() == 1 && rc.txts.size() == 1 && rc.code != 0, "race: 4 threads crash at once -> one report",
@@ -482,6 +663,7 @@ int main(int argc, char** argv)
               port_report::fmt("exit %lu, %zu dumps", hg.code, hg.dumps.size()));
         check(has(hg.txt, "no game-loop progress for 5 s") && has(hg.txt, "==== threads") && has(hg.txt, "(hang watchdog)"),
               "hang: report says what stalled, with all threads");
+        check(has(hg.txt, "==== guest threads ====") && has(hg.txt, "IN syscall 130"), "hang: guest threads section (blocked syscall + wait object)");
         check(has(hg.crashes, "[hang]"), "hang: crashes.txt line");
         check_dump(hg, "hang", false);
         Run rh = run_child(work, "rsxhang", "PORT_HANG_DUMP=1\0PORT_HANG_S=5\0");
@@ -498,6 +680,7 @@ int main(int argc, char** argv)
     Run dis = run_child(work, "av", "TESTPFX_CRASH_DUMPS=0\0", "av_disabled");
     check(dis.dumps.empty() && dis.txts.empty() && dis.code == EXCEPTION_ACCESS_VIOLATION, "<prefix>_CRASH_DUMPS=0: reporter off, crash unchanged");
 
+    frametime_backup_tests(work);
     bundle_tests(work, av);
 
     printf("\n%d/%d passed\n", g_pass, g_pass + g_fail);

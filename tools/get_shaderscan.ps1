@@ -11,6 +11,61 @@
 # download failed; the launcher works without it), 2 the download did not match the pinned SHA-256 (rejected).
 param([string]$Url = '', [string]$Sha256 = '', [string]$Dest = '')
 $ErrorActionPreference = 'Stop'
+# Windows PowerShell started from a PowerShell 7 window (directly or through cmd / a .bat) inherits pwsh's module
+# paths and then cannot load its own modules: Get-FileHash and Get-AuthenticodeSignature are 'not recognized', and
+# Expand-Archive loads pwsh's copy and fails. Keep only Windows PowerShell's own paths. Get-PortFileHash and
+# Expand-PortZip fall back to .NET if the cmdlets still cannot run (same output: upper-case hex / the same files).
+# (Same block in setup.ps1, tools\update.ps1, tools\get_shaderscan.ps1, tools\installer\prereqs.ps1, scripts\*.ps1.)
+if ($PSVersionTable.PSVersion.Major -lt 6) {
+    $pmp = @(($env:PSModulePath -split ';') | Where-Object { $_ -and $_ -notmatch '\\PowerShell\\(7[^\\]*\\)?Modules\\?$' })
+    $pmpSys = Join-Path $PSHOME 'Modules'
+    if (-not @($pmp | Where-Object { $_.TrimEnd('\') -eq $pmpSys }).Count) { $pmp += $pmpSys }
+    $env:PSModulePath = $pmp -join ';'
+}
+$script:PortHashCmd = $null
+function Get-PortFileHash([string]$LiteralPath, [string]$Algorithm = 'SHA256') {
+    if ($script:PortHashCmd -ne $false) {
+        try {
+            $r = Get-FileHash -LiteralPath $LiteralPath -Algorithm $Algorithm
+            $script:PortHashCmd = $true
+            if ($null -eq $r) { return $null }
+            return "$($r.Hash)".ToUpperInvariant()
+        } catch [System.Management.Automation.CommandNotFoundException] { $script:PortHashCmd = $false }
+    }
+    $a = switch ($Algorithm.ToUpperInvariant()) {
+        'SHA1' { [Security.Cryptography.SHA1]::Create() }
+        'SHA384' { [Security.Cryptography.SHA384]::Create() }
+        'SHA512' { [Security.Cryptography.SHA512]::Create() }
+        'MD5' { [Security.Cryptography.MD5]::Create() }
+        default { [Security.Cryptography.SHA256]::Create() }
+    }
+    $s = [IO.File]::OpenRead($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($LiteralPath))
+    try { return ([BitConverter]::ToString($a.ComputeHash($s)) -replace '-', '') } finally { $s.Dispose(); $a.Dispose() }
+}
+function Expand-PortZip([string]$LiteralPath, [string]$DestinationPath, [switch]$Force) {
+    try { Expand-Archive -LiteralPath $LiteralPath -DestinationPath $DestinationPath -Force:$Force -ErrorAction Stop; return }
+    catch {
+        $e = $_.Exception
+        while ($e -is [System.Management.Automation.ActionPreferenceStopException] -and $e.InnerException) { $e = $e.InnerException }
+        if (-not ($e -is [System.Management.Automation.CommandNotFoundException] -or $e -is [System.Management.Automation.MethodException])) { Write-Error -ErrorRecord $_; return }
+    }
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $src = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($LiteralPath)
+    $dst = [IO.Path]::GetFullPath($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($DestinationPath))
+    [void][IO.Directory]::CreateDirectory($dst)
+    $root = $dst.TrimEnd('\') + '\'
+    $z = [IO.Compression.ZipFile]::OpenRead($src)
+    try {
+        foreach ($en in $z.Entries) {
+            $t = [IO.Path]::GetFullPath([IO.Path]::Combine($dst, $en.FullName))
+            if (-not $t.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) { throw "Unsafe path in $src`: $($en.FullName)" }
+            if ($en.FullName.EndsWith('/') -or $en.FullName.EndsWith('\')) { [void][IO.Directory]::CreateDirectory($t); continue }
+            if (-not $Force -and [IO.File]::Exists($t)) { throw "$t already exists (Expand-Archive without -Force)" }
+            [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($t))
+            [IO.Compression.ZipFileExtensions]::ExtractToFile($en, $t, $true)
+        }
+    } finally { $z.Dispose() }
+}
 $tools = $PSScriptRoot
 $pinFile = Join-Path $tools 'shaderscan.version'
 if (-not $Dest) { $Dest = Join-Path $tools 'shaderscan.exe' }
@@ -24,7 +79,7 @@ if (Test-Path -LiteralPath $pinFile) {
 if (-not $Url) { $Url = $pin['url'] }
 if (-not $Sha256) { $Sha256 = $pin['sha256'] }
 $ver = if ($pin['version']) { $pin['version'] } else { '(unpinned)' }
-function Hash($p) { (Get-FileHash -Algorithm SHA256 -LiteralPath $p).Hash.ToUpperInvariant() }
+function Hash($p) { (Get-PortFileHash $p SHA256).ToUpperInvariant() }
 
 if ($env:SHADERSCAN_EXE) {
     if (-not (Test-Path -LiteralPath $env:SHADERSCAN_EXE -PathType Leaf)) {

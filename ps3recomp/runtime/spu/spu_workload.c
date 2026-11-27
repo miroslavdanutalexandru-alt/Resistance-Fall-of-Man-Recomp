@@ -384,7 +384,21 @@ static uint8_t* ts_running(uint32_t taskset_ea)
     for (int i = 0; i < TS_TRACK; i++) if (!s_ts_run[i].ea) { s_ts_run[i].ea = taskset_ea; return s_ts_run[i].running; }
     return NULL;
 }
-static void ts_lock(void)   { while (InterlockedExchange(&s_ts_lock, 1)) Sleep(0); }
+/* Perf pass 9: test-and-test-and-set. A waiter used to Sleep(0) (a syscall) on every failed
+ * exchange and hammered the line with locked writes; the critical sections are a few loads and
+ * stores, so pause-spin on a plain read first and only fall back to Sleep(0) after 64 laps. */
+static void ts_lock(void)
+{
+    unsigned n = 0;
+    while (InterlockedExchange(&s_ts_lock, 1)) {
+        do {
+#if defined(_WIN32)
+            if (++n < 64) { YieldProcessor(); continue; }
+#endif
+            Sleep(0);
+        } while (s_ts_lock);
+    }
+}
 static void ts_unlock(void) { InterlockedExchange(&s_ts_lock, 0); }
 
 static void spu_taskset_mark(uint32_t taskset_ea, uint32_t t, int on)
@@ -506,8 +520,24 @@ void spu_taskset_start_pending(uint32_t taskset_ea)
     if (taskset_ea) spu_taskset_task_exited(taskset_ea, 0xFFFFFFFFu);
 }
 
+/* SPU_ASYNC_INTERP: interpreter fallback for task images with no lifted code:
+ * the ELF's own e_entry (ELF32, big-endian, offset 0x18), latched per host
+ * thread by spu_async_run before it hands the shim to the lifted-job runner. */
+static uint32_t async_elf_entry(const uint8_t* image, uint32_t size)
+{
+    if (!image || size < 0x1C || image[0] != 0x7F || image[1] != 'E') return 0;
+    return ((uint32_t)image[0x18] << 24) | ((uint32_t)image[0x19] << 16) |
+           ((uint32_t)image[0x1A] << 8) | image[0x1B];
+}
+static SPU_THREAD_LOCAL uint32_t t_async_interp_entry;
+static void async_interp_entry(spu_context* ctx)
+{
+    spu_interp_run(ctx, t_async_interp_entry & SPU_LS_MASK);
+}
+
 static void spu_async_run(spu_async_job* j)
 {
+    if (j->fn == async_interp_entry) t_async_interp_entry = async_elf_entry(j->image, j->image_size);
     spu_taskset_mark(j->taskset_ea, j->taskid, 1);
     /* Persistent per-taskset LS: acquire (+serialize) the taskset's LS, or fall
      * back to a fresh per-dispatch LS when disabled / no taskset. */
@@ -1332,7 +1362,15 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
           } }
         fprintf(stderr, "[spu_workload] async dispatch MISS fp=0x%016llX size=%u\n",
                 (unsigned long long)fp, image_size);
-        return 0;
+        /* SPU_ASYNC_INTERP=1 (opt-in, from R3; no R1 log has shown a miss):
+         * run the unlifted task in the interpreter rather than drop it -- a
+         * dropped task leaves its PPU waiter blocked forever. Default: drop. */
+        { const char* e = getenv("SPU_ASYNC_INTERP");
+          if (!(e && *e && *e != '0')) return 0; }
+        fn = async_interp_entry;
+        image_id = 0;
+        fprintf(stderr, "[spu_workload]   -> running fp=0x%016llX interpreted (entry 0x%05X)\n",
+                (unsigned long long)fp, async_elf_entry(image, image_size));
     }
 
     spu_async_job* j = (spu_async_job*)malloc(sizeof(*j));

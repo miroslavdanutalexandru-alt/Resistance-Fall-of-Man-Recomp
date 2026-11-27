@@ -297,8 +297,20 @@ static inline int32_t vm_commit(uint32_t addr, uint32_t size)
     size = VM_ALIGN_UP(size, VM_PAGE_SIZE);
 
 #ifdef _WIN32
-    if (!VirtualAlloc(vm_base + addr, size, MEM_COMMIT, PAGE_READWRITE))
-        return CELL_ENOMEM;
+    if (!VirtualAlloc(vm_base + addr, size, MEM_COMMIT, PAGE_READWRITE)) {
+        /* The guest space may be several allocations (PORT_LARGE_PAGES: the large-page window, port_mem.h), and
+         * one MEM_COMMIT cannot span two: commit run by run; committed runs (large pages) are left alone. */
+        uint8_t* a = vm_base + addr;
+        uint8_t* const end = a + size;
+        while (a < end) {
+            MEMORY_BASIC_INFORMATION mi;
+            if (!VirtualQuery(a, &mi, sizeof mi) || mi.State == MEM_FREE) return CELL_ENOMEM;
+            uint8_t* const run_end = (uint8_t*)mi.BaseAddress + mi.RegionSize;
+            const size_t k = (size_t)((run_end < end ? run_end : end) - a);
+            if (mi.State == MEM_RESERVE && !VirtualAlloc(a, k, MEM_COMMIT, PAGE_READWRITE)) return CELL_ENOMEM;
+            a += k;
+        }
+    }
 #else
     if (vm__mprotect_pages(addr, size, PROT_READ | PROT_WRITE) != 0)
         return CELL_ENOMEM;
