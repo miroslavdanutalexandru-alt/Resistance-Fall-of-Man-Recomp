@@ -55,6 +55,11 @@ __pycache__/
 # local copies of earlier builds
 /backup_build_*/
 
+# per-user online settings written by the launcher's Multiplayer page
+/net_hosts.txt
+/online.txt
+/online_id.txt
+
 # Setup.exe is attached to the GitHub release, not committed
 /Setup.exe
 # build tools Setup put into this folder (portable mode) and the list of what it installed

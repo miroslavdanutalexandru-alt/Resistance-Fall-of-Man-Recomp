@@ -931,6 +931,7 @@ static __declspec(thread) u32 T_DRAWCNT;
 static __declspec(thread) int T_PARITY;
 char g_rsx_title_base[128] = "ps3recomp";
 static u32 s_dbg_last_draws = 0;
+volatile unsigned g_rsx_frame_draws = 0;   /* v185: last frame's guest draws, read by cellPad.c */
 static u64 s_req_verts = 0, s_req_draws = 0, s_drop_draws = 0;
 /* Raw bind offset of the duck's texture, identified by CONTENT (duck.tga is
  * overwhelmingly yellow, avg 243,191,23). VRAM offsets move between runs, so a
@@ -13316,6 +13317,7 @@ static void render_frame_impl(void)
     }
     fg_hud_mv_dump(T_DRAWS, T_DRAWCNT);   /* Ctrl+Shift+F2: per-draw motion matching */
     s_dbg_last_draws = T_DRAWCNT;
+    { extern volatile unsigned g_rsx_frame_draws; g_rsx_frame_draws = s_dbg_last_draws; }   /* v185: cellPad.c level detect */
     if (!t_render_thread) {   /* producer state: the FIFO thread's (render_frame resets it under RSX_ASYNC) */
         s_d3d.vb_offset  = 0; /* reset for next frame */
         s_d3d.vp_vb_offset = 0; s_vp_ib_off = 0; s_gf_off = 0; s_gf_gen++;
@@ -14059,8 +14061,15 @@ static void d3d12_clear(void* ud, u32 flags, u32 color, float depth, u8 stencil)
      * and each captured frame holds only a slice of the geometry -- the floor in
      * one, a wall in the next -- which makes a single model impossible to see. */
     { static int accum = -1;
-      if (accum < 0) { const char* e = getenv("RSX_ACCUM_FRAME"); accum = e ? atoi(e) : 0; }
-      if (accum) return; }
+      if (accum < 0) { const char* e = getenv("RSX_ACCUM_FRAME"); accum = e ? atoi(e) : -2; }
+      /* v185: online matches run inside the front end, which is launched
+       * without RSX_ACCUM_FRAME (run.bat passes it only to game.self as
+       * CHILD_RSX_ACCUM_FRAME). Presenting at clear boundaries then showed a
+       * pass that clears to the fog colour with the HUD on top: a flat yellow
+       * screen, intermittently. Unset = accumulate while cellPad.c sees a
+       * level in the front end (g_rfom_fe_level); 0 / 1 = force. */
+      extern volatile int g_rfom_fe_level;
+      if (accum > 0 || (accum == -2 && g_rfom_fe_level)) return; }
     if (s_d3d.initialized) {
         if (blink_dbg())
             printf("[CLEAR] presenting %u accumulated draws at frame boundary\n",

@@ -2607,9 +2607,17 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
       /* PS3_CALLTRACE_LR=<hex>: only calls returning to this guest address.
        * An unfiltered trace is far too heavy to reach a late failure -- it
        * changes the timing enough that the run never gets there. */
+      /* A comma list (up to 8) follows a call through several dispatch hops in
+       * one run, e.g. PS3_CALLTRACE_LR=006083D8,001BD784. */
       static int64_t only_lr = -2;
+      static uint32_t lr_list[8]; static int lr_n = 0;
       if (only_lr == -2) { const char* e = getenv("PS3_CALLTRACE_LR");
-                           only_lr = e ? (int64_t)strtoul(e, 0, 16) : -1; }
+                           only_lr = e ? (int64_t)strtoul(e, 0, 16) : -1;
+                           for (const char* c = e; c && *c && lr_n < 8; ) {
+                               lr_list[lr_n++] = (uint32_t)strtoul(c, (char**)&c, 16);
+                               while (*c == ',' || *c == ' ') c++; } }
+      int lr_hit = 0;
+      for (int k = 0; k < lr_n; k++) if ((uint32_t)ctx->lr == lr_list[k]) lr_hit = 1;
       /* PS3_CALLTRACE_R5=<n>: only calls with this selector in r5. Some lifted
        * bctrl sites never set ctx->lr (the lifter uses a host call there), so
        * filtering by return address silently matches nothing -- an argument
@@ -2622,7 +2630,16 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
       static int64_t only_to = -2;
       if (only_to == -2) { const char* e = getenv("PS3_CALLTRACE_TO");
                            only_to = e ? (int64_t)strtoul(e, 0, 16) : -1; }
-      if (only_to >= 0 && addr != (uint32_t)only_to) goto skip_calltrace;
+      /* PS3_CALLTRACE_TO_END=<hex>: with _TO, match the target range [TO, TO_END]
+       * -- e.g. every slot of one listener vtable in a single run. */
+      static int64_t only_to_end = -2;
+      if (only_to_end == -2) { const char* e = getenv("PS3_CALLTRACE_TO_END");
+                               only_to_end = e ? (int64_t)strtoul(e, 0, 16) : -1; }
+      if (only_to >= 0) {
+          if (only_to_end >= 0) {
+              if (addr < (uint32_t)only_to || addr > (uint32_t)only_to_end) goto skip_calltrace;
+          } else if (addr != (uint32_t)only_to) goto skip_calltrace;
+      }
       static int64_t only_from = -2;
       if (only_from == -2) { const char* e = getenv("PS3_CALLTRACE_FROM");
                              only_from = e ? (int64_t)strtoul(e, 0, 16) : -1; }
@@ -2636,7 +2653,7 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
       if (only_r5 == -2) { const char* e = getenv("PS3_CALLTRACE_R5");
                            only_r5 = e ? strtol(e, 0, 0) : -1; }
       if (only_r5 >= 0 && (int64_t)(int32_t)ctx->gpr[5] != only_r5) { /* skip */ } else
-      if (only_lr >= 0 && (uint32_t)ctx->lr != (uint32_t)only_lr) { /* skip */ } else
+      if (only_lr >= 0 && !lr_hit) { /* skip */ } else
       if(ctr_n>0){ ctr_n--;
         /* Name the CALLER too: for an indirect call the interesting question
          * is usually who dispatched it, not just where it landed. flOw calls
@@ -3642,6 +3659,35 @@ extern "C" uint32_t ppu_load_elf(const char* path)
     }
     free(file);
     fprintf(stderr, "[ppu] loaded %d PT_LOAD segments, entry OPD 0x%08X\n", loaded, entry);
+
+    /* PS3_MEMPATCH=<hex ea>:<file>[;<ea>:<file>...] -- copy each file's bytes
+     * into guest memory once, right after the image is loaded. Unlike PPU_POKE
+     * this does not fight the guest afterwards: it replaces initialised data
+     * (e.g. an embedded certificate) before any guest code has read it. A
+     * patch must fit inside a loaded image range, so it can't spill into
+     * unrelated memory. */
+    { const char* mp = getenv("PS3_MEMPATCH");
+      if (mp && *mp && vm_base) {
+          char buf[2048]; snprintf(buf, sizeof buf, "%s", mp);
+          for (char* tok = strtok(buf, ";"); tok; tok = strtok(NULL, ";")) {
+              char* colon = strchr(tok, ':');
+              if (!colon) { fprintf(stderr, "[mempatch] bad entry '%s' (want ea:file)\n", tok); continue; }
+              *colon = 0;
+              uint32_t ea = (uint32_t)strtoul(tok, 0, 16);
+              const char* path = colon + 1;
+              FILE* pf = fopen(path, "rb");
+              if (!pf) { fprintf(stderr, "[mempatch] cannot open %s\n", path); continue; }
+              unsigned char pb[65536]; size_t pn = fread(pb, 1, sizeof pb, pf); fclose(pf);
+              bool inside = false;
+              for (auto& r : g_ppu_image_ranges)
+                  if (ea >= r.begin && (uint64_t)ea + pn <= r.end) inside = true;
+              if (!pn || !inside) {
+                  fprintf(stderr, "[mempatch] 0x%08X+%zu from %s is outside the loaded image, skipped\n", ea, pn, path);
+                  continue;
+              }
+              memcpy(vm_base + ea, pb, pn);
+              fprintf(stderr, "[mempatch] wrote %zu bytes at 0x%08X from %s\n", pn, ea, path);
+          } } }
 
     /* Arm PPU_GUARD_EA here as well as in lv2_syscall. The syscall path only
      * runs once the guest CRT is already going, which misses anything the CRT

@@ -314,6 +314,7 @@ target_include_directories(${PROJECT_NAME} PRIVATE
     "${PS3RECOMP_DIR}/runtime/syscalls"
     "${PS3RECOMP_DIR}/runtime/platform"        # win32_compat.h and friends
     "${PS3RECOMP_DIR}/libs/video"
+    "${PS3RECOMP_DIR}/libs/network"           # np_psnr.h: online setup in main.cpp
     "${CMAKE_CURRENT_SOURCE_DIR}"
 )
 

@@ -177,7 +177,7 @@ Two players on one PC, split-screen, as on PS3. In the launcher, Controls page, 
 | Player 1 controller | **Automatic**, Controller 1-8 | `PAD_P1_CONTROLLER=<1..8>`: the controller that is player 1 (needs Controller support = SDL3, numbered in the order they were connected). Automatic = the controller used last (co-op off) or the first one found (co-op on) |
 | Player 2 controller | **Automatic**, Controller 1-8 | `PAD_P2_CONTROLLER=<1..8>`: the controller that is player 2 when Local co-op is On (numbered as above; needs Controller support = SDL3) |
 
-In co-op the mouse turns only player 1's camera, at the same speed as in single player (`RFOM_COOP_ML`). There is no *Player 2 uses keyboard and mouse* option in Resistance: Fall of Man: the port's mouse look writes straight into player 1's camera, so the keyboard can't be player 2. W/S/A/D only drive the Lynx while player 2's camera code isn't running, so not while they are on foot, in the Lynx gunner seat or on a turret (`RFOM_KBM_DRIVE`); E / Shift always work. Online play (PS3: 40 players on Sony's servers, now closed) is off by default; see Online (experimental) below.
+In co-op the mouse turns only player 1's camera, at the same speed as in single player (`RFOM_COOP_ML`). There is no *Player 2 uses keyboard and mouse* option in Resistance: Fall of Man: the port's mouse look writes straight into player 1's camera, so the keyboard can't be player 2. W/S/A/D only drive the Lynx while player 2's camera code isn't running, so not while they are on foot, in the Lynx gunner seat or on a turret (`RFOM_KBM_DRIVE`); E / Shift always work. Online play (PS3: 40 players on Sony's servers, now closed) is optional: see *Multiplayer* under the launcher pages (community server, off by default); an older RPCN / PS Rewired path is described under Online (experimental) below.
 
 ## Online (experimental)
 
@@ -271,12 +271,13 @@ The options are sorted into pages (the same pages as the Resistance 2 / 3 launch
 | 2 | Upscaling & Frame Gen | Anti-aliasing and upscaling (DLSS / FSR / XeSS, DLSS model, sharpening, object motion vectors), Frame generation and latency (Frame Generation, Reflex) |
 | 3 | Performance | Shader cache (compile before playing, compile threads, **Rebuild shader cache**) |
 | 4 | Controls | Key bindings, Mouse, Controller, Gyro, Controller buttons |
-| 5 | Audio | Sound (speaker layout, audio buffer), In the background |
-| 6 | Interface & Notifications | Notifications (achievement pop-ups), Movies (hold to skip, skip hint), Overlays (F3 overlay and its corner), Photo mode and Discord |
-| 7 | Advanced | Start-up and quitting, Gameplay (gore, adaptive difficulty), Cheats (single player), Mods and textures, Saves (location, backups, **Open save folder**), Updates |
-| 8 | Achievements | Unofficial fan-made achievements read from your save (see *Achievements* under *Trophies*) |
-| 9 | Saves & tools | Save backups, the benchmark |
-| 10 | About | Version, credits and licences, the key list, folder buttons, the project page, **Report a problem**, **Reset all to defaults** |
+| 5 | Multiplayer | Online play (off by default; the community server), network logging, **Edit online.txt**, **Edit net_hosts.txt** |
+| 6 | Audio | Sound (speaker layout, audio buffer), In the background |
+| 7 | Interface & Notifications | Notifications (achievement pop-ups), Movies (hold to skip, skip hint), Overlays (F3 overlay and its corner), Photo mode and Discord |
+| 8 | Advanced | Start-up and quitting, Gameplay (gore, adaptive difficulty), Cheats (single player), Mods and textures, Saves (location, backups, **Open save folder**), Updates |
+| 9 | Achievements | Unofficial fan-made achievements read from your save (see *Achievements* under *Trophies*) |
+| 10 | Saves & tools | Save backups, the benchmark |
+| 11 | About | Version, credits and licences, the key list, folder buttons, the project page, **Report a problem**, **Reset all to defaults** |
 
 Options that are empty by default write nothing to `settings.bat` until changed (the game's default is used).
 
@@ -337,6 +338,18 @@ Button: **Rebuild shader cache** (asks first).
 
 **Controls:** key bindings, the mouse (sensitivity, invert, mouse aiming, the free-cursor key, vertical and zoomed sensitivity, zoom mode, aim assist (`PORT_AIM_ASSIST=on\|off`, unset = Auto), shaking off grabs with the mouse (`RFOM_GRAB_MOUSE=0` = off), the extra crosshair), the controller (use / interact button, deadzone, response curve, controller support, button prompts `RFOM_PAD_GLYPHS=\|xbox\|ps`, Nintendo layout, light bar, pause on disconnect, southpaw, player 1 controller `PAD_P1_CONTROLLER=1..4`), gyro, and the controller button remap. See *Controls* above.
 
+**Multiplayer**
+
+Online play is **off by default**. With it on, the game's Online menu reaches a community server, `r1.rfom.online` ([Resistance-Fall-of-Man-Recomp-Server](https://github.com/soccerzebra/Resistance-Fall-of-Man-Recomp-Server), run by a fan, not Sony): sign in, then find, create and join custom games. Off, the game never touches the network and runs exactly as before.
+
+| Setting | Choices (default) | Environment variable | Notes |
+|---|---|---|---|
+| Online play | **Off**, On | `PS3_NET_ONLINE=1` | Real host sockets, a connected network, the hostname map below, and the community server's certificates accepted by the front end only (`PS3_MP_SCERT_ACCEPT`, and its TLS root swapped in memory from `tools\mp\r1_root.der`; nothing on disk is changed). |
+| Log network traffic | **Off**, On | `PS3_NET_TRACE=1` | Every packet sent and received goes to `logs\run.log`. Large and slow; for diagnosing a failed connection. Only with Online play on. |
+| Edit online.txt | button | `PS3_NP_ONLINE_ID` | `id=` your player name (3-16 letters, digits, `-` or `_`). Empty: a random one (such as ExcitingHippo), saved in `online_id.txt` so it stays the same. Never your Windows user name. |
+| Edit net_hosts.txt | button | `PS3_NET_HOSTS` | Which server the game connects to: one `hostname address` per line (IP or domain). Default: every Sony hostname -> `r1.rfom.online`. Created the first time Online play runs. |
+
+Privacy: the server sees your IP address and player name, and may log the lobby traffic. `RFOM_MP_TRACE=1` writes the port's own lobby diagnostics (`logs\mp_game.log`); off by default. Two copies on one PC: `tools\mp\run_player2.bat`.
 **Audio**
 
 | Setting | Choices (default) | Environment variable | Notes |

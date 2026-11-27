@@ -38,6 +38,12 @@
  * names over pthreads and mmap, so the call sites below are written once. */
 #include "win32_compat.h"
 
+/* Online: settles the player name and the psnr server before the toolkit
+ * registers its HLE handlers (ps3recomp/libs/network/np_psnr.h). Online is
+ * opt-in (online_setup): off unless PS3_NET_ONLINE is set or --psnr given. */
+#include "np_psnr.h"
+
+#include <string>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -438,6 +444,137 @@ static void derive_vfs_root(const char* eboot)
 }
 
 /* ---------------------------------------------------------------------------
+ * Online
+ * -----------------------------------------------------------------------*/
+/* The effective server and name are settled before the title runs because the
+ * runtime caches getenv() answers and ppu_sysprx_register() chooses real
+ * sockets over the offline stubs from PS3_NET_ONLINE at registration time.
+ * Launcher.exe / run.bat set the variables through settings.bat; these flags
+ * override them for a manual launch, matching the toolkit's runtime:
+ *   --psnr host[:port]   sets PS3_NET_ONLINE=1 and PSNR_SERVER
+ *   --username NAME      the online ID (PS3_NP_ONLINE_ID if not given)
+ * np_psnr_setup also exports the two variables, so the level process the front
+ * end spawns inherits them (stubs.cpp passes its environment on). */
+static const char* arg_value(int argc, char** argv, const char* flag)
+{
+    for (int i = 2; i + 1 < argc; i++)
+        if (!strcmp(argv[i], flag)) return argv[i + 1];
+    return nullptr;
+}
+
+static void env_default(const char* k, const char* v)
+{
+    if (getenv(k)) return;
+#ifdef _WIN32
+    _putenv_s(k, v);
+#else
+    setenv(k, v, 0);
+#endif
+}
+
+/* The hostname map new installs start with: every Sony hostname the front end
+ * looks up -> the community server. */
+static const char kDefaultHosts[] =
+    "# Resistance: Fall of Man -- hostname overrides (Multiplayer page).\n"
+    "# One \"hostname address\" per line (an IP or a domain name); '#' starts a comment.\n"
+    "# Every Sony hostname goes to the community server; for a server on this PC use 127.0.0.1.\n"
+    "\n"
+    "resistance.ps3.online.scea.com            r1.rfom.online\n"
+    "resistance.online.scee.com                r1.rfom.online\n"
+    "resistance-muis.scej-online.jp            r1.rfom.online\n"
+    "resistance-prod-muis.pdonline.scek.co.kr  r1.rfom.online\n"
+    "rfom.rt.au.playstation.com                r1.rfom.online\n"
+    "blob128.scea.com                          r1.rfom.online\n";
+
+/* Absolute path of a file in the game folder (the working directory run.bat sets). */
+static void game_path(const char* rel, char* out, size_t n)
+{
+#ifdef _WIN32
+    if (!_fullpath(out, rel, n)) snprintf(out, n, "%s", rel);
+#else
+    if (!realpath(rel, out)) snprintf(out, n, "%s", rel);
+#endif
+}
+
+static void online_setup(int argc, char** argv)
+{
+    /* Online play is opt-in (launcher: Multiplayer page -> Online play, which
+     * writes PS3_NET_ONLINE=1 to settings.bat; or --psnr). Off, nothing here
+     * runs and the run is the offline game exactly as before. On, the game
+     * talks to the community server (r1.rfom.online) once the player opens the
+     * Online menu; nothing goes on the network before that. The runtime checks
+     * PS3_NET_ONLINE by presence, so an empty or "0" value is removed. Each
+     * default below only applies when the variable is unset, so
+     * tools\mp\trace_run.bat (a local server) still overrides them. */
+    const char* on = getenv("PS3_NET_ONLINE");
+    const bool want = (on && *on && strcmp(on, "0") != 0) || arg_value(argc, argv, "--psnr");
+    if (!want) {
+        if (on) {
+#ifdef _WIN32
+            _putenv_s("PS3_NET_ONLINE", "");
+#else
+            unsetenv("PS3_NET_ONLINE");
+#endif
+        }
+        return;
+    }
+    env_default("PS3_NET_ONLINE", "1");
+    /* The community server cannot present a Sony-signed SCERT certificate
+     * (front end only: the hook is in EBOOT.elf's lobby code). */
+    env_default("PS3_MP_SCERT_ACCEPT", "1");
+    char path[1024];
+    if (!getenv("PS3_NET_HOSTS")) {
+        game_path("net_hosts.txt", path, sizeof path);
+        FILE* f = fopen(path, "rb");
+        if (f) fclose(f);
+        else if ((f = fopen(path, "wb"))) { fputs(kDefaultHosts, f); fclose(f); }
+        env_default("PS3_NET_HOSTS", path);
+    }
+    /* The name: --username, else PS3_NP_ONLINE_ID (id= in online.txt via the
+     * launcher), else the random one saved in online_id.txt. Never the
+     * Windows user name. */
+    np_psnr_setup(arg_value(argc, argv, "--username"), arg_value(argc, argv, "--psnr"));
+
+    printf("[online] on: real host sockets, hostnames from %s\n",
+           getenv("PS3_NET_HOSTS") ? getenv("PS3_NET_HOSTS") : "(none)");
+    if (getenv("PS3_NET_TRACE")) printf("[online] PS3_NET_TRACE: logging every packet\n");
+    if (getenv("PS3_MP_SCERT_ACCEPT"))
+        printf("[online] PS3_MP_SCERT_ACCEPT: accepting the community server's SCERT certificate\n");
+}
+/* The ticket login (SVO, SSL 3.0) trusts only the SCERT root embedded in the
+ * front end at 0x10038310 (958 bytes). The community server's stand-in root
+ * (tools\mp\r1_root.der: same names and size, the server's own key) replaces
+ * it after the ELF is loaded. Done here rather than with PS3_MEMPATCH, which
+ * the level program would inherit: the bytes are only replaced where they
+ * really are that root, so game.self is never touched. PS3_MEMPATCH (set by
+ * tools\mp\trace_run.bat for a local server) takes precedence. */
+static void online_patch_root(void)
+{
+    const uint32_t ea = 0x10038310u, len = 958u;
+    if (!getenv("PS3_NET_ONLINE") || getenv("PS3_MEMPATCH") || !vm_base) return;
+    uint8_t* p = vm_base + ea;
+    static const uint8_t hdr[4] = { 0x30, 0x82, 0x03, 0xBA };   /* SEQUENCE, 958 - 4 bytes */
+    static const char name[] = "SCERT Root Authority";
+    if (memcmp(p, hdr, 4) != 0) return;                         /* not the front end */
+    bool named = false;
+    for (uint32_t i = 0; i + sizeof name - 1 <= len && !named; i++)
+        named = memcmp(p + i, name, sizeof name - 1) == 0;
+    if (!named) return;
+    char path[1024];
+    game_path("tools\\mp\\r1_root.der", path, sizeof path);
+    uint8_t buf[958];
+    FILE* f = fopen(path, "rb");
+    size_t n = f ? fread(buf, 1, sizeof buf, f) : 0;
+    if (f) fclose(f);
+    if (n != len || memcmp(buf, hdr, 4) != 0) {
+        printf("[online] %s is missing or not a 958-byte root: the ticket login will fail\n", path);
+        return;
+    }
+    memcpy(p, buf, len);
+    printf("[online] community server TLS root patched in (%s)\n", path);
+}
+
+/* ---------------------------------------------------------------------------
  * Guest VM
  * -----------------------------------------------------------------------*/
 #ifdef _WIN32
@@ -515,7 +652,7 @@ extern "C" void cellGame_init_from_paramsfo(const char* sfo_path);
 int main(int argc, char** argv)
 {
     if (argc < 2) {
-        printf("usage: %s <PPU ELF>\n", argv[0]);
+        printf("usage: %s <PPU ELF> [--psnr host[:port]] [--username NAME]\n", argv[0]);
         return 2;
     }
 
@@ -620,11 +757,16 @@ int main(int argc, char** argv)
     }
     port_large_pages_summary(&s_large_pages);
 
+    /* Before ppu_load_elf (it reads PS3_MEMPATCH) and ppu_sysprx_register (it
+     * reads PS3_NET_ONLINE to pick real sockets over the offline libnet model). */
+    online_setup(argc, argv);
+
     uint32_t entry = ppu_load_elf(argv[1]);
     if (!entry) {
         fprintf(stderr, "ERROR: could not load %s\n", argv[1]);
         return 1;
     }
+    online_patch_root();
 
     derive_vfs_root(argv[1]);
     printf("[boot] VFS root: %s\n", ppu_vfs_root);

@@ -5,7 +5,7 @@ if not exist logs mkdir logs
 rem settings and controls are also kept in Saved Games\Resistance Fall of Man\config, so they survive a reinstall or update:
 rem missing files are restored from there before the game starts and saved back after it closes. portable.txt turns this off.
 set "CFG_USER=%USERPROFILE%\Saved Games\Resistance Fall of Man\config"
-set "CFG_FILES=settings.ini settings.bat controls.txt mouselook.cfg"
+set "CFG_FILES=settings.ini settings.bat controls.txt mouselook.cfg online.txt net_hosts.txt online_id.txt"
 if not exist portable.txt if exist "%CFG_USER%" robocopy "%CFG_USER%" . %CFG_FILES% /XO /XN /XC /R:0 /W:0 /NJH /NJS /NFL /NDL /NP >nul
 rem RFOM_BUILD_DIR: run another build of the programs (a Launcher.exe in that folder sets it); on a CPU without AVX2
 rem (the launcher sets PORT_CPU_V3=0) the build_baseline ones when they have been built (build_cpu.bat baseline)

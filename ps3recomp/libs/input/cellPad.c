@@ -550,6 +550,8 @@ static int s_menu_mouse = 1; static long s_menu_step = 150;   /* v160 */
  * Triangle. With a controller, pad_interact = <button> does the same for that
  * button (NONE = as on PS3). */
 volatile unsigned long long g_kbm_mouse_abs = 0;     /* total mouse travel, counts */
+static int s_fe_level = 0;   /* v185: front end is showing a level (online match), see the menu-mode block */
+volatile int g_rfom_fe_level = 0;   /* v185: the same, for rsx_d3d12_backend.c (whole-frame presents) */
 volatile unsigned long long g_rfom_play_ms = 0;   /* v162: last tick the in-play look code ran (stubs.cpp) */
 volatile unsigned long long g_rfom_drive_ms = 0;  /* issue #14: last tick a vehicle's driver input code ran for the keyboard player (stubs.cpp rfom_drive_note) */
 volatile int g_rfom_pause_ui = 0;   /* v162c: the pause menu loaded its text (stubs.cpp); cleared when play resumes */
@@ -879,7 +881,31 @@ static void pad_poll_keyboard(void)
                     const char* b = strrchr(mp, '\\'); b = b ? b + 1 : mp;
                     fe = (!_stricmp(b, "ResistanceFoM.exe") && s_menu_mouse) ? 1 : 0;
                     if (fe) printf("[controls] menu mode: WASD / arrows move, Space / Enter select, Esc / Backspace back\n"); }
+      /* v185: online matches run INSIDE the front end (no exitspawn to
+       * game.self), and menu mode turned WASD into the d-pad and dropped the
+       * mouse -- a keyboard player could not move or look. The front end's
+       * menus draw ~50-80 guest draws a frame, a level 1000+: above 400 for
+       * 1 s = in a level (the controls.txt game bindings apply), below 200 for
+       * 1 s = back in the menus. Only with online play on (PS3_NET_ONLINE):
+       * offline a level never runs in the front end. RFOM_FE_LEVEL_DRAWS=n sets
+       * the threshold, 0 disables. */
+      int fe_level = s_fe_level;
       if (fe) {
+          extern volatile unsigned g_rsx_frame_draws;
+          static int thr = -1; static ULONGLONG hi_since = 0, lo_since = 0;
+          if (thr < 0) { const char* e = getenv("RFOM_FE_LEVEL_DRAWS"); thr = e ? atoi(e) : (getenv("PS3_NET_ONLINE") ? 400 : 0); }
+          const unsigned d = g_rsx_frame_draws;
+          if (thr > 0 && d > (unsigned)thr) { lo_since = 0; if (!hi_since) hi_since = now; }
+          else if (d < (unsigned)thr / 2) { hi_since = 0; if (!lo_since) lo_since = now; }
+          const int was = fe_level;
+          if (!fe_level && hi_since && now - hi_since >= 1000) fe_level = 1;
+          if (fe_level && lo_since && now - lo_since >= 1000) fe_level = 0;
+          if (fe_level != was) printf("[controls] front end %s (%u draws/frame): %s\n",
+                                      fe_level ? "in a level" : "back in the menus", d,
+                                      fe_level ? "game controls" : "menu controls");
+          s_fe_level = fe_level; g_rfom_fe_level = fe_level;
+      }
+      if (fe && !fe_level) {
         static long acc_x = 0, acc_y = 0; static int pend_x = 0, pend_y = 0;
         static ULONGLONG ph_t = 0; static int ph = 0; static u16 ph_btn = 0;   /* pulse: 0 idle, 1 down, 2 gap */
         if (s_menu_mouse >= 2) { acc_x += mdx; acc_y += mdy; }   /* v160b: stepping by mouse motion off (menu_mouse = 2 turns it on) */
@@ -906,6 +932,18 @@ static void pad_poll_keyboard(void)
         if (KD(VK_RIGHT) || KD('D')) m |= CELL_PAD_CTRL_RIGHT;
         #undef KD
         if (ph == 1) m |= ph_btn;
+        /* v185: the front end's prompts name the controls.txt key of each pad
+         * button ("[Shift] VOTE TO START" / "[Shift] CREATE GAME" = L2, "TEXT
+         * CHAT" = R2, "SCROLL" = L1/L2, Square/Triangle options, Select = buddy
+         * list), but only the d-pad and Cross/Circle/Start got through, so those
+         * prompts could never be answered from the keyboard. Keep the bound
+         * shoulder/face/Select buttons (mouse buttons only count when captured).
+         * Online only: the offline menus get exactly what they got before. */
+        { static int online = -1;
+          if (online < 0) online = getenv("PS3_NET_ONLINE") ? 1 : 0;
+          if (online)
+              m |= (u16)(btns & (CELL_PAD_CTRL_L1 | CELL_PAD_CTRL_L2 | CELL_PAD_CTRL_R1 | CELL_PAD_CTRL_R2 |
+                                 CELL_PAD_CTRL_SQUARE | CELL_PAD_CTRL_TRIANGLE | CELL_PAD_CTRL_SELECT)); }
         btns = pad_kb_confirm(m); lx = ly = krx = kry = 0; interact = 0;
         mdx = mdy = 0;                       /* the mouse is the highlight here, not a stick */
       } }
@@ -972,6 +1010,53 @@ static void pad_poll_keyboard(void)
         lx = ly = 0;   /* the stick would fight the d-pad on some screens */
         menu_raw = 1;  /* v162b: menus read raw buttons -- the controller-screen swap (e.g. crouch <-> d-pad up) must not apply */
       } }
+    /* v191 (experimental, RFOM_MP_PAUSE_KEYS=1; off by default): the pause menu of
+     * an online match (front end, s_fe_level). The match keeps running, so the
+     * v162 menu test (the look code stopped) never fires and the menu, which only
+     * reads the d-pad and Cross/Circle, got WASD as the left stick and arrows as
+     * whatever they are bound to. No pause flag of the game is known, so the
+     * pause is followed from Start: a Start press (Esc) opens it, the next one
+     * closes it. While open: WASD / arrows = d-pad, Enter = Cross (Space keeps
+     * its binding, Cross by default), Backspace = Circle; Enter bound to Start
+     * selects instead. Mouse motion (looking around: the menu was left another
+     * way, e.g. Resume) ends it. */
+    { static int en = -1, fe5 = -1;
+      if (en < 0) { const char* e = getenv("RFOM_MP_PAUSE_KEYS"); en = (e && atoi(e)) ? 1 : 0; }
+      if (fe5 < 0) { char mp[MAX_PATH] = ""; GetModuleFileNameA(NULL, mp, MAX_PATH);
+                     const char* b = strrchr(mp, '\\'); b = b ? b + 1 : mp;
+                     fe5 = _stricmp(b, "ResistanceFoM.exe") ? 0 : 1; }
+      static int paused = 0, was_start = 0, said = 0; static long mv = 0; static ULONGLONG mv_t = 0;
+      if (!en || !fe5 || !s_fe_level) { paused = 0; was_start = (btns & CELL_PAD_CTRL_START) != 0; }
+      else {
+        #define KD(vk) ((GetAsyncKeyState(vk) & 0x8000) != 0)
+        u16 b = btns;
+        if (paused && KD(VK_RETURN) && !KD(VK_ESCAPE)) b &= (u16)~CELL_PAD_CTRL_START;
+        const int st = (b & CELL_PAD_CTRL_START) != 0;
+        if (st && !was_start) { paused = !paused; mv = 0; mv_t = now; }
+        was_start = st;
+        if (paused) {   /* ~60 degrees of looking within 250 ms = playing again */
+            if (now - mv_t > 250) { mv = 0; mv_t = now; }
+            mv += labs(mdx) + labs(mdy);
+            if (mv > 600) paused = 0;
+        }
+        { static int was = 0;
+          if (paused != was && said < 40) { said++; printf("[controls] online match: pause menu keys %s\n", paused ? "on" : "off"); }
+          was = paused; }
+        if (paused) {
+            btns = b;
+            if (KD(VK_UP) || KD('W')) btns |= CELL_PAD_CTRL_UP;
+            if (KD(VK_DOWN) || KD('S')) btns |= CELL_PAD_CTRL_DOWN;
+            if (KD(VK_LEFT) || KD('A')) btns |= CELL_PAD_CTRL_LEFT;
+            if (KD(VK_RIGHT) || KD('D')) btns |= CELL_PAD_CTRL_RIGHT;
+            u16 kc = 0;
+            if (KD(VK_RETURN)) kc |= CELL_PAD_CTRL_CROSS;
+            if (KD(VK_BACK)) kc |= CELL_PAD_CTRL_CIRCLE;
+            btns |= pad_kb_confirm(kc);
+            krx = kry = 0;   /* arrows bound to looking: the d-pad only */
+            menu_raw = 1;
+        }
+        #undef KD
+      } }
     if (g_rfom_space_start && (GetAsyncKeyState(VK_SPACE) & 0x8000)) btns |= CELL_PAD_CTRL_START;   /* v160v */
     /* v186: the front end's first-run screens (initial setup, notices) say
      * "Press the SPACE bar" -- the relabelled Start prompt -- but only Enter
@@ -980,7 +1065,7 @@ static void pad_poll_keyboard(void)
       if (fe3 < 0) { char mp[MAX_PATH] = ""; GetModuleFileNameA(NULL, mp, MAX_PATH);
                      const char* b = strrchr(mp, '\\'); b = b ? b + 1 : mp;
                      fe3 = _stricmp(b, "ResistanceFoM.exe") ? 0 : 1; }
-      if (fe3 && (GetAsyncKeyState(VK_SPACE) & 0x8000)) btns |= CELL_PAD_CTRL_START; }
+      if (fe3 && !s_fe_level && (GetAsyncKeyState(VK_SPACE) & 0x8000)) btns |= CELL_PAD_CTRL_START; }   /* v185: not in an online match (Space = jump) */
     btns = pad_aim_hold(0, btns, menu_raw);
     btns = pad_hold_toggle(0, btns, menu_raw);
     hs->buttons   = menu_raw ? btns : kbm_unswap(btns);   /* v152: undo the in-game button swaps for the keyboard */

@@ -28,6 +28,9 @@ static const CatGroup g_cat[] = {
     { P_CONTROLS, "CONTROLLER BUTTONS",           "padmap_*",
       "Also in game: F10 \xE2\x80\xBA More PC Options \xE2\x80\xBA Controller layout. Key bindings for keyboard and "
       "mouse are above." },
+    { P_ONLINE,   "ONLINE PLAY",                  "online net_trace",
+      "Off by default. On: the Online menu connects to the community server r1.rfom.online (run by a fan, not Sony). "
+      "Single player is the same either way." },
     { P_AUDIO,    "SOUND",                        "speakers audio_channels audio_buffer volume audio_mono", nullptr },
     { P_AUDIO,    "IN THE BACKGROUND",            "background", nullptr },
     { P_UI,       "NOTIFICATIONS",                "trophytoast trophystyle", nullptr },
@@ -44,14 +47,15 @@ static const CatGroup g_cat[] = {
     { P_ADVANCED, "UPDATES",                      "updates", nullptr },
 };
 static const char* g_page_title[P_COUNT] = { "Display", "Graphics", "Upscaling & Frame Generation", "Performance",
-                                             "Controls", "Audio", "Interface & Notifications", "Advanced",
-                                             "Achievements", "Saves & tools", "About" };
+                                             "Controls", "Multiplayer", "Audio", "Interface & Notifications",
+                                             "Advanced", "Achievements", "Saves & tools", "About" };
 static const char* g_page_intro[P_COUNT] = {
     "How the game window looks and how fast it runs.",
     "Image quality. Higher settings look better and cost more GPU time.",
     "Anti-aliasing, DLSS / FSR / XeSS upscaling, sharpening and frame generation.",
     "How the game builds its shaders.",
     "",
+    "Online custom games on a community server (default r1.rfom.online).",
     "Sound output, and what the game does while it is in the background.",
     "Notifications, hints and overlays the game shows while you play.",
     "Start-up, gameplay, mods, saves and updates.",

@@ -904,6 +904,391 @@ static void snd_log(const char* line)
             (unsigned long long)GetTickCount64(), (unsigned long)GetCurrentThreadId(), line);
     fclose(f);
 }
+/* Resistance port (v170): multiplayer SCERT peer-certificate acceptance.
+ *
+ * The online stack (Medius client 3.01.0001) authenticates the SERVER with an
+ * SCERT certificate as its very first act on TCP :10071. We cannot obtain a
+ * Sony-signed certificate for a community server, so the decision has to be
+ * made inside the game: the peer-certificate handler reached through
+ * func_00627748 (vtable +0x8C) reports "no session" (2), "no handler" (3) or
+ * the verifier's own code, and every one of those aborts the handshake.
+ *
+ * With PS3_MP_SCERT_ACCEPT=1 that handler's answer is forced to 0 (accepted).
+ * The game's own success path then does all of the bookkeeping -- connection
+ * state, consumed length, peer identity -- so nothing here has to fake it.
+ * Off by default: without the variable the offline game and the stock
+ * verification are exactly as shipped.
+ *
+ * Replaces nothing. It only ever turns a rejection into an acceptance, so a
+ * hook left enabled by accident cannot make a real server check stricter. */
+extern "C" int rfom_mp_scert_accept(void)
+{
+    static int en = -1;
+    if (en < 0) { const char* e = getenv("PS3_MP_SCERT_ACCEPT"); en = (e && *e && atoi(e) != 0) ? 1 : 0; }
+    return en;
+}
+/* RFOM_MP_TRACE=1 (tools\mp\trace_run.bat): the multiplayer research logs below
+ * (logs\mp_*.log) and the lobby state poller. Off by default, online or not, so
+ * a normal run writes none of them and starts no extra thread. */
+static int rfom_mp_trace(void)
+{
+    static int en = -1;
+    if (en < 0) { const char* e = getenv("RFOM_MP_TRACE"); en = (e && *e && atoi(e) != 0) ? 1 : 0; }
+    return en;
+}
+/* The SCERT handshake trace: what the read pump, the dispatch and the message
+ * handler actually do, from the first byte of our reply to the client's next
+ * send. Only with RFOM_MP_TRACE, so a normal game writes nothing and opens no
+ * file.
+ *
+ * Two things learned the hard way are built in:
+ *  - The idle pump calls back every ~31 ms with identical numbers. Logging
+ *    every call used up the old 600-line budget inside 18 s, so the part that
+ *    matters (what happened after the reply) was always cut off. A repeat of
+ *    the same values for the same kind is now counted instead of written, and
+ *    the count is reported on the line that follows it.
+ *  - The budget still stops the file growing without bound, but it counts
+ *    *distinct* events (4000 of them), and it writes a final "capped" line, so
+ *    a truncated trace says so instead of just ending.
+ *
+ * kinds, and what each field is (see the call sites, one line each):
+ *   1 func_00627748 accept verdict        a=status b=this Ea c=arg Ea
+ *   2 func_00651FEC per connection        a=conn b=[+0x430] c=[+0x444] d=[+0x44C]
+ *   3 func_00651FEC exit status           a=status b=arg
+ *   4 func_0062B9D0 dispatching a record  a=type b=[session+8] c=msg_len d=entry Ea
+ *   5 func_00651FEC called with           a=arg
+ *   6 func_0062B9D0 returning            a=status b=queue head c=[session+8]
+ *   7 record with no dispatch arm         a=type b=[session+8] c=entry Ea
+ *
+ * Values that are not meaningful for a kind are 0; a queue head or session Ea
+ * of 0xFFFFFFFF means "not available here" (the caller had no session yet).
+ *
+ * Kept in one helper so the lifted-code hunks stay one line each. */
+/* Resistance port (v178) diag: name the handler behind every dispatched record.
+ * The dispatcher (loc_0062C434) does not use a static per-type table -- it calls
+ * through a vtable slot at [TOC-0x4FD0]+0x40, chosen at runtime, so the handler
+ * for a type cannot be read out of the lift. Logging the slot and the code
+ * pointer it holds, once per dispatched record, makes llvm-symbolizer able to
+ * name it. */
+extern "C" void rfom_mp_disp_note(uint32_t type, uint32_t slot, uint32_t code)
+{
+    static FILE* f = NULL;
+    if (!rfom_mp_trace()) return;
+    if (!f) f = fopen("logs/mp_disp.log", "w");
+    if (!f) return;
+    fprintf(f, "type=0x%02X slot=0x%08X code=0x%08X\n", type & 0xFFu, slot, code);
+    fflush(f);
+}
+
+static void rfom_mp_sess_dump(void);   /* v175, defined below */
+/* v184: the game's own network debug log (func_001B7284 info / func_001B70C0
+ * error, printf-style, fmt in r3) is compiled in but printed nowhere. Format it
+ * host-side from the guest registers into logs/mp_game.log, so the client
+ * narrates its own flow ("ConnectionStats::TicketLogin - ..."). Integer args
+ * come from r4..r10, doubles from f1.. in order; %s reads a guest string. */
+extern "C" void rfom_mp_glog(int err, ppu_context* ctx)
+{
+    static FILE* f = NULL; static int n = 0;
+    char fmt[512], out[1024]; int fi = 0, gi = 4, fpi = 1; size_t o = 0; uint32_t p;
+    if (!rfom_mp_trace()) return;
+    if (++n > 4000) return;
+    p = (uint32_t)ctx->gpr[3];
+    if (!p) return;
+    for (fi = 0; fi < 511; fi++) { uint8_t ch = vm_read8(p + (uint32_t)fi); fmt[fi] = (char)ch; if (!ch) break; }
+    fmt[511] = 0;
+    for (const char* s = fmt; *s && o < sizeof out - 64; s++) {
+        if (*s != '%') { if (*s != '\n') out[o++] = *s; continue; }
+        const char* spec = s++;
+        while (*s && strchr("-+ #0123456789.lh", *s)) s++;
+        if (!*s) break;
+        char sp[16]; size_t sl = (size_t)(s - spec + 1); if (sl > 15) sl = 15;
+        memcpy(sp, spec, sl); sp[sl] = 0;
+        if (*s == '%') { out[o++] = '%'; continue; }
+        if (*s == 's') {
+            uint32_t a = gi <= 10 ? (uint32_t)ctx->gpr[gi++] : 0; int k;
+            for (k = 0; a && k < 120 && o < sizeof out - 8; k++) { uint8_t ch = vm_read8(a + (uint32_t)k); if (!ch) break; out[o++] = (ch >= 32 && ch < 127) ? (char)ch : '?'; }
+        } else if (*s == 'f' || *s == 'g' || *s == 'e') {
+            double v = fpi <= 13 ? ctx->fpr[fpi++] : 0.0;
+            o += (size_t)snprintf(out + o, sizeof out - o, "%g", v);
+        } else {
+            int64_t v = gi <= 10 ? (int64_t)ctx->gpr[gi++] : 0;
+            if (*s == 'x' || *s == 'X' || *s == 'p') o += (size_t)snprintf(out + o, sizeof out - o, "0x%llX", (unsigned long long)(uint32_t)v);
+            else if (*s == 'u') o += (size_t)snprintf(out + o, sizeof out - o, "%u", (uint32_t)v);
+            else o += (size_t)snprintf(out + o, sizeof out - o, "%d", (int32_t)v);
+        }
+    }
+    out[o] = 0;
+    if (!f) f = fopen("logs/mp_game.log", "w");
+    if (!f) return;
+    fprintf(f, "t=%llu %s %s\n", (unsigned long long)GetTickCount64(), err ? "ERR " : "info", out);
+    fflush(f);
+}
+
+extern "C" void rfom_mp_scert_note(int kind, uint32_t a, uint32_t b, uint32_t c, uint32_t d)
+{
+    /* per-kind state: the pump emits 2,1,3,2,1,3,... every ~31 ms, so
+     * comparing against the previous line would collapse nothing. A repeat is
+     * the same kind with the same four values as the last time *that kind* was
+     * seen. */
+    static FILE* f = NULL;
+    static int budget = 4000;
+    static int have[8], reps[8];
+    static uint32_t va[8], vb[8], vc[8], vd[8];
+    static unsigned long long vt[8];
+    unsigned k;
+    if (!rfom_mp_trace()) return;
+    if (kind == 5) rfom_mp_sess_dump();   /* v175: game-session fields */
+    k = (unsigned)kind & 7u;
+    if (have[k] && va[k] == a && vb[k] == b && vc[k] == c && vd[k] == d) { reps[k]++; return; }
+    if (!f) f = fopen("logs/mp_scert.log", "w");
+    if (!f) return;
+    if (have[k] && reps[k] > 0) {
+        fprintf(f, "   ^ kind=%d a=0x%08X b=0x%08X c=0x%08X d=0x%08X repeated %d more times in %llu ms\n",
+                kind, va[k], vb[k], vc[k], vd[k], reps[k],
+                (unsigned long long)(GetTickCount64() - vt[k]));
+    }
+    reps[k] = 0;
+    have[k] = 1; va[k] = a; vb[k] = b; vc[k] = c; vd[k] = d;
+    vt[k] = GetTickCount64();
+    if (budget <= 0) return;
+    budget--;
+    fprintf(f, "t=%llu kind=%d a=0x%08X b=0x%08X c=0x%08X d=0x%08X\n",
+            vt[k], kind, a, b, c, d);
+    if (budget == 0) {
+        fprintf(f, "trace capped at 4000 distinct events -- the cap is a size guard in "
+                   "rfom_mp_scert_note(); raise it deliberately\n");
+    }
+    fflush(f);
+}
+/* Resistance port (v174) diag: session window dump. rfom_mp_scert_note() only
+ * receives four scalars and dedupes on them, which cannot answer "which record
+ * type is the client waiting for" -- that lives in a field of the session
+ * object and has to be found by difference. This entry point takes the session
+ * base and prints [sess+0x00..0x4C] as 32-bit words. A window is suppressed
+ * only when it is identical to the previous window at the same tag, so the log
+ * stays readable while still showing every change.
+ *
+ * tags: 1 = func_00629D5C (the session message builder: this is where the
+ *                            0x0B on the wire is written)
+ *       2 = the 0x0062BEDC dispatcher arm (a record just arrived)
+ *       3 = the pump exit (0x0062BC2C) */
+/* Resistance port (v175) diag: the transport session's +0x430.. is NOT the
+ * tick's object. func_00651FEC reads its session from a list rooted at the
+ * global pointer slot 0x007861B0: [0x007861B0] -> +0x0 -> +0x1088. Those
+ * fields (+0x430 countdown, +0x444, +0x44C, +0x49C) are what decides the next
+ * message the client sends, so they are what has to be watched to find the
+ * reply it is waiting for. Trigger: the pump-entry note (kind 5), which already
+ * fires once per tick -- no new call site in the lift is needed for this. */
+static void rfom_mp_dump_words(FILE* f, const char* what, uint32_t base,
+                               uint32_t from, uint32_t to)
+{
+    uint32_t o;
+    fprintf(f, "  %s @0x%08X:", what, base);
+    for (o = from; o <= to; o += 4) fprintf(f, " %03X:%08X", o, vm_read32(base + o));
+    fprintf(f, "\n");
+}
+
+/* Resistance port (v183) diag: the Medius app-message dispatch table.
+ * RT 0x0A (SERVER_APP) -> [transport+0x50] = func_00650EF0 -> func_0065006C ->
+ * func_0065D654, which reads class = payload[0], id = payload[1] and looks the
+ * pair up via func_0065D5A0:
+ *     base = [[TOC-0x4910]], nClasses = [[TOC-0x48F8]], nIds = [[TOC-0x48F4]]
+ *     entry = base + (class * nIds + id) * 12
+ * An entry is live when +0 or +8 is non-zero. Dumping the live entries names
+ * every Medius message the client will accept, with its handler. Also logs the
+ * connection_lobby.cpp manager ([0x10395D88]): +0x14 is the lobby state, +0x38C
+ * the app callback the RT 0x1C relay ends in. */
+static uint32_t rfom_mp_opd_code(uint32_t p)
+{
+    if (p >= 0x00700000u && p < 0x00800000u && !(p & 3u)) return vm_read32(p);
+    return 0;
+}
+
+/* v183: connection_lobby state poller. The lobby tick (func_001BA7B8, a
+ * switch on mgr+0x14) passes through short-lived states (0xB disconnect-MAS,
+ * 0xC connect-MLS, 0xF connecting) inside one frame, which the 31 ms pump dump
+ * cannot see. A host thread sampling every ~0.2 ms logs each change of
+ * state/+0x18 (previous state)/+0x364 flags/+0x368 handle/+0x3C0 phase. */
+static DWORD WINAPI rfom_mp_lobby_poll(LPVOID)
+{
+    FILE* f = fopen("logs/mp_lobby.log", "w");
+    uint32_t last[9] = {0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu,
+                        0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
+    /* Online-login tick func_002F6184 (r30 = [TOC-0x76B8] = 0x007479F0) keeps its
+     * state at [[r30-0x7FFC]]: 5 = ticket requested (cb func_002F5468), 6 = Medius
+     * request sent by func_002F5314 (cb func_002F54A4 -> TicketLogin), 0xB = error. */
+    const uint32_t login_state_pp = 0x007479F0u - 0x7FFCu;
+    /* RFOM_MP_WATCH=addr[:b|:w],... -- extra guest words/bytes logged on change,
+     * so a new state variable needs no rebuild. Default width is a word. */
+    uint32_t wa[16], wlast[16]; char wb[16]; int nw = 0;
+    { const char* e = getenv("RFOM_MP_WATCH");
+      while (e && *e && nw < 16) {
+          char* end; unsigned long a = strtoul(e, &end, 16);
+          if (end == e) break;
+          wa[nw] = (uint32_t)a; wb[nw] = 0; wlast[nw] = 0xDEADBEEFu;
+          if (*end == ':') { wb[nw] = (end[1] == 'b') ? 1 : (end[1] == 's') ? 2 : 0; end += 2; }
+          nw++;
+          e = (*end == ',') ? end + 1 : end;
+      } }
+    /* r30 of the lobby code = [TOC-0x79F4] = 0x007411D8:
+     *   [r30-0x7F64] -> byte G  (DNS lookup pending; state 7 waits while != 0)
+     *   [r30-0x7F68] -> char[16] resolved MLS/MAS IP
+     * MediusConnect (func_006099A8) returns -15 when [[TOC-0x5860]] == 0. */
+    const uint32_t r30 = 0x007411D8u, toc = 0x0078ACB8u;
+    HANDLE tm = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    if (!f) return 0;
+    for (;;) {
+        uint32_t mgr = vm_read32(0x10395D88u), v[9];
+        if (mgr >= 0x00100000u && !(mgr & 3u)) {
+            uint32_t gptr = vm_read32(r30 - 0x7F64u), ipp = vm_read32(r30 - 0x7F68u);
+            char ip[17], dns[33]; int k;
+            v[0] = vm_read32(mgr + 0x14u);  v[1] = vm_read32(mgr + 0x18u);
+            v[2] = vm_read32(mgr + 0x364u); v[3] = vm_read32(mgr + 0x368u);
+            v[4] = vm_read32(mgr + 0x3C0u);
+            v[5] = vm_read32(vm_read32(toc - 0x5860u));
+            v[6] = gptr ? vm_read8(gptr) : 0xEEu;
+            v[7] = vm_read32(mgr + 0x360u);
+            { uint32_t lp = vm_read32(login_state_pp);
+              v[8] = (lp >= 0x00010000u && !(lp & 3u)) ? vm_read32(lp) : 0xEEEEu; }
+            if (memcmp(v, last, sizeof v)) {
+                for (k = 0; k < 16; k++) { uint8_t c = ipp ? vm_read8(ipp + (uint32_t)k) : 0; ip[k] = (c >= 32 && c < 127) ? (char)c : (c ? '?' : 0); if (!c) break; } ip[k < 16 ? k : 16] = 0;
+                for (k = 0; k < 32; k++) { uint8_t c = vm_read8(mgr + 0xCCu + (uint32_t)k); dns[k] = (c >= 32 && c < 127) ? (char)c : (c ? '?' : 0); if (!c) break; } dns[k < 32 ? k : 32] = 0;
+                fprintf(f, "t=%llu state=0x%X prev=0x%X flags364=%08X conn368=0x%08X phase3C0=%u "
+                           "libinit=0x%X dnsPending=%u ip='%s' dns='%s' port=%u login=0x%X\n",
+                        (unsigned long long)GetTickCount64(), v[0], v[1], v[2], v[3], v[4],
+                        v[5], v[6], ip, dns, v[7], v[8]);
+                fflush(f);
+                memcpy(last, v, sizeof v);
+            }
+            for (int w = 0; w < nw; w++) {
+                if (wb[w] == 2) {   /* string: FNV hash of up to 128 printable bytes */
+                    char sbuf[129]; uint32_t hsh = 2166136261u; int k;
+                    for (k = 0; k < 128; k++) { uint8_t c = vm_read8(wa[w] + (uint32_t)k); if (!c) break;
+                        sbuf[k] = (c >= 32 && c < 127) ? (char)c : '?'; hsh = (hsh ^ c) * 16777619u; }
+                    sbuf[k] = 0;
+                    if (hsh != wlast[w]) {
+                        fprintf(f, "t=%llu watch %08X = \"%s\"\n", (unsigned long long)GetTickCount64(), wa[w], sbuf);
+                        fflush(f); wlast[w] = hsh;
+                    }
+                    continue;
+                }
+                uint32_t x = wb[w] ? vm_read8(wa[w]) : vm_read32(wa[w]);
+                if (x != wlast[w]) {
+                    fprintf(f, "t=%llu watch %08X = 0x%X\n", (unsigned long long)GetTickCount64(), wa[w], x);
+                    fflush(f); wlast[w] = x;
+                }
+            }
+        }
+        { LARGE_INTEGER li; li.QuadPart = -2000; /* 0.2 ms */
+          if (tm) { SetWaitableTimer(tm, &li, 0, NULL, NULL, FALSE); WaitForSingleObject(tm, INFINITE); }
+          else Sleep(0); }
+    }
+}
+
+static void rfom_mp_medius_dump(FILE* f)
+{
+    static int poller = 0;
+    if (!poller) { poller = 1; CreateThread(NULL, 0, rfom_mp_lobby_poll, NULL, 0, NULL); }
+    static uint32_t prev_sum = 0, prev_mgr = 0xFFFFFFFFu;
+    const uint32_t toc = 0x0078ACB8u;
+    uint32_t base, ncls, nids, c, i, sum = 0, live = 0, mgr, mstate = 0, mcb = 0;
+    base = vm_read32(vm_read32(toc - 0x4910u));
+    ncls = vm_read32(vm_read32(toc - 0x48F8u));
+    nids = vm_read32(vm_read32(toc - 0x48F4u));
+    mgr  = vm_read32(0x10395D88u);
+    if (mgr >= 0x00100000u && !(mgr & 3u)) { mstate = vm_read32(mgr + 0x14u); mcb = vm_read32(mgr + 0x38Cu); }
+    if (base < 0x00100000u || (base & 3u) || ncls == 0 || ncls > 64 || nids == 0 || nids > 1024) {
+        if (prev_mgr != mstate) {
+            fprintf(f, "  medius: table not ready base=0x%08X ncls=%u nids=%u | lobby mgr=0x%08X state=0x%X cb38C=0x%08X\n",
+                    base, ncls, nids, mgr, mstate, mcb);
+            prev_mgr = mstate;
+        }
+        return;
+    }
+    for (c = 0; c < ncls; c++) for (i = 0; i < nids; i++) {
+        uint32_t e = base + (c * nids + i) * 12u;
+        uint32_t w0 = vm_read32(e), w4 = vm_read32(e + 4u), w8 = vm_read32(e + 8u);
+        if (w0 || w8) { live++; sum = sum * 31u + (c << 16 | i) + w0 + w4 * 7u + w8 * 13u; }
+    }
+    if (sum == prev_sum && prev_mgr == mstate) return;
+    fprintf(f, "  medius: lobby mgr=0x%08X state=0x%X cb38C=0x%08X(code 0x%08X)\n",
+            mgr, mstate, mcb, rfom_mp_opd_code(mcb));
+    prev_mgr = mstate;
+    if (sum == prev_sum) return;
+    prev_sum = sum;
+    fprintf(f, "  medius: table base=0x%08X ncls=%u nids=%u live=%u\n", base, ncls, nids, live);
+    for (c = 0; c < ncls; c++) for (i = 0; i < nids; i++) {
+        uint32_t e = base + (c * nids + i) * 12u;
+        uint32_t w0 = vm_read32(e), w4 = vm_read32(e + 4u), w8 = vm_read32(e + 8u);
+        if (!(w0 || w8)) continue;
+        fprintf(f, "    class=%u id=0x%02X (%3u)  +0=0x%08X(code 0x%08X) +4=0x%08X +8=0x%08X(code 0x%08X)\n",
+                c, i, i, w0, rfom_mp_opd_code(w0), w4, w8, rfom_mp_opd_code(w8));
+    }
+}
+
+static void rfom_mp_sess_dump(void)
+{
+    static uint32_t prev[128];
+    static int have = 0;
+    static FILE* f = NULL;
+    uint32_t g1, g2, sess, w[128];
+    int i, same = 1;
+    g1 = vm_read32(0x007861B0u);
+    if (g1 < 0x00001000u || (g1 & 3u)) return;
+    g2 = vm_read32(g1);
+    if (g2 < 0x00001000u || (g2 & 3u)) return;
+    sess = vm_read32(g2 + 0x1088u);
+    if (sess < 0x00001000u || (sess & 3u)) return;
+    for (i = 0; i < 128; i++) w[i] = vm_read32(sess + 0x400u + 4u * (uint32_t)i);
+    if (!f) f = fopen("logs/mp_sess_dump.log", "w");
+    if (f) { rfom_mp_medius_dump(f); fflush(f); }
+    if (have) { for (i = 0; i < 128; i++) if (prev[i] != w[i]) { same = 0; break; } }
+    else same = 0;
+    if (same) return;
+    for (i = 0; i < 128; i++) prev[i] = w[i];
+    have = 1;
+    if (!f) f = fopen("logs/mp_sess_dump.log", "w");
+    if (!f) return;
+    fprintf(f, "t=%llu g1=0x%08X g2=0x%08X gamesess=0x%08X\n",
+            (unsigned long long)GetTickCount64(), g1, g2, sess);
+    rfom_mp_dump_words(f, "sess", sess, 0x400, 0x47C);
+    rfom_mp_dump_words(f, "sess", sess, 0x480, 0x4FC);
+    rfom_mp_dump_words(f, "sess", sess, 0x500, 0x57C);
+    fflush(f);
+}
+
+extern "C" void rfom_mp_scert_win(int tag, uint32_t sess)
+{
+    /* v174: the fields the client's session tick func_00651FEC reads are at
+     * +0x430/+0x444/+0x44C, so the window covers 0x00..0x4FC -- not 0x00..0x4C,
+     * which was constant across every state and proved nothing. */
+    enum { NW = 320 };            /* words: 0x000 .. 0x4FC */
+    static uint32_t prev[8][NW];
+    static int have[8];
+    static FILE* wf = NULL;
+    static uint32_t seq = 0;
+    uint32_t w[NW];
+    int i, same;
+    if (!rfom_mp_trace()) return;
+    if (sess < 0x00100000u || (sess & 3u)) return;
+    tag &= 7;
+    for (i = 0; i < NW; i++) w[i] = vm_read32(sess + 4u * (uint32_t)i);
+    same = have[tag];
+    for (i = 0; same && i < NW; i++) if (prev[tag][i] != w[i]) same = 0;
+    if (same) return;
+    for (i = 0; i < NW; i++) prev[tag][i] = w[i];
+    have[tag] = 1;
+    if (!wf) wf = fopen("logs/mp_scert_win.log", "w");
+    if (!wf) return;
+    fprintf(wf, "--- #%u tag=%d sess=0x%08X\n", seq++, tag, sess);
+    for (i = 0; i < NW; i++) {
+        if ((i & 15) == 0) fprintf(wf, "%04X:", i * 4);
+        fprintf(wf, " %08X", w[i]);
+        if ((i & 15) == 15) fprintf(wf, "\n");
+    }
+    fflush(wf);
+}
+
 extern "C" void rfom_snd_note(int kind, uint32_t v, uint32_t lr, uint32_t extra)
 {
     static volatile LONG cnt[8];
@@ -1856,6 +2241,16 @@ static void prompts_init_xbox(void)
  * label with PAD_NINTENDO_SWAP (cellpad_nintendo_swap); rebuilt when that changes. */
 extern "C" int cellpad_nintendo_swap(void);   /* cellPad.c */
 static char s_nrep3[0x30][4], s_nrepf[0x30][24]; static int s_nhave[0x30]; static int s_nswap_built = -1;
+/* v191: the front end's own font codes for the online lobby's prompts (lobby
+ * text: U+0A0C Triangle, 0A0D Start, 0A0E Select, 0A0F L1, 0A10 L2, 0A11 L3,
+ * 0A13 R1, 0A14 R2, 0A15 R3; 0A0A is Square, see v185 below). Front end, online only. */
+static const struct { uint16_t cp; const char* pad; int nx; const char* x3; const char* xf; } s_fe_lobby[] = {
+    {0x0A0C,"TRIANGLE",3,"(Y)","[Y]"}, {0x0A0D,"START",5,"Mnu","[Menu]"}, {0x0A0E,"SELECT",4,"Vw ","[View]"},
+    {0x0A0F,"L1",6,"LB ","[LB]"}, {0x0A10,"L2",7,"LT ","[LT]"}, {0x0A11,"L3",8,"LS ","[LS]"},
+    {0x0A13,"R1",10,"RB ","[RB]"}, {0x0A14,"R2",11,"RT ","[RT]"}, {0x0A15,"R3",12,"RS ","[RS]"},
+};
+static int s_fe_online = 0;
+static char s_sel_kb[40];   /* "[Tab] key": the Select key, for the lobby's "SELECT button" plate */
 static void prompts_init_nintendo(void)
 {
     const int sw = cellpad_nintendo_swap();
@@ -1882,6 +2277,15 @@ static void prompts_init_nintendo(void)
         else snprintf(s_nrepf[i], 24, "[%s]", lab);
         s_nhave[i] = 1;
     }
+    if (s_fe_online) {   /* v191: the online lobby's glyphs (s_fe_lobby; 0A0A = Square there) */
+        auto put = [sw](int i, int idx) {
+            const char* lab = pcx_nx_label(idx, sw); if (!lab) return;
+            const int face = strlen(lab) == 1 && isalpha((unsigned char)lab[0]);
+            if (face) snprintf(s_nrep3[i], 4, "(%s)", lab); else snprintf(s_nrep3[i], 4, "%-3.3s", lab);
+            snprintf(s_nrepf[i], 24, "[%s]", lab); s_nhave[i] = 1; };
+        put(0x0A0A - 0x0A09, 1);
+        for (auto& g : s_fe_lobby) put(g.cp - 0x0A09, g.nx);
+    }
 }
 static void prompts_init(void)
 {
@@ -1907,6 +2311,22 @@ static void prompts_init(void)
               const int cx = 0x0A20 - 0x0A09, ci = 0x0A1F - 0x0A09;
               memcpy(s_rep3[cx], "Spc", 4); snprintf(s_repf[cx], 24, "[Space]"); s_have[cx] = 1;
               memcpy(s_rep3[ci], "Esc", 4); snprintf(s_repf[ci], 24, "[Esc]"); s_have[ci] = 1;
+              /* v185: in the front end's lobby text U+0A0A is the SQUARE
+               * button ("[sq] CREATE GAME", "[sq] VOTE TO START"; the lobby's
+               * own art is named "SQ - CREATE GAME"), not L2 -- the prompts
+               * read "[Shift]" and Shift did nothing. Name the Square key. */
+              const int sq = 0x0A0A - 0x0A09;
+              char k3[4], kf[24];
+              if (getenv("PS3_NET_ONLINE")) {   /* the lobby is only reached online */
+              if (pad_key_for("SQUARE", k3, kf)) { memcpy(s_rep3[sq], k3, 4); memcpy(s_repf[sq], kf, 24); s_have[sq] = 1; }
+              memcpy(s_xrep3[sq], "(X)", 4); snprintf(s_xrepf[sq], 24, "[X]"); s_xhave[sq] = 1;
+              /* v191: the lobby's other button glyphs ("[R2] TEXT CHAT", "[L1] / [L2]
+               * SCROLL", "[Tri] OPTIONS", sort / filter / tab prompts) */
+              for (auto& g : s_fe_lobby) { const int i = g.cp - 0x0A09;
+                  if (pad_key_for(g.pad, k3, kf)) { memcpy(s_rep3[i], k3, 4); memcpy(s_repf[i], kf, 24); s_have[i] = 1; }
+                  memcpy(s_xrep3[i], g.x3, 4); snprintf(s_xrepf[i], 24, "%s", g.xf); s_xhave[i] = 1; }
+              s_fe_online = 1; s_nswap_built = -1; prompts_init_nintendo();
+              if (pad_key_for("SELECT", k3, kf)) snprintf(s_sel_kb, sizeof s_sel_kb, kf[0] == '[' ? "%s key" : "%s", kf); }
           } } }
 }
 /* One text file as loaded (its original bytes) and as last patched, so the
@@ -1971,6 +2391,8 @@ static void prompts_apply(uint32_t base, uint32_t end, int mode, uint32_t* blkp,
         if (m == 22 && !memcmp(p + i, "Press the START button", 22)) r = mode == 3 ? "Press the + button" : mode ? "Press the MENU button" : "Press the SPACE bar";
         else if (m == 34 && !memcmp(p + i, "Press the START button to continue", 34)) r = mode == 3 ? "Press the + button to continue" : mode ? "Press the MENU button to continue" : "Press the SPACE bar to continue";
         else if (m == 35 && !memcmp(p + i, " Press the START button to continue", 35)) r = mode == 3 ? " Press the + button to continue" : mode ? " Press the MENU button to continue" : " Press the SPACE bar to continue";
+        else if (m == 13 && s_fe_online && !memcmp(p + i, "SELECT button", 13))   /* v191: the lobby's BUDDY LIST plate */
+            r = mode == 3 ? "- button" : mode ? "VIEW button" : s_sel_kb[0] ? s_sel_kb : nullptr;
         if (r) { size_t si = 0; while (si < starts.size() && starts[si] != i) si++;
                  if (si == starts.size()) { starts.push_back(i); isgrab.push_back(r); } else isgrab[si] = r; }
         i += m;
