@@ -267,11 +267,17 @@ static void lx_register()
            "edges. Same as resolution = the old behaviour (sharpest, slowest).", "RFOM_SHADOW_SCALE",
            { {"Auto  (up to 2x)", ""}, {"1x  (PS3)", "1"}, {"1.5x", "1.5"}, {"2x", "2"}, {"3x", "3"},
              {"Same as resolution", "8"} });
-    // rsx_ssao.inc: ambient occlusion pass of the D3D12 renderer (same option as Resistance 2 / 3)
+    // rsx_ssao.inc / rsx_cacao.inc: ambient occlusion passes of the D3D12 renderer (same option as Resistance 2 / 3)
     lx_add(1, "ssao", "Ambient occlusion",
-           "Adds soft contact shadows in corners and creases (SSAO). Works with every Anti-aliasing setting; "
-           "with DLSS, FSR or XeSS it is computed at the internal resolution, before upscaling. Experimental.",
-           "RSX_SSAO", { {"Off", ""}, {"On  (experimental)", "1"} });
+           "Game: as the game (Fall of Man has no ambient occlusion of its own; the default). Port SSAO adds the "
+           "port's own screen-space AO. CACAO (AMD FidelityFX CACAO) draws higher-quality soft contact shadows in "
+           "corners and creases from the scene depth. Off draws no AO. Works with every Anti-aliasing setting; with "
+           "DLSS, FSR or XeSS it is computed at the internal resolution, before upscaling. Costs GPU time. Experimental.",
+           "RFOM_AO_MODE", { {"Game  (none of its own)", ""}, {"Port SSAO  (extra, experimental)", "1"},
+                             {"CACAO  (experimental)", "cacao"}, {"Off  (no AO)", "off"} });
+    lx_add(1, "aoquality", "Ambient occlusion quality",
+           "Quality of the CACAO ambient occlusion: Low (3 samples), Medium (5 samples, sharper edges and detail) or High (12 samples, normal-aware edges). Costs GPU time; only used with Ambient occlusion: CACAO.",
+           "RFOM_AO_QUALITY", { {"Medium", ""}, {"Low", "low"}, {"High", "high"} });
     // "SHADER CACHE" options (rsx_d3d12_backend.c rsx_pso_precompile_boot)
     lx_add(3, "precompile", "Compile shaders before playing",
            "On: at start-up the game builds every shader pipeline it has already used on this PC before play begins "

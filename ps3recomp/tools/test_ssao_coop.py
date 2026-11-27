@@ -31,14 +31,19 @@ def c_string_literal(src, name):
     return "".join(parts).encode("latin-1").decode("unicode_escape")
 
 
-def compile_hlsl(code, entry, target):
+class ShaderMacro(ctypes.Structure):
+    _fields_ = [("name", ctypes.c_char_p), ("definition", ctypes.c_char_p)]
+
+
+def compile_hlsl(code, entry, target, macros=()):
     try:
         dc = ctypes.WinDLL("d3dcompiler_47.dll")
     except OSError:
         return None
     blob, err = ctypes.c_void_p(), ctypes.c_void_p()
     src = code.encode("ascii")
-    hr = dc.D3DCompile(src, ctypes.c_size_t(len(src)), b"rsx_ssao", None, None, entry.encode(), target.encode(), 0, 0,
+    mac = (ShaderMacro * (len(macros) + 1))(*[ShaderMacro(k.encode(), v.encode()) for k, v in macros])
+    hr = dc.D3DCompile(src, ctypes.c_size_t(len(src)), b"rsx_ssao", mac, None, entry.encode(), target.encode(), 0, 0,
                        ctypes.byref(blob), ctypes.byref(err))
     msg = ""
     if err.value:
@@ -50,7 +55,7 @@ def compile_hlsl(code, entry, target):
 
 def test_ssao_hlsl():
     code = c_string_literal(open(SSAO, encoding="utf-8").read(), "s_ao_hlsl")
-    for entry, target in (("vs", "vs_5_0"), ("ps_ao", "ps_5_0"), ("ps_apply", "ps_5_0")):
+    for entry, target in (("vs", "vs_5_0"), ("ps_ao", "ps_5_0"), ("ps_apply", "ps_5_0"), ("ps_apply1", "ps_5_0")):
         r = compile_hlsl(code, entry, target)
         if r is None:
             print("SKIP ssao hlsl: no d3dcompiler_47.dll")
@@ -58,6 +63,21 @@ def test_ssao_hlsl():
         ok, msg = r
         assert ok, f"{entry}: {msg}"
         print(f"ssao hlsl {entry} ({target}) ok")
+
+
+def test_cacao_hlsl():
+    """rsx_cacao.inc (RFOM_AO_MODE=cacao): every entry, ps_gen at each quality preset (cacao_pso's macros)."""
+    code = c_string_literal(open(os.path.join(LIBS, "video", "rsx_cacao.inc"), encoding="utf-8").read(), "s_cc_hlsl")
+    jobs = [("vs", "vs_5_0", 0), ("ps_prepare", "ps_5_0", 0), ("ps_blur", "ps_5_0", 0), ("ps_apply", "ps_5_0", 0)]
+    jobs += [("ps_gen", "ps_5_0", q) for q in (0, 1, 2)]
+    for entry, target, q in jobs:
+        r = compile_hlsl(code, entry, target, (("Q", str(q)), ("NUM_TAPS", str((3, 5, 12)[q]))))
+        if r is None:
+            print("SKIP cacao hlsl: no d3dcompiler_47.dll")
+            return
+        ok, msg = r
+        assert ok, f"{entry} Q={q}: {msg}"
+        print(f"cacao hlsl {entry} Q={q} ({target}) ok")
 
 
 DRIVER = r"""
@@ -242,6 +262,7 @@ def run_c(code, name):
 
 if __name__ == "__main__":
     test_ssao_hlsl()
+    test_cacao_hlsl()
     test_coop_order()
     test_bg_neutral()
     print("OK")

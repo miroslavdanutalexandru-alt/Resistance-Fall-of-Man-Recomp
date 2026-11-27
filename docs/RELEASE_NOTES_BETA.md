@@ -10,6 +10,9 @@ This is a **beta**. The campaign has been played up to Cheddar Gorge. Later leve
 
 ## Unreleased
 
+### New
+- **Ambient occlusion: CACAO, and the choice of AO (issue #45). Not yet tested in game.** *Graphics › Quality › Ambient occlusion* (and F9) is now Game / Port SSAO (extra) / CACAO / Off (`RFOM_AO_MODE`), with *Ambient occlusion quality* Low / Medium / High (`RFOM_AO_QUALITY`). Fall of Man has no AO of its own; CACAO (AMD FidelityFX CACAO) is a higher-quality alternative to the port SSAO, applied at the same point. Game is the default and unchanged; a saved "On" is Port SSAO.
+
 ### Fixes
 - **Ultrawide: the menu screen no longer flips between 21:9 and 16:9 (issue #2).** Menus and other screens drawn without player control could set a 3D camera now and then, or draw short bursts of 3D, which turned the stretch on for a moment each time. Now, once the picture is back at its 16:9 letterbox outside play, it stays there until you are in control again (the stretch returns at once) or the game has drawn 3D steadily for a second (cutscenes; a cutscene right after a loading screen may start letterboxed for that second). A pause menu with the level still drawn behind it may settle at 21:9 after that second, but no longer flips. Gameplay, aiming down sights and scopes keep the 21:9 picture as before. `RFOM_ASPECT_REARM_MS=<ms>` (default 1000) sets how long the 3D has to be steady; `RFOM_MENU_ASPECT=0` (or `RFOM_ASPECT_REARM_MS=0`) restores the 0.3.1 behaviour. *Not yet tested at 21:9; please report.*
 

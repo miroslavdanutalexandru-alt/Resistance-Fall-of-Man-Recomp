@@ -638,6 +638,12 @@ static void opts_init(void)
             "gamma", "PS3_DISPLAY_GAMMA", 0,
             { {L"1.0 (as the game)", ""}, {L"0.8 (brighter)", "0.8"}, {L"0.9 (brighter)", "0.9"}, {L"1.1 (darker)", "1.1"},
               {L"1.2 (darker)", "1.2"} }, "", live_gamma);
+    /* same keys, values and env as the launcher's "ssao" / "aoquality" rows; the renderer reads them at start-up */
+    opt_add(L"Ambient occlusion", L"Game: as the game (no AO of its own). Port SSAO: the port's extra AO. CACAO: AMD FidelityFX CACAO. Takes effect on restart.",
+            "ssao", ENVN("AO_MODE"), 1,
+            { {L"Game", ""}, {L"Port SSAO", "1"}, {L"CACAO", "cacao"}, {L"Off", "off"} }, "", NULL);
+    opt_add(L"AO quality", L"CACAO quality: Low (3 samples), Medium (5) or High (12). Takes effect on restart.",
+            "aoquality", ENVN("AO_QUALITY"), 1, { {L"Medium", ""}, {L"Low", "low"}, {L"High", "high"} }, "", NULL);
     opt_add(L"Crosshair", L"A small extra marker at the screen centre while on foot.", "crosshair", ENVN("CROSSHAIR"), 0,
             { {L"Off", ""}, {L"Dot", "dot"}, {L"Cross", "cross"} }, "", live_xhair);
     opt_add(L"Crosshair colour", L"Colour of the extra crosshair (high-contrast choices; a dark outline is always drawn).", "xhair_color", ENVN("CROSSHAIR_COLOR"), 0,
