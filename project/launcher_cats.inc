@@ -28,7 +28,7 @@ static const CatGroup g_cat[] = {
     { P_CONTROLS, "CONTROLLER BUTTONS",           "padmap_*",
       "Also in game: F10 \xE2\x80\xBA More PC Options \xE2\x80\xBA Controller layout. Key bindings for keyboard and "
       "mouse are above." },
-    { P_ONLINE,   "ONLINE PLAY",                  "online net_trace",
+    { P_ONLINE,   "ONLINE PLAY",                  "online mp_pause_keys net_trace",
       "Off by default. On: the Online menu connects to the community server r1.rfom.online (run by a fan, not Sony). "
       "Single player is the same either way." },
     { P_AUDIO,    "SOUND",                        "speakers audio_channels audio_buffer volume audio_mono", nullptr },

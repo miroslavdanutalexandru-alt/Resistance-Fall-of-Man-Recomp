@@ -322,7 +322,7 @@ __declspec(dllexport) void rfom_dlssg_sleep(unsigned long long id)
 
 // Game thread (rfom_reflex.cpp, before the sleep): Reflex's frame limit in microseconds per rendered frame
 // (before frame generation), 0 = no limit. Returns 1 when Streamline accepted it.
-// RFOM_REFLEX_FG_DIV=1 (default 0 = old behaviour): while generation is on, Reflex gets the limit for
+// RFOM_REFLEX_FG_DIV (default 1; 0 = old behaviour): while generation is on, Reflex gets the limit for
 // *presented* frames, us / (generated + 1). Measured (r1_fmd_run, r1_fmd2_run, 0.3.1 MVQ2 run): with
 // frameLimitUs = 16667 and 2x generation the rendered rate locks at exactly 30.0 fps (33.33 ms, worst 33.7)
 // against ~58 fps with generation off -- the limit paces the output, so the real frames halve and every
@@ -333,7 +333,7 @@ static int g_lim_gen = 0, g_lim_div = -1;
 static bool g_lim_have = false;   // rfom_reflex.cpp has asked for a limit
 static int LimitApplyLocked()
 {
-    if (g_lim_div < 0) { const char* e = getenv("RFOM_REFLEX_FG_DIV"); g_lim_div = e && *e == '1'; }
+    if (g_lim_div < 0) { const char* e = getenv("RFOM_REFLEX_FG_DIV"); g_lim_div = !(e && *e == '0'); }   // default on; 0 = old
     const unsigned us = g_lim_div && g_lim_gen > 0 && g_lim_base ? g_lim_base / (unsigned)(g_lim_gen + 1) : g_lim_base;
     if (us == g_lim_sent) return 1;
     sl::ReflexOptions ro{};
@@ -343,7 +343,7 @@ static int LimitApplyLocked()
     const sl::Result r = p_slReflexSetOptions(ro);
     if (r != sl::Result::eOk) { Log("slReflexSetOptions (frame limit %u us) failed: %s", us, ResStr(r)); g_lim_sent = ~0u; return 0; }
     if (g_lim_div && us != g_lim_base)
-        Log("Reflex frame limit %u us per presented frame (%u us per rendered frame, %dx generation; RFOM_REFLEX_FG_DIV=1)",
+        Log("Reflex frame limit %u us per presented frame (%u us per rendered frame, %dx generation; RFOM_REFLEX_FG_DIV=0: old)",
             us, g_lim_base, g_lim_gen + 1);
     else if (g_lim_div && g_lim_sent != ~0u)
         Log("Reflex frame limit %u us (generation off)", us);
@@ -441,7 +441,9 @@ __declspec(dllexport) int rfom_dlssg_tag(ID3D12GraphicsCommandList* cl, ID3D12Re
     c.cameraFwd = sl::float3(0.0f, 0.0f, 1.0f);
     // RFOM_DLSS_FG_REAL_CAMERA (default 1; 0 = fixed): position / axes accumulated from the solved camera motion (rfom_fgpose_step)
     // instead of a camera that never moves; DLSS-G's scene change detection and disocclusion heuristics read them
-    static const bool pose_on = [] { const char* e = getenv("RFOM_DLSS_FG_REAL_CAMERA"); return !(e && *e && atoi(e) <= 0); }();
+    // RFOM_DLSS_FG_REAL_CAM=0 (the switch for the whole real-camera fix, rsx_dlssg.inc) turns this off too
+    static const bool pose_on = [] { const char* e = getenv("RFOM_DLSS_FG_REAL_CAMERA"); const char* c = getenv("RFOM_DLSS_FG_REAL_CAM");
+                                     return !(e && *e && atoi(e) <= 0) && !(c && *c && atoi(c) <= 0); }();
     static rfom_fgpose_t pose{};
     if (pose_on) {
         if (cam) rfom_fgpose_step(&pose, g_cam_c2p, n, f, xs, ys);

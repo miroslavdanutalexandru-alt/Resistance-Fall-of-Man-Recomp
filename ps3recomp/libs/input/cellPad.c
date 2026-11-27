@@ -473,20 +473,6 @@ static u16 pad_aim_hold(int src, u16 btns, int reset)
         const int was = st[src].tries;
         if (pcx_aim_hold(&st[src], (btns & CELL_PAD_CTRL_R3) != 0, rfom_is_zoomed(), g_rfom_view_fov,
                          GetTickCount64(), g_rfom_play_frames, reset)) btns |= CELL_PAD_CTRL_R3;
-        /* PAD_AIM_LIVE=1: every state change to logs\aimhold_live_<pid>.txt, flushed at once (watch it live) */
-        { static int live = -1; static FILE* lf = NULL; static int last[2] = { -1, -1 };
-          if (live < 0) { const char* e = getenv("PAD_AIM_LIVE"); live = (e && *e && *e != '0') ? 1 : 0;
-                          if (live) { char fn[64]; snprintf(fn, sizeof fn, "logs\\aimhold_live_%lu.txt", (unsigned long)GetCurrentProcessId());
-                                      lf = fopen(fn, "w"); } }
-          const PcxAimHold* a = &st[src];
-          const int key = a->prev | (a->armed << 1) | (a->pulse << 2) | (a->tries << 3) | ((reset != 0) << 6) | (rfom_is_zoomed() << 7);
-          if (lf && key != last[src]) {
-              last[src] = key;
-              fprintf(lf, "t=%llu src=%d frames=%lu held=%d armed=%d click=%d tries=%d menu=%d zoomed=%d fov=%.2f\n",
-                      GetTickCount64(), src, (unsigned long)g_rfom_play_frames, a->prev, a->armed, a->pulse, a->tries,
-                      reset != 0, rfom_is_zoomed(), (double)g_rfom_view_fov);
-              fflush(lf);
-          } }
         if (st[src].tries != was && st[src].tries > 1 && said < 40) {
             said++;
             printf("[controls] zoom hold: still zoomed (FOV %.1f), R3 clicked again (%d)\n", (double)g_rfom_view_fov, st[src].tries);

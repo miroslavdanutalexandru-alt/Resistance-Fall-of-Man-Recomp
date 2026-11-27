@@ -409,6 +409,12 @@ static void lx_register()
            "sign in, find, create and join custom games. Your player name is in online.txt (a random one if empty; "
            "never your Windows name). The server sees your IP address and player name. Off: the game stays offline, "
            "as before.", "PS3_NET_ONLINE", { {"Off", ""}, {"On", "1"} });
+    // cellPad.c RFOM_MP_PAUSE_KEYS: experimental (the game has no pause flag readable in online matches; Esc is followed)
+    lx_add(0, "mp_pause_keys", "Pause menu keys in matches",
+           "Experimental. In an online match the pause menu ignores the keyboard (the match keeps running). On: Esc "
+           "opens it, WASD / arrows move, Enter selects, Backspace goes back, Esc closes. After Resume, move the mouse "
+           "once before walking. Only with Online play on; a controller works either way.", "RFOM_MP_PAUSE_KEYS",
+           { {"Off", ""}, {"On  (experimental)", "1"} });
     lx_add(0, "net_trace", "Log network traffic",
            "Writes every packet sent and received to the game log (logs\\run.log). Useful when a connection fails; "
            "it makes the log large, so leave it off for normal play. Only with Online play on.", "PS3_NET_TRACE",
