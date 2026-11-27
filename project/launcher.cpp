@@ -84,7 +84,8 @@ static std::vector<Setting> g_set = {
       "The game runs at the same speed at any limit (each frame advances game time by the real time it "
       "took). 60 is the most tested; 120 and above are smooth but some scripted moments are less tested. "
       "The PS3 ran at 30. 40 suits a 40 Hz handheld mode (Steam Deck) or a 120 Hz screen; 45 a 90 Hz one. "
-      "Unlimited still stops at 240.",
+      "Unlimited still stops at 240. On a fixed-refresh screen (Display sync) the limit becomes an even share of the "
+      "refresh rate (60 -> 72 at 144 Hz) and steps down one share (48) while the PC can't hold it, back up when it can.",
       { {"30  (PS3 original)", "30"}, {"40  (handheld 40 Hz)", "40"}, {"45", "45"}, {"55  (even on 165 Hz)", "55"}, {"60", "60"},
         {"72", "72"}, {"82  (even on 165 Hz)", "82"}, {"90", "90"}, {"120", "120"},
         {"144", "144"}, {"165", "165"}, {"Just under refresh  (G-Sync / FreeSync)", "vrr"}, {"Unlimited  (240)", "0"} }, 4 },

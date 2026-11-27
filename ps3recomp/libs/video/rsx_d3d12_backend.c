@@ -2774,6 +2774,8 @@ static void present_draw_frame(ID3D12GraphicsCommandList* cl, UINT bi, u32 fi, D
  *    (/ the frame-generation multiplier) and the present to vsync, sync interval k (1 with frame
  *    generation), so every frame stays on screen for k refreshes (pds_make_plan). RSX_VSYNC=N (N > 0)
  *    keeps its interval. RFOM_FPS=orig: gameplay untouched (the game's own 30 fps pacing).
+ *    A PC that can't hold refresh / k gets refresh / (k + 1) until the faster plan holds again
+ *    (PORT_PACING_ADAPT, default on; never faster than RFOM_FPS allows).
  *  - movies: vsync, interval 1 (no movie LFC repeats; present_blit). */
 void rfom_fps_pacing_set(double fps);   /* project/stubs.cpp (game exe) */
 double rfom_fps_target(void);
@@ -2796,14 +2798,26 @@ double rfom_pacing_correction_ms(void)
 /* project/rfom_reflex.cpp: the phase lock needs the port's limiter in charge (no Reflex frame limit then) */
 int rfom_pacing_pll(void) { return s_pace_pll; }
 
+/* PORT_PACING_ADAPT (default on; port_display_sync.h pds_adapt_frame): a PC that can't hold the plan
+ * steps one refresh slower per frame (144 Hz: 72 -> 48, not a steady 36) and tries the faster plan later */
+static pds_adapt s_pace_ad;
+
 static void pacing_apply(int movie, int* vs)
 {
-    static int cur = 0, cmult = 0, nlog = 0, said_orig = 0, said_novs = 0;
+    static int cur = 0, cmult = 0, nlog = 0, said_orig = 0, said_novs = 0, ad_init = 0, ad_log = 0;
     static LONG cgen = -1;
     static pds_plan cp;
+    static double qms = 0.0;
+    if (!ad_init) {
+        ad_init = 1;
+        const char* e = getenv("PORT_PACING_ADAPT");
+        pds_adapt_init(&s_pace_ad, pds_parse_adapt(e));
+        LARGE_INTEGER qf; QueryPerformanceFrequency(&qf); qms = 1000.0 / (double)qf.QuadPart;
+    }
     if (!pds_fixed()) {
         if (cur) {
             cur = 0; s_pace_pll = 0; rfom_fps_pacing_set(0.0);
+            pds_adapt_reset(&s_pace_ad);
             fprintf(stderr, "[display] fixed-refresh pacing off: frame limit back to RFOM_FPS, presents as set (RSX_VSYNC)%c", 10);
         }
         return;
@@ -2817,15 +2831,29 @@ static void pacing_apply(int movie, int* vs)
     const int mult = fg_out_mult();
     const double hz = pds_hz();
     if (!(hz > 1.0)) return;
-    if (!cur || mult != cmult || pds_gen() != cgen) {
+    const double maxr = pds_max_real(tgt);
+    if (cur && mult != cmult) pds_adapt_reset(&s_pace_ad);   /* frame generation switched: the player's plan again */
+    int adapted = 0;
+    if (cur && mult == cmult && cp.k >= 1) {
+        LARGE_INTEGER t; QueryPerformanceCounter(&t);
+        adapted = pds_adapt_frame(&s_pace_ad, (double)t.QuadPart * qms, 1000.0 / cp.real, 1000.0 / hz, pds_plan_max_extra(hz, mult, maxr, 30.0));
+    }
+    if (!cur || adapted || mult != cmult || pds_gen() != cgen) {
         pds_plan p;
-        pds_make_plan(hz, mult, pds_max_real(tgt), 30.0, &p);
+        pds_make_plan_step(hz, mult, maxr, 30.0, s_pace_ad.extra, &p);
         cgen = pds_gen(); cmult = mult;
         if (!cur || !pds_plan_same(&p, &cp)) {
             rfom_fps_pacing_set(p.k >= 1 ? p.limiter : 0.0);   /* k = 0: too slow even at k = 1, RFOM_FPS stays */
-            if (nlog < 16) {
+            if (adapted && cur) {
+                if (ad_log < 64) {
+                    char b[224]; pds_adapt_str(&s_pace_ad, &p, &cp, b, sizeof b);
+                    fprintf(stderr, "[display] fixed-refresh pacing: %s%s%c", b,
+                            ++ad_log == 64 ? " (further changes not logged)" : "", 10);
+                }
+            } else if (nlog < 16) {
                 char b[192]; pds_plan_str(&p, b, sizeof b); nlog++;
-                fprintf(stderr, "[display] fixed-refresh pacing: %s%s%c", b, *vs ? " -- RSX_VSYNC keeps its interval" : "", 10);
+                fprintf(stderr, "[display] fixed-refresh pacing: %s%s%s%c", b, *vs ? " -- RSX_VSYNC keeps its interval" : "",
+                        !cur && p.k >= 1 ? (s_pace_ad.enabled ? " (steps slower while the PC can't hold it; PORT_PACING_ADAPT=0 = never)" : " (PORT_PACING_ADAPT=0: never steps slower)") : "", 10);
             }
         }
         cp = p; cur = 1;
