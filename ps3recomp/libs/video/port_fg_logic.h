@@ -110,6 +110,34 @@ static inline int pfg_fx_hold_step(unsigned* hold, int on, int prev_gen, int inp
     return on || (*hold && prev_gen && inputs_ok);
 }
 
+/* R2_DLSS_FG_CAM_RESET (R1: RFOM_DLSS_FG_CAM_RESET): a frame whose camera motion is not a measurement (the upscaler's
+   camera vote failed, or its depth check rejected the motion and zeroed it) while the camera moves resets frame
+   generation, which would otherwise interpolate the whole scene with a wrong or zero camera motion (a double image of
+   everything while turning; R2 Chicago Leviathan). src: PFG_CAM_HELD (failed vote, last frame's motion reused),
+   PFG_CAM_GUESSED (failed vote, the largest agreeing group of draws or no motion), PFG_CAM_ZEROED (depth check reject).
+   moving_px: pfg_cam_moving_px. Never the rejected motion (usually an object's).
+   mode: 0 off, 1 guessed / zeroed (default), 2 held ones too. */
+enum { PFG_CAM_TRUSTED = 0, PFG_CAM_HELD = 1, PFG_CAM_GUESSED = 2, PFG_CAM_ZEROED = 3 };
+#define PFG_CAM_MOVING_PX 1.0
+#define PFG_CAM_LATCH 8 /* frames a measured camera motion stands for the camera's movement */
+static inline int pfg_cam_reset(int mode, int src, double moving_px)
+{
+    if (mode <= 0 || src <= PFG_CAM_TRUSTED) return 0;
+    if (src == PFG_CAM_HELD && mode < 2) return 0;
+    return moving_px >= PFG_CAM_MOVING_PX;
+}
+
+/* moving_px for pfg_cam_reset. vp_px: the game's view-projection motion (< 0: unknown); stand_px: the stand-in motion
+   frame generation would warp by when it is one (held, or a plausible largest agreeing group: near zero = still;
+   < 0: none, the identity or a zeroed reject); latch_px / latch_age: the last measured motion and its age in frames,
+   used for PFG_CAM_LATCH frames only (a run of unmeasured frames that outlasts the turn must not keep resetting). */
+static inline double pfg_cam_moving_px(double vp_px, double stand_px, double latch_px, unsigned latch_age)
+{
+    if (vp_px >= 0.0) return stand_px > vp_px ? stand_px : vp_px;
+    if (stand_px >= 0.0) return stand_px;
+    return latch_age <= PFG_CAM_LATCH ? latch_px : 0.0;
+}
+
 /* the generated frame must not blend with history: first frame, new swapchain, camera cut or a held (off) frame */
 static inline int pfg_fx_reset(int prev_gen, int sc_new, int reset, int on)
 {
