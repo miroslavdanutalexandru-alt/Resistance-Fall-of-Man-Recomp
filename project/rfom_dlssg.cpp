@@ -27,6 +27,8 @@
 #include <sl_pcl.h>
 #include <sl_security.h>
 
+#include "../ps3recomp/libs/video/rfom_fg_cam.h"   // rfom_fgpose_step (RFOM_DLSS_FG_REAL_CAMERA)
+
 typedef void (*RfomFgLog)(const char* msg);
 
 namespace {
@@ -411,6 +413,19 @@ __declspec(dllexport) int rfom_dlssg_tag(ID3D12GraphicsCommandList* cl, ID3D12Re
     c.cameraUp = sl::float3(0.0f, 1.0f, 0.0f);
     c.cameraRight = sl::float3(1.0f, 0.0f, 0.0f);
     c.cameraFwd = sl::float3(0.0f, 0.0f, 1.0f);
+    // RFOM_DLSS_FG_REAL_CAMERA (default 1; 0 = fixed): position / axes accumulated from the solved camera motion (rfom_fgpose_step)
+    // instead of a camera that never moves; DLSS-G's scene change detection and disocclusion heuristics read them
+    static const bool pose_on = [] { const char* e = getenv("RFOM_DLSS_FG_REAL_CAMERA"); return !(e && *e && atoi(e) <= 0); }();
+    static rfom_fgpose_t pose{};
+    if (pose_on) {
+        if (cam) rfom_fgpose_step(&pose, g_cam_c2p, n, f, xs, ys);
+        if (pose.init) {
+            c.cameraPos = sl::float3((float)pose.pos[0], (float)pose.pos[1], (float)pose.pos[2]);
+            c.cameraUp = sl::float3((float)pose.up[0], (float)pose.up[1], (float)pose.up[2]);
+            c.cameraRight = sl::float3((float)pose.right[0], (float)pose.right[1], (float)pose.right[2]);
+            c.cameraFwd = sl::float3((float)pose.fwd[0], (float)pose.fwd[1], (float)pose.fwd[2]);
+        }
+    }
     c.cameraNear = n;
     c.cameraFar = f;
     c.cameraFOV = fov;
