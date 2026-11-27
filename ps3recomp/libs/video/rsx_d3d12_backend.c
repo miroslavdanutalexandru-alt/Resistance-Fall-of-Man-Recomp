@@ -1326,6 +1326,9 @@ extern volatile long g_ps3_host_pause_gen; /* sys_ppu_thread.c: cellVdec stall l
 void port_ft_present(void);
 void port_ft_present_default(void) {}
 #pragma comment(linker, "/alternatename:port_ft_present=port_ft_present_default")
+void port_ft_exit(void);   /* writes the frame-time report; pc_quit_clean's ExitProcess lost it */
+void port_ft_exit_default(void) {}
+#pragma comment(linker, "/alternatename:port_ft_exit=port_ft_exit_default")
 extern volatile long g_port_audio_focus_gen;   /* cellAudio.c: PORT_AUDIO_FOCUS_REPRIME on focus regained */
 
 static int pc_focus_pause_on(void)
@@ -1361,6 +1364,7 @@ static void pc_quit_clean(const char* why)
     psow_quit_stop();       /* pipeline builders: finish the pipeline in hand, take no more */
     rsx_pso_cache_save();   /* pipelines added since the last background save (RSX_PSO_LIBRARY) */
     { extern void rsx_featcov_dump(const char*); rsx_featcov_dump("exit"); }   /* [featcov] ExitProcess skips atexit */
+    port_ft_exit();         /* frametimes_*.txt: the TLS-detach fallback never wrote it on this path */
     fprintf(stderr, "[quit] clean exit%c", 10);
     fflush(stdout); fflush(stderr); _flushall();
     ExitProcess(0);

@@ -497,6 +497,13 @@ extern "C" void port_ft_present(void)
     InterlockedExchange(&g_busy, 0);
 }
 
+/* The renderer's clean quit (pc_quit_clean), right before ExitProcess: the
+ * atexit / TLS-detach paths below did not write the report there. */
+extern "C" void port_ft_exit(void)
+{
+    port_ft::on_exit_once();
+}
+
 /* port_crash.h after_report: a crash or hang report was written. */
 static void port_ft_on_report(int kind)
 {
