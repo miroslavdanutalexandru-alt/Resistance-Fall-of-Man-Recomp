@@ -1409,9 +1409,10 @@ int spu_sched_effective(void)
     if (s_sched_on < 0) spu_sched_init();
     return s_sched_on;
 }
-/* Every ~10 s (R2/R3 print it beside their [spuwait] line). */
+/* Every ~10 s with PORT_DIAG=1 (R2/R3 print it beside their [spuwait] line). */
 static void spu_sched_report(void)
 {
+    if (!ps3_diag_enabled()) return;   /* PORT_DIAG=1 only */
     static volatile long long s_next;
     const long long now = (long long)GetTickCount64();
     if (now < s_next) return;

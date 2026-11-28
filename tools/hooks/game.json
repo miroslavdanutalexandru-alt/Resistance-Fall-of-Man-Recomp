@@ -810,13 +810,21 @@
 "add": [
 "#undef _RCX_RL",
 "",
-"/* Resistance port (v121, diagnostic): libmixer surround-mixer thread counters",
+"/* Resistance port (v121, diagnostic, PORT_STATS_LOG=1): libmixer surround-mixer thread counters",
 " * (func_00621CA8), reported every 5 s. Timebase ticks, 79.8 MHz. */",
 "static struct { unsigned long long ev, everr, writes, passes, wait, lock1, lock2, cb, wr, t_ev, t0;",
 "                unsigned lock1fail, lock2fail; } rfom_smx;",
+"/* Off unless PORT_STATS_LOG=1 / PORT_DIAG=1: no clock reads, no [surmix] line. */",
+"extern \"C\" int rfom_stats_log(void);   /* project/stubs.cpp */",
+"static inline unsigned long long rfom_smx_now(void)",
+"{",
+"    static const int on = rfom_stats_log();",
+"    return on ? ppu_timebase_now() : 0;",
+"}",
 "static void rfom_smx_report(void)",
 "{",
-"    const unsigned long long now = ppu_timebase_now();",
+"    const unsigned long long now = rfom_smx_now();",
+"    if (!now) return;",
 "    if (!rfom_smx.t0) rfom_smx.t0 = now;",
 "    if (now - rfom_smx.t0 < 5ull * 79800000ull) return;",
 "    const double ms = 1000.0 / 79800000.0;",
@@ -837,9 +845,9 @@
 "        lv2_syscall(ctx); _RCX_RL;"
 ],
 "add": [
-"        { const unsigned long long _t = ppu_timebase_now(); lv2_syscall(ctx); _RCX_RL;",
-"          rfom_smx.wait += ppu_timebase_now() - _t; if ((int32_t)R_3 == 0) rfom_smx.ev++; else rfom_smx.everr++;",
-"          rfom_smx.t_ev = ppu_timebase_now(); rfom_smx_report(); }"
+"        { const unsigned long long _t = rfom_smx_now(); lv2_syscall(ctx); _RCX_RL;",
+"          rfom_smx.wait += rfom_smx_now() - _t; if ((int32_t)R_3 == 0) rfom_smx.ev++; else rfom_smx.everr++;",
+"          rfom_smx.t_ev = rfom_smx_now(); rfom_smx_report(); }"
 ]
 },
 {
@@ -847,7 +855,7 @@
 "ctx": "        ctx->gpr[3] = R_3 = R_30 | R_30;",
 "rm": [],
 "add": [
-"        { const unsigned long long _t = ppu_timebase_now();"
+"        { const unsigned long long _t = rfom_smx_now();"
 ]
 },
 {
@@ -855,7 +863,7 @@
 "ctx": "        ctx->lr = R_lr = 0x00621EBC; func_0066A608(ctx); DRAIN_TRAMPOLINE(ctx); _RCX_RL;",
 "rm": [],
 "add": [
-"          rfom_smx.lock1 += ppu_timebase_now() - _t; if ((int32_t)R_3 != 0) rfom_smx.lock1fail++; }"
+"          rfom_smx.lock1 += rfom_smx_now() - _t; if ((int32_t)R_3 != 0) rfom_smx.lock1fail++; }"
 ]
 },
 {
@@ -863,7 +871,7 @@
 "ctx": "        ctx->gpr[4] = R_4 = (int64_t)(int32_t)(0x64);",
 "rm": [],
 "add": [
-"        { const unsigned long long _t = ppu_timebase_now();"
+"        { const unsigned long long _t = rfom_smx_now();"
 ]
 },
 {
@@ -871,7 +879,7 @@
 "ctx": "        ctx->lr = R_lr = 0x00621F20; func_0066A608(ctx); DRAIN_TRAMPOLINE(ctx); _RCX_RL;",
 "rm": [],
 "add": [
-"          rfom_smx.lock2 += ppu_timebase_now() - _t; if ((int32_t)R_3 != 0) rfom_smx.lock2fail++; }"
+"          rfom_smx.lock2 += rfom_smx_now() - _t; if ((int32_t)R_3 != 0) rfom_smx.lock2fail++; }"
 ]
 },
 {
@@ -879,7 +887,7 @@
 "ctx": "        ctx->gpr[2] = R_2 = vm_read32(R_11 + 0x4);",
 "rm": [],
 "add": [
-"        { const unsigned long long _t = ppu_timebase_now();"
+"        { const unsigned long long _t = rfom_smx_now();"
 ]
 },
 {
@@ -887,7 +895,7 @@
 "ctx": "        ctx->lr = R_lr = 0x00621FBC; ps3_indirect_call(ctx); DRAIN_TRAMPOLINE(ctx); _RCX_RL;",
 "rm": [],
 "add": [
-"          rfom_smx.cb += ppu_timebase_now() - _t; }"
+"          rfom_smx.cb += rfom_smx_now() - _t; }"
 ]
 },
 {
@@ -896,7 +904,7 @@
 "rm": [],
 "add": [
 "        rfom_smx.writes++;",
-"        { const unsigned long long _t = ppu_timebase_now();"
+"        { const unsigned long long _t = rfom_smx_now();"
 ]
 },
 {
@@ -904,7 +912,7 @@
 "ctx": "        ctx->lr = R_lr = 0x00621FD8; func_00620BA8(ctx); DRAIN_TRAMPOLINE(ctx); _RCX_RL;",
 "rm": [],
 "add": [
-"          rfom_smx.wr += ppu_timebase_now() - _t; }"
+"          rfom_smx.wr += rfom_smx_now() - _t; }"
 ]
 },
 {

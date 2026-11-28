@@ -20,6 +20,7 @@
 #include "rsx_featcov.h"                     /* RSX feature coverage tracer */
 #include "../../include/ps3emu/guest_call.h" /* g_ps3_guest_caller for direct handler dispatch */
 #include "../../include/ps3emu/ps3_ftrace.h"  /* PS3_FTRACE timeline */
+#include "../../runtime/ps3_log.h"            /* ps3_diag_enabled: PORT_DIAG=1 */
 
 /* Guest EA of the GCM context (begin/end/current/callback) the title writes its
  * command stream into; recorded by cellGcmSetupContext, drained by the RSX. */
@@ -2559,7 +2560,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                                   const u32 v = ((u32)be[0] << 24) | ((u32)be[1] << 16) | ((u32)be[2] << 8) | be[3];
                                   const u32 mi = (m & 0x1FFCu) >> 2;
                                   if (!qseen[mi]) { qseen[mi] = 1;
-                                      printf("[mfirst] subch=%u m=0x%04X = 0x%08X%c", subch, m & 0x1FFCu, v, 10); }
+                                      if (ps3_diag_enabled()) printf("[mfirst] subch=%u m=0x%04X = 0x%08X%c", subch, m & 0x1FFCu, v, 10); }
                                   gcm_get_for_label(m, i, put);
                                   rsx_process_method(&s_state, m, v);
                                   if (m == 0x50u || m == 0x1A8u || m == 0x1800u) gcm_method_post(m, v);
@@ -2672,8 +2673,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
                  * backend never handles (inline arrays, conditional render). */
                 { static unsigned char seen[8][0x800];
                   const u32 mi = (m & 0x1FFCu) >> 2;
-                  if (!seen[subch & 7][mi]) { seen[subch & 7][mi] = 1;
-                      printf("[mfirst] subch=%u m=0x%04X = 0x%08X%c", subch, m & 0x1FFCu, vm_read32(dea), 10); } }
+                  if (!seen[subch & 7][mi]) { seen[subch & 7][mi] = 1;   /* PORT_DIAG=1 */
+                      if (ps3_diag_enabled()) printf("[mfirst] subch=%u m=0x%04X = 0x%08X%c", subch, m & 0x1FFCu, vm_read32(dea), 10); } }
                 /* GCM_METHOD_HIST=<secs>: every <secs>, the most frequent
                  * (subchannel, method) pairs dispatched since the last report --
                  * what a frame is actually made of when nothing draws. */

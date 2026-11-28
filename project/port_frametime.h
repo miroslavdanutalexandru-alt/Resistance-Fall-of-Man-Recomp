@@ -22,7 +22,7 @@
  * moment a stutter happened. Polled every 50 ms on the recorder's own thread,
  * only while one of the game's windows has the focus; that thread also does
  * the marker file writes.
- *   PORT_FRAMETIME=0             recorder off
+ *   PORT_FRAMETIME=1             recorder on (default off)
  *   PORT_FT_MARKER_KEY=<key>     scroll (default), pause, f1..f24, off
  *
  * The statistics half (port_ft::Stats, stats_add, stats_low, format_report,
@@ -182,7 +182,7 @@ static inline size_t format_report(const Stats* s, const Info* in, const char* m
 {
     Out o{ buf, 0, cap };
     if (cap) buf[0] = 0;
-    o.f("%s PC port -- frame-time report (PORT_FRAMETIME=0 turns this off)\n", in->title ? in->title : "Resistance");
+    o.f("%s PC port -- frame-time report (PORT_FRAMETIME=1)\n", in->title ? in->title : "Resistance");
     o.f("session:   %s  %s\n", in->session ? in->session : "", in->exe ? in->exe : "");
     o.f("written:   %s\n", in->reasons && *in->reasons ? in->reasons : "-");
     o.f("recorded:  %.1f s, %llu frames (pauses left out: %u; stalls >= 1 s: %u, %.1f s, not in the numbers below)\n",
@@ -525,7 +525,7 @@ static void port_ft_init(const PortFtConfig& cfg)
 {
     using namespace port_ft;
     const char* e = getenv("PORT_FRAMETIME");
-    if (e && e[0] == '0') return;
+    if (!(e && *e && e[0] != '0')) return;   /* opt-in */
     g_cfg = cfg;
     LARGE_INTEGER f, c;
     QueryPerformanceFrequency(&f); QueryPerformanceCounter(&c);
@@ -557,7 +557,7 @@ static void port_ft_init(const PortFtConfig& cfg)
         SetThreadPriority(th, THREAD_PRIORITY_BELOW_NORMAL);
         CloseHandle(th);
     }
-    fprintf(stderr, "[frametime] recording frame times -> logs\\frametimes_%s%s%s.txt (marker key: %s; PORT_FRAMETIME=0 turns it off)\n",
+    fprintf(stderr, "[frametime] recording frame times -> logs\\frametimes_%s%s%s.txt (marker key: %s; opt-in: PORT_FRAMETIME=1)\n",
             g_stamp, cfg.exe_suffix && *cfg.exe_suffix ? "_" : "", cfg.exe_suffix && *cfg.exe_suffix ? cfg.exe_suffix : "", g_key_name);
 }
 #endif /* PORT_FRAMETIME_IMPL && _WIN32 */

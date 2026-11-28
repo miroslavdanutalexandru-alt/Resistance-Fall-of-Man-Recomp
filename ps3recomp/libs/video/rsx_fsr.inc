@@ -3053,7 +3053,7 @@ static int cam_solve_core(u32 fr, u32 n, double (*Ms)[16], const u32* pg, double
              * own motion (ndc vs "no camera motion"), so a second camera (near-zero motion: weapon / UI / scope)
              * can be told from spread that grows with the motion (shake / recoil). */
             static u32 ulog;
-            if (ulog < 24 || ulog % 200 == 0) {
+            if (port_stats_log() && (ulog < 24 || ulog % 200 == 0)) {   /* PORT_STATS_LOG=1 / PORT_DIAG=1 */
                 static const double I[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
                 char line[1024]; int o = snprintf(line, sizeof line, "[DLSS] camera unsolved (frame %u, %u candidates, medoid spread %.3g motion %.3g):",
                                                   fr, n, sp, mo > 1e8 ? -1.0 : mo);
@@ -3495,7 +3495,7 @@ static void fsr_dispatch(void)
 
 /* Render thread, per non-clear draw: a jittered scene draw starts / continues
  * this frame's scene. */
-/* RSX_AA_UV_JITTER (default 1 while an upscaler is on, 0 = off): screen-UV jitter
+/* RSX_AA_UV_JITTER (default off; 1, PORT_STATS_LOG=1 or PORT_DIAG=1 = on while an upscaler is on): screen-UV jitter
  * check. Only scene-surface draws are jittered, so a jittered draw that samples a
  * screen-sized buffer rendered by OTHER (un-jittered) passes -- a light pre-pass,
  * AO or shadow mask looked up by screen position -- reads it at a jitter-phase
@@ -3506,7 +3506,7 @@ static void fsr_dispatch(void)
 static void fsr_uvjit_check(const D3D12DrawRecord* dr, int slot)
 {
     static int on = -1;
-    if (on < 0) { const char* e = getenv("RSX_AA_UV_JITTER"); on = e ? atoi(e) : 1; }
+    if (on < 0) { const char* e = getenv("RSX_AA_UV_JITTER"); on = e ? atoi(e) : port_stats_log(); }
     if (!on || slot < 0) return;
     const OffRT* sr = &s_d3d.off_rt[slot];
     if (!sr->w || !sr->h) return;

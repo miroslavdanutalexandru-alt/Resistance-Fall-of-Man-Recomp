@@ -501,7 +501,8 @@ static int rfom_frame_wait_impl(uint64_t target, uint32_t last_ea);
 extern "C" int rfom_stats_log(void)
 {
     static int on = -1;
-    if (on < 0) { const char* e = getenv("PORT_STATS_LOG"); on = (e && atoi(e)) ? 1 : 0; }
+    if (on < 0) { const char* e = getenv("PORT_STATS_LOG"); const char* d = getenv("PORT_DIAG");
+                  on = (e && atoi(e)) || (d && atoi(d)) ? 1 : 0; }   /* PORT_DIAG=1 includes the statistics */
     return on;
 }
 #include "port_hitchcatch.h"   /* PORT_HITCHCATCH=<ms>: stacks of the key threads on a hitch */

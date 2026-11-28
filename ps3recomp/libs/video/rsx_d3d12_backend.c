@@ -159,12 +159,13 @@ static u64 shk_get(ID3DBlob* blob)
     ReleaseSRWLockShared(&s_shk_lock);
     return key;
 }
-/* PORT_STATS_LOG=1: the periodic statistics lines ("[present] 5 s", movie LFC,
- * "[FSR] stats/600", "[DLSS] camera/600", ...). Off by default. */
+/* PORT_STATS_LOG=1 (or PORT_DIAG=1): the periodic statistics lines ("[present] 5 s", movie LFC,
+ * "[FSR] stats/600", "[DLSS] camera/600", "[DLSS] camera unsolved", [AAUV], ...). Off by default. */
 static int port_stats_log(void)
 {
     static int on = -1;
-    if (on < 0) { const char* e = getenv("PORT_STATS_LOG"); on = (e && atoi(e)) ? 1 : 0; }
+    if (on < 0) { const char* e = getenv("PORT_STATS_LOG"); const char* d = getenv("PORT_DIAG");
+                  on = (e && atoi(e)) || (d && atoi(d)) ? 1 : 0; }
     return on;
 }
 static unsigned s_gpu_vendor;   /* tentative; set with s_gpu_device at device creation */

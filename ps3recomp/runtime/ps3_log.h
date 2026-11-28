@@ -21,6 +21,23 @@
 #endif
 
 #ifdef __cplusplus
+static inline int ps3_diag_enabled(void)
+#else
+static __inline int ps3_diag_enabled(void)
+#endif
+{
+    /* Resistance port: PORT_DIAG=1 turns on the debug diagnostics (periodic
+     * statistics lines, per-event traces). Off by default so release runs stay
+     * quiet and the statistics' timers and string formatting are skipped. */
+    static int d = -1;
+    if (d < 0) {
+        const char* e = getenv("PORT_DIAG");
+        d = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    return d;
+}
+
+#ifdef __cplusplus
 static inline int ps3_log_verbose(void)
 #else
 static __inline int ps3_log_verbose(void)
@@ -39,7 +56,7 @@ static __inline int ps3_log_verbose(void)
     if (v < 0) {
         const char* e = getenv("PS3_VERBOSE");
         if (e) v = (e[0] && e[0] != '0') ? 1 : 0;
-        else   v = 0;
+        else   v = ps3_diag_enabled();
     }
     return v;
 }
