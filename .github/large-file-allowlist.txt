@@ -1,0 +1,6 @@
+# Tracked files allowed to be larger than 5 MB (one path per line, relative to the repo root).
+# Checked by .github/scripts/repo_hygiene.py. Add a line only for a file that has to be in git.
+tools/ffx_bin/amd_fidelityfx_upscaler_dx12.dll           # AMD FidelityFX DX12 upscaler, allow-listed in scripts/package_beta.ps1
+ps3recomp/third_party/SDL3/lib/SDL3-static.lib           # SDL3 pad backend; package_beta.ps1 requires it to be committed
+tools/hdui_upscaler/bin/realesrgan-ncnn-cpu.exe          # HD UI pack upscaler (Real-ESRGAN-ncnn, MIT), allow-listed in scripts/package_beta.ps1
+tools/hdui_upscaler/bin/realesrgan-ncnn-vulkan.exe       # HD UI pack upscaler (Real-ESRGAN-ncnn, MIT), allow-listed in scripts/package_beta.ps1
