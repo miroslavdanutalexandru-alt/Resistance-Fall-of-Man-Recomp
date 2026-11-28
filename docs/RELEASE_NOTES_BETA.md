@@ -265,7 +265,7 @@ If 0.2.0 is already built and runs, you don't need this update.
 
 ## What you download
 
-- **`ResistancePort-Setup-<version>.exe`** (for this release `ResistancePort-Setup-0.3.1-beta.exe`) from the GitHub release: an installer with the port's source, scripts and `Launcher.exe`. It installs the files and starts Setup.
+- **`ResistancePort-Setup-<version>.exe`** (for this release `ResistancePort-Setup-0.3.2-beta.exe`) from the GitHub release: an installer with the port's source, scripts and `Launcher.exe`. It installs the files and starts Setup.
 - or the **source code** (the release's source archive or `git clone` at the tag), then `Setup.bat`.
 
 Either way, the game itself is built on your PC; no built game program is published. Setup downloads the build tools, FFmpeg (an LGPL build), shaderscan, AMD's FSR 3 frame generation DLL and, if you accept their licences, the NVIDIA DLSS, Streamline (DLSS Frame Generation) and Intel XeSS SDKs.
